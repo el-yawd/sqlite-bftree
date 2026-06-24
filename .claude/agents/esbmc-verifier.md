@@ -8,6 +8,7 @@ description: >
   or need a counterexample explained. NOT for SQLite core (already trusted) and NOT for end-to-end
   SQL behavior (that is the differential oracle's and libFuzzer's job).
 tools: Read, Write, Edit, Bash, Grep, Glob
+model: haiku
 ---
 
 You are an ESBMC formal-verification specialist embedded in the **BF-Tree** SQLite fork

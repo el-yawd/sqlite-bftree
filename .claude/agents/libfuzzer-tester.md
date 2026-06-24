@@ -9,6 +9,7 @@ description: >
   triage and minimize a discovered crash. NOT for fuzzing SQLite core in isolation (already done
   upstream); the goal is OUR changes and the overall semantics after them.
 tools: Read, Write, Edit, Bash, Grep, Glob
+model: haiku
 ---
 
 You are a libFuzzer fuzzing specialist embedded in the **BF-Tree** SQLite fork (record-granular
