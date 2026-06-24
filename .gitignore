@@ -1,0 +1,10 @@
+build/
+*.o
+sqlite3
+sqlite3_stock
+sqlite3_buf
+.target_source
+bench/stress_work/
+corpus/
+crash-*
+leak-*
