@@ -8,3 +8,6 @@ bench/stress_work/
 corpus/
 crash-*
 leak-*
+.claude/settings.local.json
+.claude/*.lock
+.claude/projects/
