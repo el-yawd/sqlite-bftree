@@ -165,6 +165,7 @@ close $in
 # text of the file in-line.  The file only needs to be included once.
 #
 foreach hdr {
+   bf_cache.h
    btree.h
    btreeInt.h
    fts3.h
@@ -416,6 +417,9 @@ set flist {
    bitvec.c
    pcache.c
    pcache1.c
+   bf_circular_buffer.c
+   bf_mini_page.c
+   bf_mapping.c
    rowset.c
    pager.c
    wal.c

@@ -719,6 +719,14 @@ SRC += \
 SRC += \
   $(TOP)/ext/misc/stmt.c
 
+# BF-Tree record cache (v2): durability-agnostic leaf modules.  Whole-file
+# guarded by SQLITE_OMIT_BF_CACHE; inert until btree/pager hooks land.
+SRC += \
+  $(TOP)/src/bf_cache.h \
+  $(TOP)/src/bf_circular_buffer.c \
+  $(TOP)/src/bf_mini_page.c \
+  $(TOP)/src/bf_mapping.c
+
 # Generated source code files
 #
 SRC += \
