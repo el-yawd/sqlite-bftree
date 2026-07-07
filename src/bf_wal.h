@@ -37,8 +37,9 @@
 /* Return codes. */
 #define BFWAL_OK       0    /* Success */
 #define BFWAL_FULL     1    /* Append: record does not fit in the frame */
-#define BFWAL_DONE     2    /* Iterator: no more records */
+#define BFWAL_DONE     2    /* Iterator/index: no more records */
 #define BFWAL_CORRUPT  3    /* Decode: malformed / out-of-bounds payload */
+#define BFWAL_NOMEM    4    /* Index: allocation failed */
 
 /* Batch-payload header: magic(4) version(2) nRec(2) nUsed(4) = 12 bytes.  op
 ** values reuse the mini-page BFOP_* space; only the dirty ops are ever logged. */
@@ -93,6 +94,32 @@ int  sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec);
 ** the reader/recovery walk to tell record frames from page-image frames when a
 ** frame-header marker is not otherwise available. */
 int  sqlite3BfWalIsBatch(const u8 *aBuf, int szBuf);
+
+/*
+** In-memory page -> ordered record-ops index.
+**
+** As record frames are written (runtime) or scanned (recovery), their ops are
+** appended here keyed by target pgno, preserving log order.  The pager consults
+** it to reconstruct a page (latest page image + in-order replay of later record
+** ops) and to apply record ops onto base pages at checkpoint.  Ops for a page
+** are dropped once that page has been materialised/checkpointed.
+**
+** The index owns copies of the key/value bytes (the WAL frame buffer is not
+** retained).  Opaque handle; storage details live in bf_wal.c.
+*/
+typedef struct BfWalIndex BfWalIndex;
+
+BfWalIndex *sqlite3BfWalIndexNew(void);
+void        sqlite3BfWalIndexFree(BfWalIndex *p);
+int         sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec);
+int         sqlite3BfWalIndexPageCount(BfWalIndex *p, u32 pgno);
+int         sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec);
+void        sqlite3BfWalIndexClearPage(BfWalIndex *p, u32 pgno);
+
+/* Feed every op of one record-batch frame payload into the index (recovery /
+** reader walk convenience).  Returns BFWAL_OK, BFWAL_CORRUPT (bad payload), or
+** BFWAL_NOMEM. */
+int         sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf);
 
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */
 #endif /* SQLITE_BF_WAL_H */

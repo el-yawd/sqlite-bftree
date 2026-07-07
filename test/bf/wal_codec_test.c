@@ -124,11 +124,82 @@ static void test_corrupt_header(void){
   CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_CORRUPT );
 }
 
+/* Index: ops come back per-page in log order; other pages unaffected. */
+static void test_index_order(void){
+  BfWalIndex *ix = sqlite3BfWalIndexNew();
+  BfWalRec r;
+  int i;
+  CHECK( ix!=0 );
+  /* Interleave three pages; values encode (pgno, seq) so order is checkable. */
+  for(i=0;i<30;i++){
+    u8 key[1]; u8 val[2];
+    u32 pg = (u32)(1 + (i%3));
+    key[0]=(u8)i; val[0]=(u8)pg; val[1]=(u8)i;
+    r.pgno=pg; r.op=(i&1)?BFWAL_OP_DELETE:BFWAL_OP_INSERT;
+    r.nKey=1; r.pKey=key; r.nVal=(i&1)?0:2; r.pVal=(i&1)?0:val;
+    CHECK( sqlite3BfWalIndexAppend(ix,&r)==BFWAL_OK );
+  }
+  CHECK( sqlite3BfWalIndexPageCount(ix,1)==10 );
+  CHECK( sqlite3BfWalIndexPageCount(ix,2)==10 );
+  CHECK( sqlite3BfWalIndexPageCount(ix,3)==10 );
+  CHECK( sqlite3BfWalIndexPageCount(ix,4)==0 );
+  /* Page 1 got i = 0,3,6,...,27; verify log order preserved via val[1]. */
+  for(i=0;i<10;i++){
+    CHECK( sqlite3BfWalIndexGet(ix,1,i,&r)==BFWAL_OK );
+    CHECK( r.pgno==1 );
+    if( r.op==BFWAL_OP_INSERT ){ CHECK( r.nVal==2 && r.pVal[1]==(u8)(i*3) ); }
+  }
+  CHECK( sqlite3BfWalIndexGet(ix,1,10,&r)==BFWAL_DONE );
+  sqlite3BfWalIndexClearPage(ix,2);
+  CHECK( sqlite3BfWalIndexPageCount(ix,2)==0 );
+  CHECK( sqlite3BfWalIndexPageCount(ix,1)==10 );  /* others intact */
+  sqlite3BfWalIndexFree(ix);
+}
+
+/* Idempotence proxy: scanning the same record frame into two indexes yields
+** identical per-page op sequences ("replay twice = replay once" building block). */
+static void test_index_from_frame(void){
+  u8 buf[4096];
+  BfWalBatch b;
+  BfWalRec r;
+  BfWalIndex *ix1, *ix2;
+  u32 pg;
+  const char *v="xy";
+  int i;
+  sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
+  for(i=0;i<50;i++){
+    u8 key[2]; key[0]=(u8)i; key[1]=(u8)(i>>8);
+    r.pgno=(u32)(1+(i%5)); r.op=BFWAL_OP_INSERT; r.nKey=2; r.pKey=key;
+    r.nVal=2; r.pVal=(const u8*)v;
+    CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
+  }
+  sqlite3BfWalBatchFinish(&b);
+  ix1 = sqlite3BfWalIndexNew();
+  ix2 = sqlite3BfWalIndexNew();
+  CHECK( sqlite3BfWalIndexAddFrame(ix1, buf, sizeof(buf))==BFWAL_OK );
+  CHECK( sqlite3BfWalIndexAddFrame(ix2, buf, sizeof(buf))==BFWAL_OK );
+  for(pg=1; pg<=5; pg++){
+    int n1 = sqlite3BfWalIndexPageCount(ix1,pg);
+    CHECK( n1==sqlite3BfWalIndexPageCount(ix2,pg) );
+    for(i=0;i<n1;i++){
+      BfWalRec a, c;
+      CHECK( sqlite3BfWalIndexGet(ix1,pg,i,&a)==BFWAL_OK );
+      CHECK( sqlite3BfWalIndexGet(ix2,pg,i,&c)==BFWAL_OK );
+      CHECK( a.op==c.op && a.nKey==c.nKey && a.nVal==c.nVal );
+      CHECK( a.nKey==0 || memcmp(a.pKey,c.pKey,a.nKey)==0 );
+    }
+  }
+  sqlite3BfWalIndexFree(ix1);
+  sqlite3BfWalIndexFree(ix2);
+}
+
 int main(void){
   test_roundtrip();
   test_full();
   test_corrupt_header();
   test_fuzz_bounds();
+  test_index_order();
+  test_index_from_frame();
   if( nFail==0 ) printf("wal_codec_test: ALL PASS\n");
   else printf("wal_codec_test: %d FAILURE(S)\n", nFail);
   return nFail!=0;

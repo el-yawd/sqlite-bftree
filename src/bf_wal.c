@@ -37,6 +37,20 @@
 #ifndef SQLITE_OMIT_BF_CACHE
 #include "bf_wal.h"
 
+/* Allocation seam: the amalgamation build routes through sqlite3's allocator;
+** a standalone harness supplies libc's (see BF_WAL_STANDALONE in bf_wal.h). */
+#ifdef BF_WAL_STANDALONE
+# include <stdlib.h>
+# include <string.h>
+# define BFWAL_MALLOC(n)     malloc((size_t)(n))
+# define BFWAL_REALLOC(p,n)  realloc((p),(size_t)(n))
+# define BFWAL_FREE(p)       free(p)
+#else
+# define BFWAL_MALLOC(n)     sqlite3_malloc((int)(n))
+# define BFWAL_REALLOC(p,n)  sqlite3_realloc((p),(int)(n))
+# define BFWAL_FREE(p)       sqlite3_free(p)
+#endif
+
 /* Largest LEB128 encoding of a u32 is 5 bytes (32 bits / 7 per byte). */
 #define BFWAL_VARINT_MAX 5
 
@@ -250,6 +264,195 @@ int sqlite3BfWalIsBatch(const u8 *aBuf, int szBuf){
   if( bfGet16(aBuf + 4) != BFWAL_VERSION ) return 0;
   nUsed = bfGet32(aBuf + 8);
   return nUsed >= (u32)BFWAL_HDRSIZE && nUsed <= (u32)szBuf;
+}
+
+/****************************************************************************
+** In-memory page -> ordered record-ops index (see bf_wal.h).
+**
+** Chained hash by pgno.  Each page node holds its ops in a growable array in
+** log (append) order; each op owns one contiguous key||value allocation.
+****************************************************************************/
+typedef struct BfWalIdxOp BfWalIdxOp;
+struct BfWalIdxOp {
+  u8   op;                  /* BFWAL_OP_INSERT / BFWAL_OP_DELETE */
+  u32  nKey;                /* key length */
+  u32  nVal;                /* value length */
+  u8  *pBody;               /* owned: [key bytes][val bytes], nKey+nVal long */
+};
+typedef struct BfWalIdxPage BfWalIdxPage;
+struct BfWalIdxPage {
+  u32           pgno;       /* target page */
+  int           nOp;        /* ops recorded */
+  int           nAlloc;     /* aOp capacity */
+  BfWalIdxOp   *aOp;        /* log order */
+  BfWalIdxPage *pNext;      /* bucket chain */
+};
+struct BfWalIndex {
+  BfWalIdxPage **apBucket;  /* nBucket chains (power of two) */
+  int            nBucket;
+  int            nPage;     /* live page nodes (for load factor) */
+};
+
+#define BFWAL_IDX_INIT_BUCKETS 16
+
+static unsigned bfIdxHash(u32 pgno, int nBucket){
+  /* Fibonacci hash, then mask to the (power-of-two) bucket count. */
+  return (unsigned)((pgno * 2654435761u) >> 16) & (unsigned)(nBucket - 1);
+}
+
+static BfWalIdxPage *bfIdxFind(BfWalIndex *p, u32 pgno){
+  BfWalIdxPage *pP = p->apBucket[bfIdxHash(pgno, p->nBucket)];
+  for(; pP; pP = pP->pNext){
+    if( pP->pgno==pgno ) return pP;
+  }
+  return 0;
+}
+
+/* Grow and rehash when the table gets crowded (load factor > ~0.75). */
+static int bfIdxMaybeGrow(BfWalIndex *p){
+  int newN, i;
+  BfWalIdxPage **apNew;
+  if( p->nPage <= (p->nBucket*3)/4 ) return BFWAL_OK;
+  newN = p->nBucket * 2;
+  apNew = (BfWalIdxPage**)BFWAL_MALLOC((i64)newN * (int)sizeof(*apNew));
+  if( apNew==0 ) return BFWAL_NOMEM;   /* keep running at the old size */
+  memset(apNew, 0, (size_t)newN * sizeof(*apNew));
+  for(i=0; i<p->nBucket; i++){
+    BfWalIdxPage *pP = p->apBucket[i];
+    while( pP ){
+      BfWalIdxPage *pNext = pP->pNext;
+      unsigned h = bfIdxHash(pP->pgno, newN);
+      pP->pNext = apNew[h];
+      apNew[h] = pP;
+      pP = pNext;
+    }
+  }
+  BFWAL_FREE(p->apBucket);
+  p->apBucket = apNew;
+  p->nBucket = newN;
+  return BFWAL_OK;
+}
+
+BfWalIndex *sqlite3BfWalIndexNew(void){
+  BfWalIndex *p = (BfWalIndex*)BFWAL_MALLOC((int)sizeof(*p));
+  if( p==0 ) return 0;
+  p->nBucket = BFWAL_IDX_INIT_BUCKETS;
+  p->nPage = 0;
+  p->apBucket = (BfWalIdxPage**)BFWAL_MALLOC(p->nBucket * (int)sizeof(BfWalIdxPage*));
+  if( p->apBucket==0 ){ BFWAL_FREE(p); return 0; }
+  memset(p->apBucket, 0, (size_t)p->nBucket * sizeof(BfWalIdxPage*));
+  return p;
+}
+
+static void bfIdxFreePage(BfWalIdxPage *pP){
+  int i;
+  for(i=0; i<pP->nOp; i++) BFWAL_FREE(pP->aOp[i].pBody);
+  BFWAL_FREE(pP->aOp);
+  BFWAL_FREE(pP);
+}
+
+void sqlite3BfWalIndexFree(BfWalIndex *p){
+  int i;
+  if( p==0 ) return;
+  for(i=0; i<p->nBucket; i++){
+    BfWalIdxPage *pP = p->apBucket[i];
+    while( pP ){ BfWalIdxPage *pNext = pP->pNext; bfIdxFreePage(pP); pP = pNext; }
+  }
+  BFWAL_FREE(p->apBucket);
+  BFWAL_FREE(p);
+}
+
+int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec){
+  BfWalIdxPage *pP;
+  BfWalIdxOp *pOp;
+  u8 *pBody;
+
+  if( pRec->pgno==0 ) return BFWAL_CORRUPT;
+
+  pP = bfIdxFind(p, pRec->pgno);
+  if( pP==0 ){
+    if( bfIdxMaybeGrow(p) ){ /* NOMEM: proceed at current size, still correct */ }
+    pP = (BfWalIdxPage*)BFWAL_MALLOC((int)sizeof(*pP));
+    if( pP==0 ) return BFWAL_NOMEM;
+    pP->pgno = pRec->pgno;
+    pP->nOp = 0;
+    pP->nAlloc = 0;
+    pP->aOp = 0;
+    { unsigned h = bfIdxHash(pRec->pgno, p->nBucket);
+      pP->pNext = p->apBucket[h];
+      p->apBucket[h] = pP; }
+    p->nPage++;
+  }
+
+  if( pP->nOp >= pP->nAlloc ){
+    int newAlloc = pP->nAlloc ? pP->nAlloc*2 : 4;
+    BfWalIdxOp *aNew = (BfWalIdxOp*)BFWAL_REALLOC(pP->aOp,
+                                     newAlloc * (int)sizeof(BfWalIdxOp));
+    if( aNew==0 ) return BFWAL_NOMEM;
+    pP->aOp = aNew;
+    pP->nAlloc = newAlloc;
+  }
+
+  /* One contiguous allocation for key||value; +1 so a 0-length body still
+  ** yields a non-NULL pointer (distinguishes "empty" from "OOM"). */
+  pBody = (u8*)BFWAL_MALLOC((int)(pRec->nKey + pRec->nVal) + 1);
+  if( pBody==0 ) return BFWAL_NOMEM;
+  if( pRec->nKey ) memcpy(pBody, pRec->pKey, pRec->nKey);
+  if( pRec->nVal ) memcpy(pBody + pRec->nKey, pRec->pVal, pRec->nVal);
+
+  pOp = &pP->aOp[pP->nOp++];
+  pOp->op = pRec->op;
+  pOp->nKey = pRec->nKey;
+  pOp->nVal = pRec->nVal;
+  pOp->pBody = pBody;
+  return BFWAL_OK;
+}
+
+int sqlite3BfWalIndexPageCount(BfWalIndex *p, u32 pgno){
+  BfWalIdxPage *pP = bfIdxFind(p, pgno);
+  return pP ? pP->nOp : 0;
+}
+
+int sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec){
+  BfWalIdxPage *pP = bfIdxFind(p, pgno);
+  BfWalIdxOp *pOp;
+  if( pP==0 || i<0 || i>=pP->nOp ) return BFWAL_DONE;
+  pOp = &pP->aOp[i];
+  pRec->pgno = pgno;
+  pRec->op   = pOp->op;
+  pRec->nKey = pOp->nKey;
+  pRec->nVal = pOp->nVal;
+  pRec->pKey = pOp->nKey ? pOp->pBody : 0;
+  pRec->pVal = pOp->nVal ? pOp->pBody + pOp->nKey : 0;
+  return BFWAL_OK;
+}
+
+void sqlite3BfWalIndexClearPage(BfWalIndex *p, u32 pgno){
+  unsigned h = bfIdxHash(pgno, p->nBucket);
+  BfWalIdxPage **ppSlot = &p->apBucket[h];
+  while( *ppSlot ){
+    if( (*ppSlot)->pgno==pgno ){
+      BfWalIdxPage *pDead = *ppSlot;
+      *ppSlot = pDead->pNext;
+      bfIdxFreePage(pDead);
+      p->nPage--;
+      return;
+    }
+    ppSlot = &(*ppSlot)->pNext;
+  }
+}
+
+int sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf){
+  BfWalIter it;
+  BfWalRec r;
+  int rc;
+  rc = sqlite3BfWalIterInit(&it, aBuf, szBuf);
+  if( rc!=BFWAL_OK ) return rc;
+  while( (rc = sqlite3BfWalIterNext(&it, &r))==BFWAL_OK ){
+    int rc2 = sqlite3BfWalIndexAppend(p, &r);
+    if( rc2!=BFWAL_OK ) return rc2;
+  }
+  return (rc==BFWAL_DONE) ? BFWAL_OK : rc;
 }
 
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */
