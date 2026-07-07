@@ -166,6 +166,7 @@ close $in
 #
 foreach hdr {
    bf_cache.h
+   bf_wal.h
    btree.h
    btreeInt.h
    fts3.h
@@ -421,6 +422,7 @@ set flist {
    bf_circular_buffer.c
    bf_mini_page.c
    bf_mapping.c
+   bf_wal.c
    bf_btree.c
    bf_config.c
    rowset.c

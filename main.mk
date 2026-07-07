@@ -724,10 +724,12 @@ SRC += \
 # read-cache + write-through (insert-buffering OFF by default).
 SRC += \
   $(TOP)/src/bf_cache.h \
+  $(TOP)/src/bf_wal.h \
   $(TOP)/src/bf_cache.c \
   $(TOP)/src/bf_circular_buffer.c \
   $(TOP)/src/bf_mini_page.c \
   $(TOP)/src/bf_mapping.c \
+  $(TOP)/src/bf_wal.c \
   $(TOP)/src/bf_btree.c \
   $(TOP)/src/bf_config.c
 
