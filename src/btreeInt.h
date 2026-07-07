@@ -547,6 +547,22 @@ struct BtCursor {
   CellInfo info;            /* A parse of the cell we are pointing at */
   i64 nKey;                 /* Size of pKey, or last integer key */
   Pgno pgnoRoot;            /* The root page of this tree */
+#ifndef SQLITE_OMIT_BF_CACHE
+  Pgno bfLeaf;              /* BF descent shortcut: leaf pgno served from the BF
+                            ** mini-page cache without reading the leaf (valid
+                            ** only while BTCF_BfLeaf is set) */
+  char *pBfScratch;         /* Per-cursor scratch buffer holding the BF-served
+                            ** record for the zero-copy payload fetch path */
+  int nBfScratch;           /* Allocated size of pBfScratch */
+  u8 bfMerge;               /* Scan is using merge-iteration (Stage 2.2): leaf
+                            ** mini-pages are merged on the fly instead of being
+                            ** flushed up front */
+  u8 bfOnMini;              /* Merge scan is logically ON a buffered insert: the
+                            ** row is served from pBfScratch and pPage/ix is
+                            ** parked at the next base cell to emit after it */
+  Pgno bfMergeLeaf;         /* Leaf pgno bfIx indexes into (detects leaf change) */
+  int bfIx;                 /* Next mini-page sorted index to examine on merge */
+#endif
   i8 iPage;                 /* Index of current page in apPage */
   u8 curIntKey;             /* Value of apPage[0]->intKey */
   u16 ix;                   /* Current index for apPage[iPage] */
@@ -566,6 +582,8 @@ struct BtCursor {
 #define BTCF_Incrblob     0x10   /* True if an incremental I/O handle */
 #define BTCF_Multiple     0x20   /* Maybe another cursor on the same btree */
 #define BTCF_Pinned       0x40   /* Cursor is busy and cannot be moved */
+#define BTCF_BfLeaf       0x80   /* Row served from BF cache; leaf not read.
+                                 ** pCur->bfLeaf holds the (un-read) leaf pgno. */
 
 /*
 ** Potential values for BtCursor.eState.

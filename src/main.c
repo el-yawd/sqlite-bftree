@@ -286,6 +286,21 @@ int sqlite3_initialize(void){
     memset(&sqlite3BuiltinFunctions, 0, sizeof(sqlite3BuiltinFunctions));
     sqlite3RegisterBuiltinFunctions();
     if( sqlite3GlobalConfig.isPCacheInit==0 ){
+#ifndef SQLITE_OMIT_BF_CACHE
+      /* Register the BF-tree cache as the global page-cache provider
+      ** before sqlite3PcacheInitialize() calls xInit().  At this point
+      ** isInit==0 so sqlite3_config() accepts the registration.
+      ** Applications can override this by calling
+      **   sqlite3_config(SQLITE_CONFIG_PCACHE2, &myMethods)
+      ** before sqlite3_initialize().
+      **
+      ** Only override if no application-supplied pcache2 was pre-registered.
+      */
+      if( sqlite3GlobalConfig.pcache2.xCreate==0 ){
+        void sqlite3BfCacheSetMethods(void);
+        sqlite3BfCacheSetMethods();
+      }
+#endif
       rc = sqlite3PcacheInitialize();
     }
     if( rc==SQLITE_OK ){

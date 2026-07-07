@@ -891,6 +891,29 @@ void sqlite3Pragma(
     break;
   }
 
+#ifndef SQLITE_OMIT_BF_CACHE
+  case PragTyp_BF_CACHE: {
+    extern void sqlite3PragmaBfCache(Parse*, const char*, const char*);
+    sqlite3PragmaBfCache(pParse, zDb, zRight);
+    break;
+  }
+  case PragTyp_BF_CACHE_SIZE: {
+    extern void sqlite3PragmaBfCacheSize(Parse*, const char*, const char*);
+    sqlite3PragmaBfCacheSize(pParse, zDb, zRight);
+    break;
+  }
+  case PragTyp_BF_CACHE_STATS: {
+    extern void sqlite3PragmaBfCacheStats(Parse*, const char*);
+    sqlite3PragmaBfCacheStats(pParse, zDb);
+    break;
+  }
+  case PragTyp_BF_PROMOTION_RATE: {
+    extern void sqlite3PragmaBfPromotionRate(Parse*, const char*, const char*);
+    sqlite3PragmaBfPromotionRate(pParse, zDb, zRight);
+    break;
+  }
+#endif
+
   /*
   **  PRAGMA [schema.]cache_spill
   **  PRAGMA cache_spill=BOOLEAN

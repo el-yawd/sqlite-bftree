@@ -183,6 +183,11 @@ int sqlite3HeaderSizePcache1(void);
 /* Number of dirty pages as a percentage of the configured cache size */
 int sqlite3PCachePercentDirty(PCache*);
 
+/* Return the underlying sqlite3_pcache object managed by a PCache.
+** Used by the BF-tree layer to reach the BfCache when BF is active
+** as the global pcache2 provider. */
+sqlite3_pcache *sqlite3PcacheGetUnderlying(PCache *p);
+
 #ifdef SQLITE_DIRECT_OVERFLOW_READ
 int sqlite3PCacheIsDirty(PCache *pCache);
 #endif

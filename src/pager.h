@@ -38,6 +38,11 @@ typedef u32 Pgno;
 typedef struct Pager Pager;
 
 /*
+** BF-Tree cache structure (P0.3).
+*/
+typedef struct BfCache BfCache;
+
+/*
 ** Handle type for pages.
 */
 typedef struct PgHdr DbPage;
@@ -184,6 +189,7 @@ int sqlite3PagerSync(Pager *pPager, const char *zSuper);
 int sqlite3PagerCommitPhaseTwo(Pager*);
 int sqlite3PagerRollback(Pager*);
 int sqlite3PagerOpenSavepoint(Pager *pPager, int n);
+int sqlite3PagerNSavepoint(Pager *pPager);
 int sqlite3PagerSavepoint(Pager *pPager, int op, int iSavepoint);
 int sqlite3PagerSharedLock(Pager *pPager);
 
@@ -259,5 +265,12 @@ void sqlite3PagerRekey(DbPage*, Pgno, u16);
 #if defined(SQLITE_USE_SEH) && !defined(SQLITE_OMIT_WAL)
 int sqlite3PagerWalSystemErrno(Pager*);
 #endif
+
+/* P0.3: Per-pager BF-Tree cache */
+void sqlite3PagerOpenBfCache(Pager *pPager);
+int sqlite3PagerUsesBfCache(Pager *pPager);
+BfCache *sqlite3PagerGetBfCache(Pager *pPager);
+void sqlite3BfClosePagerCache(Pager *pPager);
+BfCache *sqlite3BfGetPagerCache(Pager *pPager);
 
 #endif /* SQLITE_PAGER_H */

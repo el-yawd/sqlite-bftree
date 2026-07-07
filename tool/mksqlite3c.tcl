@@ -417,9 +417,12 @@ set flist {
    bitvec.c
    pcache.c
    pcache1.c
+   bf_cache.c
    bf_circular_buffer.c
    bf_mini_page.c
    bf_mapping.c
+   bf_btree.c
+   bf_config.c
    rowset.c
    pager.c
    wal.c

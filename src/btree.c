@@ -14,6 +14,7 @@
 ** Including a description of file format and an overview of operation.
 */
 #include "btreeInt.h"
+#include "bf_cache.h"
 
 /*
 ** The header string that appears at the beginning of every
@@ -775,7 +776,15 @@ static int saveCursorPosition(BtCursor *pCur){
     pCur->eState = CURSOR_REQUIRESEEK;
   }
 
-  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl|BTCF_AtLast);
+  /* A BF-served cursor (BTCF_BfLeaf) holds no live page; its saved position is
+  ** just the rowid (captured by saveCursorKey above), so drop the flag and let
+  ** the restore re-seek (possibly re-serving from BF) from a clean state. */
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl|BTCF_AtLast|BTCF_BfLeaf);
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+  /* The parked leaf is being released; a merge cursor can no longer be ON a
+  ** buffered insert.  bfMerge is kept so btreeRestoreCursorPosition bails. */
+  pCur->bfOnMini = 0;
+#endif
   return rc;
 }
 
@@ -850,6 +859,13 @@ void sqlite3BtreeClearCursor(BtCursor *pCur){
   sqlite3_free(pCur->pKey);
   pCur->pKey = 0;
   pCur->eState = CURSOR_INVALID;
+#ifndef SQLITE_OMIT_BF_CACHE
+  pCur->curFlags &= ~BTCF_BfLeaf;   /* no live position ⇒ no BF-served state */
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+  pCur->bfMerge = 0;
+  pCur->bfOnMini = 0;
+# endif
+#endif
 }
 
 /*
@@ -901,6 +917,16 @@ static int btreeRestoreCursorPosition(BtCursor *pCur){
   if( pCur->eState==CURSOR_FAULT ){
     return pCur->skipNext;
   }
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* A merge scan (Stage 2.2) cannot resume across a save/restore — its position
+  ** may be a buffered insert with no base cell.  Restore happens at safe points
+  ** (btreeNext / sqlite3BtreeCursorRestore), so bail here: flush the table's
+  ** buffered rows to the base tree, drop merge mode, and re-seek by the saved
+  ** rowid into the now-materialised base.  Correct because no buffers remain. */
+  if( pCur->bfMerge ){
+    sqlite3BfBtreeMergeBail(pCur);
+  }
+#endif
   pCur->eState = CURSOR_INVALID;
   if( sqlite3FaultSim(410) ){
     rc = SQLITE_IOERR;
@@ -2404,6 +2430,9 @@ static int getAndInitPage(
   }
   assert( pPage->pgno==pgno || CORRUPT_DB );
   assert( pPage->aData==sqlite3PagerGetData(pDbPage) );
+#ifdef SQLITE_BF_TRACE
+  sqlite3_log(SQLITE_NOTICE, "btree: getAndInitPage pgno=%u pDbPage=%p pPage=%p isInit=%d", pgno, pDbPage, (void*)pPage, pPage->isInit);
+#endif
   *ppPage = pPage;
   return SQLITE_OK;
 }
@@ -3591,6 +3620,27 @@ int sqlite3BtreeNewDb(Btree *p){
 ** when A already has a read lock, we encourage A to give up and let B
 ** proceed.
 */
+
+/*
+** Open pager savepoints on behalf of the btree layer, flushing any
+** BF-buffered records to base pages first whenever a NEW pager savepoint
+** is about to be created.  The flush establishes the invariant that no
+** dirty BF record predates an open savepoint: pages written by the flush
+** are journalled by the savepoint about to open, so a later savepoint
+** rollback restores them, and any record still dirty at rollback time must
+** have been buffered after the savepoint opened.  That makes it safe for
+** sqlite3BtreeSavepoint(SAVEPOINT_ROLLBACK) to discard the entire BF cache.
+*/
+static int btreeOpenSavepoint(Btree *p, int nSavepoint){
+  Pager *pPager = p->pBt->pPager;
+#ifndef SQLITE_OMIT_BF_CACHE
+  if( nSavepoint>sqlite3PagerNSavepoint(pPager) ){
+    sqlite3BfBtreeFlushAllDirty(p);
+  }
+#endif
+  return sqlite3PagerOpenSavepoint(pPager, nSavepoint);
+}
+
 static SQLITE_NOINLINE int btreeBeginTrans(
   Btree *p,                 /* The btree in which to start the transaction */
   int wrflag,               /* True to start a write transaction */
@@ -3790,7 +3840,7 @@ trans_begun:
       ** open savepoints. If the second parameter is greater than 0 and
       ** the sub-journal is not already open, then it will be opened here.
       */
-      rc = sqlite3PagerOpenSavepoint(pPager, p->db->nSavepoint);
+      rc = btreeOpenSavepoint(p, p->db->nSavepoint);
     }
   }
 
@@ -3815,7 +3865,7 @@ int sqlite3BtreeBeginTrans(Btree *p, int wrflag, int *pSchemaVersion){
     ** open savepoints. If the second parameter is greater than 0 and
     ** the sub-journal is not already open, then it will be opened here.
     */
-    return sqlite3PagerOpenSavepoint(pBt->pPager, p->db->nSavepoint);
+    return btreeOpenSavepoint(p, p->db->nSavepoint);
   }else{
     return SQLITE_OK;
   }
@@ -3955,6 +4005,14 @@ static int relocatePage(
   assert( sqlite3_mutex_held(pBt->mutex) );
   assert( pDbPage->pBt==pBt );
   if( iDbPage<3 ) return SQLITE_CORRUPT_BKPT;
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_DEBUG)
+  /* Stage 1.5 page-lifecycle invariant: BF is disabled for auto-vacuum DBs
+  ** (btreeUsesBfCache), so relocation must never encounter a BF mini-page on
+  ** the page it moves or on the destination — otherwise the pgno-keyed cache
+  ** would be orphaned/corrupted. */
+  assert( !sqlite3BfBtreeDebugHasMiniPage(pBt, iDbPage) );
+  assert( !sqlite3BfBtreeDebugHasMiniPage(pBt, iFreePage) );
+#endif
 
   /* Move page iDbPage from its current location to page number iFreePage */
   TRACE(("AUTOVACUUM: Moving %u to free page %u (ptr page %u type %u)\n",
@@ -4311,6 +4369,12 @@ int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
   if( p->inTrans==TRANS_WRITE ){
     BtShared *pBt = p->pBt;
     sqlite3BtreeEnter(p);
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* Flush any BF write-buffered inserts to their base B-tree pages before
+    ** the pager commits.  With journal_mode=OFF / synchronous=OFF this is
+    ** the only "persistence" step for BF-buffered rows. */
+    sqlite3BfBtreeFlushAllDirty(p);
+#endif
 #ifndef SQLITE_OMIT_AUTOVACUUM
     if( pBt->autoVacuum ){
       rc = autoVacuumCommit(p);
@@ -4523,6 +4587,12 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
   assert( writeOnly==1 || writeOnly==0 );
   assert( tripCode==SQLITE_ABORT_ROLLBACK || tripCode==SQLITE_OK );
   sqlite3BtreeEnter(p);
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Discard any BF write-buffered inserts that were never committed to base
+  ** pages.  If we left BFOP_INSERT records in the mini-page they would appear
+  ** as live rows after the rollback, violating atomicity. */
+  sqlite3BfBtreeClearCache(p);
+#endif
   if( tripCode==SQLITE_OK ){
     rc = tripCode = saveAllCursors(pBt, 0, 0);
     if( rc ) writeOnly = 0;
@@ -4594,7 +4664,7 @@ int sqlite3BtreeBeginStmt(Btree *p, int iStatement){
   ** SQL statements. It is illegal to open, release or rollback any
   ** such savepoints while the statement transaction savepoint is active.
   */
-  rc = sqlite3PagerOpenSavepoint(pBt->pPager, iStatement);
+  rc = btreeOpenSavepoint(p, iStatement);
   sqlite3BtreeLeave(p);
   return rc;
 }
@@ -4615,6 +4685,9 @@ int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
   int rc = SQLITE_OK;
   if( p && p->inTrans==TRANS_WRITE ){
     BtShared *pBt = p->pBt;
+#ifndef SQLITE_OMIT_BF_CACHE
+    int nPagerSavepoint = sqlite3PagerNSavepoint(pBt->pPager);
+#endif
     assert( op==SAVEPOINT_RELEASE || op==SAVEPOINT_ROLLBACK );
     assert( iSavepoint>=0 || (iSavepoint==-1 && op==SAVEPOINT_ROLLBACK) );
     sqlite3BtreeEnter(p);
@@ -4625,6 +4698,21 @@ int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
       rc = sqlite3PagerSavepoint(pBt->pPager, op, iSavepoint);
     }
     if( rc==SQLITE_OK ){
+#ifndef SQLITE_OMIT_BF_CACHE
+      if( op==SAVEPOINT_ROLLBACK && iSavepoint<nPagerSavepoint ){
+        /* Base pages have been restored to their state at savepoint open.
+        ** Discard all BF state for this btree: dirty records can only have
+        ** been buffered after the savepoint opened (btreeOpenSavepoint
+        ** flushes before opening one), so they must not survive, and clean
+        ** cached records may no longer match the reverted base pages.
+        **
+        ** If iSavepoint>=nPagerSavepoint the savepoint never got a pager
+        ** savepoint (no write statement ran after it was created), the
+        ** pager rollback above was a no-op, and any dirty BF records
+        ** predate the savepoint — they must be kept, not discarded. */
+        sqlite3BfBtreeClearCache(p);
+      }
+#endif
       if( iSavepoint<0 && (pBt->btsFlags & BTS_INITIALLY_EMPTY)!=0 ){
         pBt->nPage = 0;
       }
@@ -4725,6 +4813,15 @@ static int btreeCursor(
   ** variables and link the cursor into the BtShared list.  */
   pCur->pgnoRoot = iTable;
   pCur->iPage = -1;
+#ifndef SQLITE_OMIT_BF_CACHE
+  pCur->bfLeaf = 0;
+  pCur->pBfScratch = 0;
+  pCur->nBfScratch = 0;
+  pCur->bfMerge = 0;
+  pCur->bfOnMini = 0;
+  pCur->bfMergeLeaf = 0;
+  pCur->bfIx = 0;
+#endif
   pCur->pKeyInfo = pKeyInfo;
   pCur->pBtree = p;
   pCur->pBt = pBt;
@@ -4845,6 +4942,9 @@ int sqlite3BtreeCloseCursor(BtCursor *pCur){
     unlockBtreeIfUnused(pBt);
     sqlite3_free(pCur->aOverflow);
     sqlite3_free(pCur->pKey);
+#ifndef SQLITE_OMIT_BF_CACHE
+    sqlite3_free(pCur->pBfScratch);
+#endif
     if( (pBt->openFlags & BTREE_SINGLE) && pBt->pCursor==0 ){
       /* Since the BtShared is not sharable, there is no need to
       ** worry about the missing sqlite3BtreeLeave() call here.  */
@@ -4885,6 +4985,23 @@ int sqlite3BtreeCloseCursor(BtCursor *pCur){
   #define assertCellInfo(x)
 #endif
 static SQLITE_NOINLINE void getCellInfo(BtCursor *pCur){
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Descent shortcut (Stage 1.6): the row is served from the BF mini-page and
+  ** pCur->info was fully populated (key, payload, pPayload->scratch) when the
+  ** shortcut fired.  pCur->pPage is the parent interior page, so parsing it
+  ** would be wrong — just trust the pre-built info. */
+  if( pCur->curFlags & BTCF_BfLeaf ){
+    pCur->curFlags |= BTCF_ValidNKey;
+    return;
+  }
+  /* Merge scan (Stage 2.2) positioned ON a buffered insert: pCur->info was
+  ** populated from the mini-page and pPage is a real (parked) leaf whose cell
+  ** at ix is a DIFFERENT row, so parsing it would be wrong — trust info. */
+  if( pCur->bfOnMini ){
+    pCur->curFlags |= BTCF_ValidNKey;
+    return;
+  }
+#endif
   if( pCur->info.nSize==0 ){
     pCur->curFlags |= BTCF_ValidNKey;
     btreeParseCell(pCur->pPage,pCur->ix,&pCur->info);
@@ -4941,6 +5058,16 @@ void sqlite3BtreeCursorUnpin(BtCursor *pCur){
 i64 sqlite3BtreeOffset(BtCursor *pCur){
   assert( cursorHoldsMutex(pCur) );
   assert( pCur->eState==CURSOR_VALID );
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* A BF-served cursor has no physical page/offset; materialise the real leaf
+  ** so the file offset reflects the actual on-page cell. */
+  if( pCur->curFlags & BTCF_BfLeaf ){
+    if( sqlite3BfBtreeMaterializeLeaf(pCur)!=SQLITE_OK
+     || pCur->eState!=CURSOR_VALID ){
+      return 0;
+    }
+  }
+#endif
   getCellInfo(pCur);
   return (i64)pCur->pBt->pageSize*((i64)pCur->pPage->pgno - 1) +
          (i64)(pCur->info.pPayload - pCur->pPage->aData);
@@ -5331,10 +5458,28 @@ static int accessPayload(
 ** the available payload.
 */
 int sqlite3BtreePayload(BtCursor *pCur, u32 offset, u32 amt, void *pBuf){
+  int rc;
+#ifndef SQLITE_OMIT_BF_CACHE
+  rc = sqlite3BfBtreeFetchPayload(pCur, offset, amt, pBuf);
+  if( rc==SQLITE_OK ) return SQLITE_OK;
+  if( rc!=SQLITE_NOTFOUND ) return rc;
+#endif
   assert( cursorHoldsMutex(pCur) );
   assert( pCur->eState==CURSOR_VALID );
   assert( pCur->iPage>=0 && pCur->pPage );
-  return accessPayload(pCur, offset, amt, (unsigned char*)pBuf, 0);
+  rc = accessPayload(pCur, offset, amt, (unsigned char*)pBuf, 0);
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Promote rowid-table records only.  Index records have no BF read path
+  ** (index lookups never consult the BF cache), so promoting them would
+  ** just pollute the mini-page with unreachable entries. */
+  if( rc==SQLITE_OK && pCur->curIntKey ){
+    if( offset==0 && amt==(u32)pCur->info.nPayload ){
+      (void)sqlite3BfBtreePromoteRecord(pCur,
+          &pCur->info.nKey, sizeof(pCur->info.nKey), pBuf, (int)amt);
+    }
+  }
+#endif
+  return rc;
 }
 
 /*
@@ -5355,12 +5500,40 @@ static SQLITE_NOINLINE int accessPayloadChecked(
   }
   assert( cursorOwnsBtShared(pCur) );
   rc = btreeRestoreCursorPosition(pCur);
-  return rc ? rc : accessPayload(pCur, offset, amt, pBuf, 0);
+  if( rc ) return rc;
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* accessPayload reads from the physical leaf; a re-seek above may have left
+  ** the cursor BF-served, so materialise the real leaf first. */
+  if( pCur->curFlags & BTCF_BfLeaf ){
+    rc = sqlite3BfBtreeMaterializeLeaf(pCur);
+    if( rc ) return rc;
+  }
+#endif
+  return accessPayload(pCur, offset, amt, pBuf, 0);
 }
 int sqlite3BtreePayloadChecked(BtCursor *pCur, u32 offset, u32 amt, void *pBuf){
+  int rc;
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* The blob interface reads via accessPayload (physical page); a BF-served
+  ** cursor has no leaf, so re-descend onto the real one first. */
+  if( (pCur->curFlags & BTCF_BfLeaf) && pCur->eState==CURSOR_VALID ){
+    rc = sqlite3BfBtreeMaterializeLeaf(pCur);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+#endif
   if( pCur->eState==CURSOR_VALID ){
     assert( cursorOwnsBtShared(pCur) );
-    return accessPayload(pCur, offset, amt, pBuf, 0);
+    rc = accessPayload(pCur, offset, amt, pBuf, 0);
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* Rowid tables only — see sqlite3BtreePayload. */
+    if( rc==SQLITE_OK && pCur->curIntKey ){
+      if( offset==0 && amt==(u32)pCur->info.nPayload ){
+        (void)sqlite3BfBtreePromoteRecord(pCur,
+            &pCur->info.nKey, sizeof(pCur->info.nKey), pBuf, (int)amt);
+      }
+    }
+#endif
+    return rc;
   }else{
     return accessPayloadChecked(pCur, offset, amt, pBuf);
   }
@@ -5391,6 +5564,15 @@ static const void *fetchPayload(
   u32 *pAmt            /* Write the number of available bytes here */
 ){
   int amt;
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Descent shortcut (Stage 1.6): the row was served from the BF mini-page and
+  ** the leaf was never read, so info.pPayload points into the cursor's scratch
+  ** buffer, not into a page.  Return that directly. */
+  if( (pCur->curFlags & BTCF_BfLeaf) || pCur->bfOnMini ){
+    *pAmt = (u32)pCur->info.nLocal;
+    return (void*)pCur->info.pPayload;
+  }
+#endif
   assert( pCur!=0 && pCur->iPage>=0 && pCur->pPage);
   assert( pCur->eState==CURSOR_VALID );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
@@ -5406,6 +5588,11 @@ static const void *fetchPayload(
     assert( CORRUPT_DB );
     amt = MAX(0, (int)(pCur->pPage->aDataEnd - pCur->info.pPayload));
   }
+#ifndef SQLITE_OMIT_BF_CACHE
+  if( pCur->curIntKey ){
+    (void)sqlite3BfBtreeRecordExists(pCur, &pCur->info.nKey, sizeof(pCur->info.nKey));
+  }
+#endif
   *pAmt = (u32)amt;
   return (void*)pCur->info.pPayload;
 }
@@ -5544,6 +5731,18 @@ static int moveToRoot(BtCursor *pCur){
   int rc = SQLITE_OK;
 
   assert( cursorOwnsBtShared(pCur) );
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* A fresh descent from the root: drop any leaf-less BF-served state left on
+  ** the cursor (the descent re-establishes it via the shortcut if it hits). */
+  pCur->curFlags &= ~BTCF_BfLeaf;
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Drop stale merge-scan state so it never leaks into a later point read
+  ** (where pCur->bfMerge would wrongly suppress promotion).  sqlite3BtreeFirst
+  ** re-arms it after positioning. */
+  pCur->bfMerge = 0;
+  pCur->bfOnMini = 0;
+# endif
+#endif
   assert( CURSOR_INVALID < CURSOR_REQUIRESEEK );
   assert( CURSOR_VALID   < CURSOR_REQUIRESEEK );
   assert( CURSOR_FAULT   > CURSOR_REQUIRESEEK );
@@ -5673,16 +5872,191 @@ static int moveToRightmost(BtCursor *pCur){
 ** on success.  Set *pRes to 0 if the cursor actually points to something
 ** or set *pRes to 1 if the table is empty.
 */
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+/*
+** Merge-scan engine (Stage 2.2).  Rowid of the base cell at index ix on the
+** intkey leaf pPage, read without disturbing pCur->info.
+*/
+static i64 bfBaseCellRowid(MemPage *pPage, int ix){
+  CellInfo info;
+  btreeParseCell(pPage, ix, &info);
+  return info.nKey;
+}
+
+/*
+** Position a merge cursor on the next row in rowid order, drawing from the base
+** cells of the current leaf and that leaf's buffered BFOP_INSERT records, and
+** crossing to following leaves as both are exhausted.  On entry pCur->ix is the
+** current base-cell candidate (may equal nCell ⇒ base exhausted on this leaf);
+** pCur->pPage is a leaf.  Returns SQLITE_OK (positioned on a base cell with
+** bfOnMini=0, or on a buffered insert with bfOnMini=1 and pPage/ix parked at the
+** next base cell), SQLITE_DONE (no more rows), or an error code.
+**
+** Clean records are skipped inside sqlite3BfBtreeMergeNextInsert, and promotion
+** is suppressed for the whole scan, so the dirty mini-page (and pCur->bfIx into
+** it) is stable across steps.  Two streams normally never collide (the insert
+** hook only buffers brand-new keys), but write-back deletes (Stage 2.3) make
+** two collisions possible: a base cell carrying a BFOP_DELETE tombstone is
+** suppressed, and a base cell whose key was re-inserted (BFOP_INSERT) after a
+** buffered delete is shadowed by the new value — both handled below.
+*/
+static int bfMergePick(BtCursor *pCur){
+  for(;;){
+    MemPage *pPage = pCur->pPage;
+    int haveBase, haveIns, foundIx, insVal = 0, r;
+    i64 insKey = 0, baseKey = 0;
+
+    if( !pPage->leaf ) return SQLITE_CORRUPT_BKPT;
+    if( pPage->pgno!=pCur->bfMergeLeaf ){
+      pCur->bfMergeLeaf = pPage->pgno;
+      pCur->bfIx = 0;
+    }
+    haveBase = (pCur->ix < pPage->nCell);
+    foundIx = pCur->bfIx;
+    r = sqlite3BfBtreeMergeNextInsert(pCur, pPage->pgno, &foundIx, &insKey,
+            pCur->pBfScratch, pCur->nBfScratch, &insVal);
+    if( r<0 ) return SQLITE_CORRUPT_BKPT;   /* impossible: keys are 8-byte rowid */
+    haveIns = (r==1);
+    if( haveBase ) baseKey = bfBaseCellRowid(pPage, pCur->ix);
+
+    if( haveIns && (!haveBase || insKey<=baseKey) ){
+      pCur->bfIx = foundIx + 1;             /* consume this insert */
+      if( haveBase && insKey==baseKey ){
+        /* Shadow/update (Stage 2.3): the buffered insert's key still has a
+        ** physical base cell — a re-insert of a row deleted earlier in this
+        ** transaction (the write-back tombstone was overwritten in-place by the
+        ** new BFOP_INSERT, leaving the old base cell behind).  Emit the new
+        ** value and drop the stale base cell.  Without write-back deletes a
+        ** buffered insert key can never equal a base cell key, so this never
+        ** fires (the insert hook only buffers brand-new keys). */
+        pCur->ix++;
+      }
+      pCur->info.nKey     = insKey;
+      pCur->info.pPayload = (u8*)pCur->pBfScratch;
+      pCur->info.nPayload = (u32)insVal;
+      pCur->info.nLocal   = (u16)insVal;
+      pCur->info.nSize    = (u16)(insVal>0 ? insVal : 1);
+      pCur->bfOnMini = 1;
+      pCur->eState = CURSOR_VALID;
+      pCur->curFlags |= BTCF_ValidNKey;
+      pCur->curFlags &= ~BTCF_ValidOvfl;
+      return SQLITE_OK;
+    }
+    if( haveBase ){
+#if !defined(SQLITE_BF_NO_WRITEBACK_DELETE)
+      /* Tombstone suppression (Stage 2.3): a base cell logically removed by a
+      ** buffered write-back delete must not be emitted.  Skip it and re-evaluate
+      ** (the peeked insert, if any, is preserved via bfIx=foundIx).  Only a dirty
+      ** BFOP_DELETE suppresses; a clean PHANTOM does not (KeyTombstoned checks). */
+      if( sqlite3BfBtreeKeyTombstoned(pCur, pPage->pgno, baseKey) ){
+        BfCache *pBfTomb = btreeGetBfCache(pCur->pBt);
+        if( pBfTomb ) pBfTomb->nMergeTombstones++;
+        pCur->bfIx = foundIx;               /* keep the peeked insert */
+        pCur->ix++;                         /* advance past the suppressed cell */
+        continue;
+      }
+#endif
+      pCur->bfIx = foundIx;                 /* keep the peeked insert for later */
+      pCur->bfOnMini = 0;
+      pCur->info.nSize = 0;
+      pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+      pCur->eState = CURSOR_VALID;
+      return SQLITE_OK;
+    }
+    /* Base exhausted on this leaf and no more inserts here: cross to the next
+    ** leaf with the stock end-of-leaf walk (merge briefly disabled), then loop
+    ** to re-evaluate against the new leaf. */
+    pCur->bfIx = foundIx;
+    {
+      int rc;
+      pCur->bfMerge = 0;
+      pCur->bfOnMini = 0;
+      pCur->ix = pPage->nCell>0 ? pPage->nCell-1 : 0;
+      rc = sqlite3BtreeNext(pCur, 0);
+      pCur->bfMerge = 1;
+      if( rc==SQLITE_DONE ) return SQLITE_DONE;
+      if( rc!=SQLITE_OK ) return rc;
+    }
+  }
+}
+
+/*
+** Ensure the per-cursor scratch buffer used to serve buffered-insert payloads
+** is allocated.  Returns SQLITE_OK or SQLITE_NOMEM.
+*/
+static int bfMergeEnsureScratch(BtCursor *pCur){
+  if( pCur->nBfScratch < (int)BF_MAX_MINI_PAGE ){
+    char *p = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
+    if( p==0 ) return SQLITE_NOMEM_BKPT;
+    pCur->pBfScratch = p;
+    pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
+  }
+  return SQLITE_OK;
+}
+#endif /* SQLITE_BF_INSERT_BUFFERING */
+
 int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
   int rc;
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  int bMerge;
+#endif
 
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Forward full scans merge-iterate buffered inserts instead of flushing
+  ** (Stage 2.2).  When merge is not armed, flush BF-buffered inserts BEFORE
+  ** moveToRoot: if all rows are in the BF mini-page (base B-tree empty),
+  ** moveToRoot would return SQLITE_EMPTY and make those rows invisible.
+  ** Flushing here is safe — the cursor is uninitialised (iPage == -1). */
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+  bMerge = sqlite3BfBtreeBeginMergeScan(pCur);
+  if( !bMerge )
+# endif
+  (void)sqlite3BfBtreePrepareForScan(pCur);
+#endif
   rc = moveToRoot(pCur);
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  if( bMerge && rc==SQLITE_EMPTY ){
+    /* Base tree empty but inserts may be buffered: flush and re-root plain. */
+    sqlite3BfBtreeMergeBail(pCur);
+    bMerge = 0;
+    rc = moveToRoot(pCur);
+  }
+#endif
   if( rc==SQLITE_OK ){
+#ifndef SQLITE_OMIT_BF_CACHE
+    if(
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+       !bMerge &&
+# endif
+       sqlite3BfBtreePrepareForScan(pCur) ){
+      /* Safety net (non-merge): handles records left dirty after the pre-flush
+      ** above.  saveAllCursors() set pCur to CURSOR_REQUIRESEEK — re-root. */
+      rc = moveToRoot(pCur);
+      if( rc==SQLITE_EMPTY ){
+        *pRes = 1;
+        return SQLITE_OK;
+      }
+      if( rc!=SQLITE_OK ) return rc;
+    }
+#endif
     assert( pCur->pPage->nCell>0 );
     *pRes = 0;
     rc = moveToLeftmost(pCur);
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+    if( rc==SQLITE_OK && bMerge ){
+      rc = bfMergeEnsureScratch(pCur);
+      if( rc==SQLITE_OK ){
+        pCur->bfMerge = 1;        /* re-arm (moveToRoot cleared it) and pick */
+        pCur->bfMergeLeaf = 0;
+        pCur->bfIx = 0;
+        pCur->bfOnMini = 0;
+        rc = bfMergePick(pCur);
+        if( rc==SQLITE_DONE ){ *pRes = 1; rc = SQLITE_OK; }
+      }
+    }
+#endif
   }else if( rc==SQLITE_EMPTY ){
     assert( pCur->pgnoRoot==0 || (pCur->pPage!=0 && pCur->pPage->nCell==0) );
     *pRes = 1;
@@ -5758,6 +6132,16 @@ int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
 
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Flush BF-buffered inserts before locating the last entry.  OP_NewRowid
+  ** uses BtreeLast to find the maximum rowid; if the most recent inserts are
+  ** still buffered in the BF mini-page, the base B-tree's last rowid is stale
+  ** and the VDBE would hand out a duplicate rowid that silently overwrites
+  ** the buffered row.  If a flush occurs, saveAllCursors moves this cursor
+  ** to CURSOR_REQUIRESEEK, which also disarms the BTCF_AtLast shortcut. */
+  (void)sqlite3BfBtreePrepareForScan(pCur);
+#endif
+
   /* If the cursor already points to the last entry, this is a no-op. */
   if( CURSOR_VALID==pCur->eState && (pCur->curFlags & BTCF_AtLast)!=0 ){
     assert( cursorIsAtLastEntry(pCur) || CORRUPT_DB );
@@ -5790,6 +6174,53 @@ int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
 **     *pRes>0      The cursor is left pointing at an entry that
 **                  is larger than intKey.
 */
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_DESCENT_SHORTCUT)
+/*
+** Descent shortcut (Stage 1.6): serve a point read straight from the BF
+** mini-page cache without reading the leaf page chldPg.  On success the cursor
+** is left in the leaf-less BTCF_BfLeaf state with pCur->info fully populated
+** (key + the payload bytes copied into the per-cursor scratch buffer) and
+** SQLITE_OK is returned.  On any failure (raced/evicted/oversized/OOM) the
+** BTCF_BfLeaf flag is cleared and SQLITE_NOTFOUND is returned, so the caller
+** continues the normal descent and reads the real leaf.
+*/
+static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
+  int n;
+
+  /* Provisional leaf-less keying so the BF read helpers resolve to chldPg. */
+  pCur->bfLeaf = chldPg;
+  pCur->curFlags |= BTCF_BfLeaf;
+  pCur->info.nKey = intKey;
+
+  /* One scratch buffer per cursor, sized once to the max record class and
+  ** reused across serves (BF records never exceed BF_MAX_MINI_PAGE). */
+  if( pCur->nBfScratch<(int)BF_MAX_MINI_PAGE ){
+    char *pNew = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
+    if( pNew==0 ){ pCur->curFlags &= ~BTCF_BfLeaf; return SQLITE_NOTFOUND; }
+    pCur->pBfScratch = pNew;
+    pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
+  }
+
+  /* Single mini-page read: copies the record bytes and returns the length. */
+  n = sqlite3BfBtreeReadCachedRecord(pCur, pCur->pBfScratch, pCur->nBfScratch);
+  if( n<0 ){
+    pCur->curFlags &= ~BTCF_BfLeaf;
+    return SQLITE_NOTFOUND;
+  }
+  /* Populate the cell info the read path consumes.  BF records never overflow
+  ** (capped at BF_MAX_MINI_PAGE) so nLocal==nPayload; nSize is set nonzero so
+  ** getCellInfo() trusts this info instead of parsing the (parent) page. */
+  pCur->info.nKey     = intKey;
+  pCur->info.pPayload = (u8*)pCur->pBfScratch;
+  pCur->info.nPayload = (u32)n;
+  pCur->info.nLocal   = (u16)n;
+  pCur->info.nSize    = (u16)(n>0 ? n : 1);
+  pCur->curFlags |= BTCF_ValidNKey;
+  pCur->curFlags &= ~BTCF_ValidOvfl;
+  return SQLITE_OK;
+}
+#endif
+
 int sqlite3BtreeTableMoveto(
   BtCursor *pCur,          /* The cursor to be moved */
   i64 intKey,              /* The table key */
@@ -5902,6 +6333,28 @@ int sqlite3BtreeTableMoveto(
           pCur->info.nKey = nCellKey;
           pCur->info.nSize = 0;
           *pRes = 0;
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
+ && !defined(SQLITE_BF_NO_WRITEBACK_DELETE)
+          /* Write-back delete (Stage 2.3): the base cell physically exists but
+          ** may carry a live BFOP_DELETE tombstone (the row was deleted earlier
+          ** in this transaction without removing the cell).  A tombstone makes
+          ** the row absent — report not-found so point seeks, OP_NotExists
+          ** uniqueness checks and the insert re-seek all agree with the merge
+          ** scan.  This exact-match return bypasses moveto_table_finish, so the
+          ** shared bf_status==2 handling never sees it; check here.  Skipped for
+          ** BF-served cursors (no physical leaf) — KeyTombstoned no-ops fast
+          ** (one map lookup) when the leaf has no mini-page or BF is off/bypass. */
+          if( (pCur->curFlags & BTCF_BfLeaf)==0
+           && sqlite3BfBtreeKeyTombstoned(pCur, pPage->pgno, intKey) ){
+            /* Report not-found, and DROP the exact-key claim: the cursor is
+            ** physically parked on the (tombstoned) cell, but leaving
+            ** BTCF_ValidNKey + info.nKey==intKey set would make the insert
+            ** overwrite path and the TableMoveto fast-path treat it as an exact
+            ** hit (loc==0), contradicting *pRes and tripping asserts. */
+            pCur->curFlags &= ~BTCF_ValidNKey;
+            *pRes = -1;
+          }
+#endif
           return SQLITE_OK;
         }
       }
@@ -5924,13 +6377,122 @@ moveto_table_next_layer:
       chldPg = get4byte(findCell(pPage, lwr));
     }
     pCur->ix = (u16)lwr;
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_DESCENT_SHORTCUT)
+    /* Descent shortcut (Stage 1.6): if chldPg is a leaf with a CLEAN cached
+    ** record for intKey, serve it straight from the BF mini-page and skip the
+    ** (possibly cold) leaf-page read entirely.  pCur stays parked on the parent
+    ** interior page; bfLeaf records the un-read leaf and BTCF_BfLeaf routes the
+    ** subsequent point payload read through the BF cache.  Only fires at the
+    ** true leaf edge (interior pgnos are never in the BF map).  Any non-point
+    ** cursor op re-descends for real first (see getCellInfo / Next / etc.). */
+    if( sqlite3BfBtreeDescentProbe(pCur, chldPg, intKey)
+     && btreeBfServeFromCache(pCur, chldPg, intKey)==SQLITE_OK
+    ){
+      *pRes = 0;
+      return SQLITE_OK;         /* row served from BF; leaf page not read */
+    }
+#endif
     rc = moveToChild(pCur, chldPg);
     if( rc ) break;
   }
 moveto_table_finish:
+#ifndef SQLITE_OMIT_BF_CACHE
+  if( rc==SQLITE_OK && pCur->eState==CURSOR_VALID && pCur->curIntKey ){
+    int bf_status = sqlite3BfBtreeRecordExists(pCur, &intKey, sizeof(intKey));
+    if( bf_status == 1 ){
+#ifdef SQLITE_BF_INSERT_BUFFERING
+      /* The key is buffered.  Tell a clean read-cache shadow apart from a dirty
+      ** buffered insert by the base search result *pRes:
+      **   *pRes==0 — the base HAS this exact cell, so this is a clean BFOP_CACHE
+      **              shadow and the descent is on the real cell: fast fake below.
+      **   *pRes!=0 — the base has NO cell for this key (a dirty BFOP_INSERT never
+      **              shadows a base row), so the descent parked the cursor on a
+      **              NEIGHBOUR.  Faking here would serve the neighbour's
+      **              key/payload (getCellInfo re-derives pCur->info from the
+      **              physical cell).  Materialise the table's buffered rows and
+      **              re-descend so the cursor lands on the now-real cell.
+      ** This only flushes when the EXACT probed key is a dirty buffered insert,
+      ** so the common existence-probe before an INSERT (key absent everywhere,
+      ** bf_status==0) never pays it — that is what keeps write buffering a win.
+      ** Range scans need ALL in-range buffered rows materialised regardless of
+      ** the seek key, so they flush separately at the OP_Seek{GE,GT,LE,LT}
+      ** opcodes (vdbe.c) before iterating.  (Serving dirty rows straight from
+      ** the mini-page without this round-trip is Stage 1.6 / Phase 2 work.) */
+      if( *pRes!=0 ){
+        if( sqlite3BfBtreeFlushTableForMutation(pCur)>0 ){
+          return sqlite3BtreeTableMoveto(pCur, intKey, biasRight, pRes);
+        }
+        /* Flush was a no-op (bypass/merge in progress): leave the base
+        ** not-found result rather than fake a neighbour. */
+      }else
+#endif
+      {
+        *pRes = 0;
+        rc = SQLITE_OK;
+        pCur->curFlags |= BTCF_ValidNKey;
+        pCur->info.nKey = intKey;
+      }
+    }else if( bf_status == 2 ){
+      /* Tombstone or phantom: the row must appear absent.  Only force "not
+      ** found" when the base search landed on an exact match (*pRes==0) — a
+      ** row the base still holds that BF says is deleted.  Otherwise the base
+      ** already reports not-found, and its *pRes encodes the cursor's true
+      ** position relative to intKey; clobbering it to -1 makes a range scan
+      ** believe the parked cell is *smaller* than the start key and Next past
+      ** it, dropping a live row (e.g. DELETE id=3 then scan WHERE id>=3 skips
+      ** the next surviving row).  Leave the base result intact in that case. */
+      if( *pRes==0 ){
+        *pRes = -1;
+      }
+      rc = SQLITE_OK;
+    }else if( bf_status == 0 && *pRes!=0 ){
+      (void)sqlite3BfBtreeCachePhantom(pCur, &intKey, sizeof(intKey));
+    }
+  }
+#endif
   pCur->info.nSize = 0;
   assert( (pCur->curFlags & BTCF_ValidOvfl)==0 );
   return rc;
+}
+
+/*
+** Like sqlite3BtreeTableMoveto, but first materialises any BF-buffered rows of
+** this table into the base tree.  Used by the range-seek opcodes
+** (OP_Seek{GE,GT,LE,LT}) so the cursor then iterates a STABLE tree.
+**
+** Why this is needed and why it lives here rather than in plain TableMoveto:
+** a buffered BFOP_INSERT has no base cell, and OP_SeekGE finalises its position
+** by calling sqlite3BtreeNext (vdbe.c) when the landing cell is below the seek
+** key.  If that Next were to flush buffered rows mid-positioning it would mutate
+** the tree under an in-progress seek and step onto a row that violates the seek
+** bound (stress.sh seed 7: id>=16 wrongly yielded buffered 14,15).  Flushing
+** up-front here keeps Next mutation-free.  Plain TableMoveto can't do this
+** itself: it cannot tell a range-scan seek from the existence probe an INSERT
+** issues (OP_NotExists), and flushing on every probe would defeat write
+** buffering — so point probes only flush when the EXACT key is dirty
+** (moveto_table_finish), while range seeks flush wholesale through this wrapper.
+** In the write-through default build PrepareForScan early-outs (nothing
+** buffered), so this is a no-op there.
+*/
+int sqlite3BtreeTableMovetoForScan(
+  BtCursor *pCur,
+  i64 intKey,
+  int biasRight,
+  int *pRes
+){
+#ifndef SQLITE_OMIT_BF_CACHE
+  int rc;
+  (void)sqlite3BfBtreePrepareForScan(pCur);
+  /* Range seeks position for iteration, so keep them on the full descent (a
+  ** leaf-less BF serve would just materialise on the first Next).  Point seeks
+  ** (OP_SeekRowid/OP_NotExists) go through plain TableMoveto and stay eligible. */
+  sqlite3BfBtreeSuppressShortcut(pCur, +1);
+  rc = sqlite3BtreeTableMoveto(pCur, intKey, biasRight, pRes);
+  sqlite3BfBtreeSuppressShortcut(pCur, -1);
+  return rc;
+#else
+  return sqlite3BtreeTableMoveto(pCur, intKey, biasRight, pRes);
+#endif
 }
 
 /*
@@ -6246,6 +6808,16 @@ bypass_moveto_root:
     ***** End of in-lined moveToChild() call */
  }
 moveto_index_finish:
+  /* No BF-cache consultation for index btrees.  All index writes are
+  ** write-through (inserts have no BF buffering hook), so the base search
+  ** that just completed is authoritative.  Overriding its result from the
+  ** BF mini-page is never a win here — the search already happened — and a
+  ** cached phantom can go stale the moment the key is inserted (the insert
+  ** path has no hook to invalidate it), turning a found key into a false
+  ** "not found": OP_IdxDelete then reports index corruption and UNIQUE
+  ** probes silently admit duplicates.  Index record caching would need a
+  ** pre-search short-circuit plus insert/delete invalidation hooks with a
+  ** consistent key encoding to be sound. */
   pCur->info.nSize = 0;
   assert( (pCur->curFlags & BTCF_ValidOvfl)==0 );
   return rc;
@@ -6370,6 +6942,38 @@ int sqlite3BtreeNext(BtCursor *pCur, int flags){
   MemPage *pPage;
   UNUSED_PARAMETER( flags );  /* Used in COMDB2 but not native SQLite */
   assert( cursorOwnsBtShared(pCur) );
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Stepping needs a physical leaf: re-descend a BF-served cursor first. */
+  if( pCur->curFlags & BTCF_BfLeaf ){
+    int rcBf = sqlite3BfBtreeMaterializeLeaf(pCur);
+    if( rcBf!=SQLITE_OK ) return rcBf;
+  }
+#endif
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Merge scan (Stage 2.2): advance through the merged base+buffered-insert
+  ** stream.  An invalidated merge cursor (eState!=VALID) falls through to the
+  ** stock restore path, where btreeRestoreCursorPosition bails to a flush. */
+  if( pCur->bfMerge && pCur->eState==CURSOR_VALID ){
+    int rc;
+    pCur->info.nSize = 0;
+    pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+    if( pCur->bfOnMini ){
+      pCur->bfOnMini = 0;          /* consumed the insert; base candidate stays */
+    }else{
+      pCur->ix++;                  /* advance base within the current leaf */
+    }
+    rc = bfMergePick(pCur);
+    if( rc==SQLITE_DONE ){ pCur->eState = CURSOR_INVALID; return SQLITE_DONE; }
+    return rc;
+  }
+#endif
+  /* NOTE: no BF pre-scan flush here.  A flush mutates the base tree, and this
+  ** routine is called by OP_SeekGE/GT to FINALISE a seek position; flushing
+  ** mid-positioning made the seek step onto a just-materialised row that
+  ** violates the seek bound (stress.sh seed 7).  Every scan entry point now
+  ** flushes UP-FRONT instead: sqlite3BtreeFirst/Last, sqlite3BtreeCount, and
+  ** sqlite3BtreeTableMovetoForScan (the range-seek opcodes), so by the time we
+  ** iterate here the table's buffered rows are already in the base tree. */
   assert( flags==0 || flags==1 );
   pCur->info.nSize = 0;
   pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
@@ -6462,6 +7066,13 @@ int sqlite3BtreePrevious(BtCursor *pCur, int flags){
   assert( cursorOwnsBtShared(pCur) );
   assert( flags==0 || flags==1 );
   UNUSED_PARAMETER( flags );  /* Used in COMDB2 but not native SQLite */
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Stepping needs a physical leaf: re-descend a BF-served cursor first. */
+  if( pCur->curFlags & BTCF_BfLeaf ){
+    int rcBf = sqlite3BfBtreeMaterializeLeaf(pCur);
+    if( rcBf!=SQLITE_OK ) return rcBf;
+  }
+#endif
   pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidOvfl|BTCF_ValidNKey);
   pCur->info.nSize = 0;
   if( pCur->eState!=CURSOR_VALID
@@ -6833,6 +7444,15 @@ static int freePage2(BtShared *pBt, MemPage *pMemPage, Pgno iPage){
   if( iPage<2 || iPage>pBt->nPage ){
     return SQLITE_CORRUPT_BKPT;
   }
+
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* The page is leaving this table; its pgno may be recycled as a different
+  ** leaf (or a different table's page).  Drop any BF mini-page keyed by it so
+  ** a recycled pgno never serves stale read-cache from its previous life.
+  ** Phase 0/1 records are all clean, so dropping is always safe. */
+  sqlite3BfBtreeForgetPage(pBt, iPage);
+#endif
+
   if( pMemPage ){
     pPage = pMemPage;
     sqlite3PagerRef(pPage->pDbPage);
@@ -8369,6 +8989,22 @@ static int balance_nonroot(
     }
   }
 
+  /* BF per-leaf coherence: balancing redistributes cells among the sibling
+  ** leaves apOld[0..nOld-1] (and possibly recycles their pgnos for apNew[])
+  ** WITHOUT freeing the pages, so freePage2's ForgetPage hook never fires for
+  ** them.  A row can move A->B while its BFOP_CACHE/BFOP_PHANTOM mini-page
+  ** stays keyed to A, leaving stale wrong-leaf reads.  Drop the read-cache
+  ** mini-pages of every participating leaf now; reads fall back to base and
+  ** re-promote on the correct leaf.  (Write-back records return in Phase 2 and
+  ** will need re-routing here instead of forgetting — see Stage 1.4.) */
+#ifndef SQLITE_OMIT_BF_CACHE
+  for(i=0; i<nOld; i++){
+    if( apOld[i] && apOld[i]->leaf ){
+      sqlite3BfBtreeForgetPage(pBt, apOld[i]->pgno);
+    }
+  }
+#endif
+
   /* Make nMaxCells a multiple of 4 in order to preserve 8-byte
   ** alignment */
   nMaxCells = (nMaxCells + 3)&~3;
@@ -9464,6 +10100,10 @@ int sqlite3BtreeInsert(
       invalidateIncrblobCursors(p, pCur->pgnoRoot, pX->nKey, 0);
     }
 
+    /* BF per-leaf write buffering now happens AFTER the descent below, once
+    ** the target leaf (loc) is known — see the SQLITE_BF_INSERT_BUFFERING
+    ** block just before the base-page cell write. */
+
     /* If BTREE_SAVEPOSITION is set, the cursor must already be pointing
     ** to a row with the same key as the new entry being inserted.
     */
@@ -9487,6 +10127,13 @@ int sqlite3BtreeInsert(
        && pCur->info.nPayload==(u32)pX->nData+pX->nZero
       ){
         /* New entry is the same size as the old.  Do an overwrite */
+#ifndef SQLITE_OMIT_BF_CACHE
+        /* Refresh the leaf read cache with the new value (cursor is on the
+        ** row's leaf; an in-place overwrite never balances). */
+        if( pCur->curIntKey && pCur->pgnoRoot>1 ){
+          sqlite3BfBtreeCacheRecord(pCur, pX->nKey, pX->pData, pX->nData);
+        }
+#endif
         return btreeOverwriteCell(pCur, pX);
       }
       assert( loc==0 );
@@ -9545,6 +10192,63 @@ int sqlite3BtreeInsert(
   }
   assert( pCur->eState==CURSOR_VALID
        || (pCur->eState==CURSOR_INVALID && loc) || CORRUPT_DB );
+
+#ifndef SQLITE_OMIT_BF_CACHE
+# ifdef SQLITE_BF_INSERT_BUFFERING
+  /* Per-leaf write buffering (Phase 1).  A brand-new rowid (loc!=0) with a
+  ** small payload is buffered into the mini-page of the leaf the cursor has
+  ** descended to (BFOP_INSERT) and the base cell write is skipped; point reads
+  ** and scans see it through the BF read/merge paths.  Updates (loc==0) fall
+  ** through to the base write — this keeps a mini-page INSERT for a key that
+  ** also exists in the base leaf impossible, simplifying the merge rules.
+  ** Buffering is skipped during a flush replay (btreeGetBfCache() returns NULL
+  ** when bBypassActive), and for preformatted / save-position / zero-extended
+  ** writes. */
+  if( pCur->curIntKey
+   && pCur->pgnoRoot>1
+   && loc!=0
+   && pCur->eState==CURSOR_VALID
+   && (flags & (BTREE_SAVEPOSITION|BTREE_PREFORMAT))==0
+   && pX->pData!=0 && pX->nData>0 && pX->nData<=(int)BF_MAX_MINI_PAGE
+   && pX->nZero==0
+   && btreeGetBfCache(pCur->pBt)!=0
+  ){
+    u8 keyBuf[8];
+    i64 rid = pX->nKey;
+    int ki, bfrc;
+    for(ki=7; ki>=0; ki--){ keyBuf[ki]=(u8)(rid&0xff); rid>>=8; }
+    bfrc = sqlite3BfBtreeInsertCell(pCur, keyBuf, 8, pX->pData, pX->nData);
+    if( bfrc==SQLITE_OK ){
+      /* Buffered — no base cell.  Invalidate the cursor; a later read re-seeks
+      ** and BF serves the row, and the pre-scan flush materialises it. */
+      pCur->eState = CURSOR_INVALID;
+      pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+      return SQLITE_OK;
+    }
+    if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+    /* BF refused (full / not on a usable leaf) — fall through to base write. */
+  }
+
+  /* This insert/overwrite is going to the base tree and may rebalance or free
+  ** leaves.  Materialise this table's buffered rows first so balance_nonroot /
+  ** freePage2 never observe a dirty mini-page (per-leaf survival fallback),
+  ** then re-seek to the insert position (the flush replay invalidated the
+  ** cursor). */
+  if( pCur->curIntKey && pCur->pgnoRoot>1
+   && sqlite3BfBtreeFlushTableForMutation(pCur) ){
+    rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, (flags & BTREE_APPEND)!=0, &loc);
+    if( rc ) return rc;
+  }
+# endif /* SQLITE_BF_INSERT_BUFFERING */
+
+  /* Write-through the rowid record into the leaf read cache BEFORE the base
+  ** write, while the cursor is reliably on the target leaf (no balance yet).
+  ** Covers new inserts and non-same-size overwrites; the same-size overwrite
+  ** fast paths above call sqlite3BfBtreeCacheRecord on their own. */
+  if( pCur->curIntKey && pCur->pgnoRoot>1 && (flags & BTREE_PREFORMAT)==0 ){
+    sqlite3BfBtreeCacheRecord(pCur, pX->nKey, pX->pData, pX->nData);
+  }
+#endif
 
   pPage = pCur->pPage;
   assert( pPage->intKey || pX->nKey>=0 || (flags & BTREE_PREFORMAT) );
@@ -9833,6 +10537,9 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
   int iCellDepth;            /* Depth of node containing pCell */
   CellInfo info;             /* Size of the cell being deleted */
   u8 bPreserve;              /* Keep cursor valid.  2 for CURSOR_SKIPNEXT */
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  int bfWB;                  /* Stage 2.3: 1 ⇒ buffer a write-back tombstone */
+#endif
 
   assert( cursorOwnsBtShared(pCur) );
   assert( pBt->inTransaction==TRANS_WRITE );
@@ -9841,6 +10548,33 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
   assert( hasSharedCacheTableLock(p, pCur->pgnoRoot, pCur->pKeyInfo!=0, 2) );
   assert( !hasReadConflicts(p, pCur->pgnoRoot) );
   assert( (flags & ~(BTREE_SAVEPOSITION | BTREE_AUXDELETE))==0 );
+
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Stage 2.3 write-back eligibility, decided BEFORE the mutation flush.  A
+  ** write-back delete leaves the base tree untouched (it only buffers a dirty
+  ** BFOP_DELETE tombstone), so it must NOT pre-flush — flushing would
+  ** materialise this table's buffered rows and immediately delete the target,
+  ** defeating the buffering.  Scan-deletes (BTREE_SAVEPOSITION must keep the
+  ** cursor positioned for continued iteration) and aux/index deletes stay
+  ** write-through. */
+# if !defined(SQLITE_BF_NO_WRITEBACK_DELETE)
+  bfWB = pCur->curIntKey && pCur->pgnoRoot>1
+      && (flags & (BTREE_SAVEPOSITION|BTREE_AUXDELETE))==0
+      && btreeGetBfCache(pCur->pBt)!=0;
+# else
+  bfWB = 0;
+# endif
+  /* A base delete may merge or free this table's leaves.  Materialise its
+  ** buffered rows first so balance_nonroot / freePage2 never see a dirty
+  ** mini-page (per-leaf survival fallback).  The flush replay saves this
+  ** cursor; the eState!=CURSOR_VALID branch below restores it to the row being
+  ** deleted (by rowid), so a leaf moved by the flush is followed correctly.
+  ** Skipped for a write-back delete, which performs no base mutation. */
+  if( !bfWB && pCur->curIntKey && pCur->pgnoRoot>1 ){
+    sqlite3BfBtreeFlushTableForMutation(pCur);
+  }
+#endif
+
   if( pCur->eState!=CURSOR_VALID ){
     if( pCur->eState>=CURSOR_REQUIRESEEK ){
       rc = btreeRestoreCursorPosition(pCur);
@@ -9851,6 +10585,38 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
     }
   }
   assert( pCur->eState==CURSOR_VALID );
+
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
+ && !defined(SQLITE_BF_NO_WRITEBACK_DELETE)
+  /* Stage 2.3 — write-back delete.  Buffer a BFOP_DELETE tombstone on the leaf
+  ** the cursor is parked on and skip the physical cell removal.  The base cell
+  ** stays put; point reads, the descent shortcut and forward merge scans treat
+  ** it as absent, and the commit/scan flush replays the tombstone to remove it. */
+  if( bfWB ){
+    i64 rid;
+    int bfrc;
+    getCellInfo(pCur);
+    rid = pCur->info.nKey;
+    bfrc = sqlite3BfBtreeBufferDelete(pCur, &rid, sizeof(rid));
+    if( bfrc==SQLITE_OK ){
+      /* No BTREE_SAVEPOSITION here (gated off), so invalidate the cursor like a
+      ** buffered insert; a later read re-seeks and BF reports the row absent. */
+      pCur->eState = CURSOR_INVALID;
+      pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+      return SQLITE_OK;
+    }
+    if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+    /* BF refused (mini-page full at max size class): fall through to a base
+    ** delete.  We skipped the mutation flush above, so run it now and re-seek
+    ** to the row (the flush may have moved its leaf). */
+    if( sqlite3BfBtreeFlushTableForMutation(pCur) ){
+      int loc = 0;
+      rc = sqlite3BtreeTableMoveto(pCur, rid, 0, &loc);
+      if( rc ) return rc;
+      if( pCur->eState!=CURSOR_VALID || loc!=0 ) return SQLITE_OK; /* row gone */
+    }
+  }
+#endif
 
   iCellDepth = pCur->iPage;
   iCellIdx = pCur->ix;
@@ -9865,6 +10631,22 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
   if( pCell<&pPage->aCellIdx[pPage->nCell] ){
     return SQLITE_CORRUPT_PAGE(pPage);
   }
+
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Tombstone rowid-table deletes only.  Index btrees are write-through and
+  ** index lookups never consult the BF cache, so an index tombstone has no
+  ** consumer — and because it would be keyed by the raw cell payload (record
+  ** format, unlike the probe encoding) it could never be matched anyway.
+  ** Worse, a dirty index tombstone would be picked up by the commit flush,
+  ** which applies records through a rowid-table cursor on the index root. */
+  if( pCur->curIntKey ){
+    getCellInfo(pCur);
+    rc = sqlite3BfBtreeDeleteCell(pCur, &pCur->info.nKey, sizeof(pCur->info.nKey));
+    if( rc!=SQLITE_OK && rc!=SQLITE_FULL ){
+      return rc;
+    }
+  }
+#endif
 
   /* If the BTREE_SAVEPOSITION bit is on, then the cursor position must
   ** be preserved following this delete operation. If the current delete
@@ -10266,6 +11048,13 @@ int sqlite3BtreeClearTable(Btree *p, int iTable, i64 *pnChange){
   sqlite3BtreeEnter(p);
   assert( p->inTrans==TRANS_WRITE );
 
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Clearing/dropping a table frees its leaves page-by-page; materialise any
+  ** buffered rows first so the freePage2 hook only sees clean mini-pages and no
+  ** dirty record is orphaned on a freed pgno. */
+  sqlite3BfBtreeFlushAllDirty(p);
+#endif
+
   rc = saveAllCursors(pBt, (Pgno)iTable, 0);
 
   if( SQLITE_OK==rc ){
@@ -10489,6 +11278,14 @@ int sqlite3BtreeUpdateMeta(Btree *p, int idx, u32 iMeta){
 int sqlite3BtreeCount(sqlite3 *db, BtCursor *pCur, i64 *pnEntry){
   i64 nEntry = 0;                      /* Value to return in *pnEntry */
   int rc;                              /* Return code */
+
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* OP_Count bypasses BtreeFirst/BtreeNext entirely and counts cells
+  ** directly from B-tree pages.  Flush any BF-buffered inserts first so
+  ** the page-level cell counts include all rows.  The cursor is still
+  ** CURSOR_INVALID here; saveAllCursors is a no-op (iPage == -1). */
+  (void)sqlite3BfBtreePrepareForScan(pCur);
+#endif
 
   rc = moveToRoot(pCur);
   if( rc==SQLITE_EMPTY ){

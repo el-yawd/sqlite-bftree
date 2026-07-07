@@ -406,6 +406,22 @@ set pragma_def {
   TYPE: FLAG
   ARG:  SQLITE_LegacyAlter
   IF:   !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+
+  NAME: bf_cache
+  TYPE: BF_CACHE
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
+  NAME: bf_cache_size
+  TYPE: BF_CACHE_SIZE
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
+  NAME: bf_cache_stats
+  TYPE: BF_CACHE_STATS
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
+  NAME: bf_promotion_rate
+  TYPE: BF_PROMOTION_RATE
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
 }
 
 # Open the output file

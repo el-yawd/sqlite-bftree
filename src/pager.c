@@ -696,6 +696,8 @@ struct Pager {
   int (*xGet)(Pager*,Pgno,DbPage**,int); /* Routine to fetch a patch */
   char *pTmpSpace;            /* Pager.pageSize bytes of space for tmp use */
   PCache *pPCache;            /* Pointer to page cache object */
+  void *pBfCache;             /* Pointer to BF-Tree mini-page cache (BfCache*) */
+  u8 bBfCacheShared;          /* Non-zero: pBfCache is owned by pcache2, don't free */
 #ifndef SQLITE_OMIT_WAL
   Wal *pWal;                  /* Write-ahead log used by "journal_mode=wal" */
   char *zWal;                 /* File name for write-ahead log */
@@ -4225,12 +4227,116 @@ int sqlite3PagerClose(Pager *pPager, sqlite3 *db){
   sqlite3OsClose(pPager->fd);
   sqlite3PageFree(pTmp);
   sqlite3PcacheClose(pPager->pPCache);
+#ifndef SQLITE_OMIT_BF_CACHE
+  sqlite3BfClosePagerCache(pPager);  /* P0.3: Close per-pager BF-Tree cache */
+#endif
   assert( !pPager->aSavepoint && !pPager->pInJournal );
   assert( !isOpen(pPager->jfd) && !isOpen(pPager->sjfd) );
 
   sqlite3_free(pPager);
   return SQLITE_OK;
 }
+
+#ifndef SQLITE_OMIT_BF_CACHE
+/*
+** Create a BF-Tree cache for a pager (P0.3).
+** This function is called lazily when the BF-Tree cache is first accessed.
+** Returns the cache pointer or NULL if disabled or allocation fails.
+*/
+void sqlite3PagerOpenBfCache(Pager *pPager){
+  BfCache *pCache;
+
+  if( !pPager || pPager->pBfCache ) return;
+  if( !sqlite3BfCacheEnabled() ) return;
+
+  /* When BF is active as the global pcache2 provider, the underlying
+  ** sqlite3_pcache object for this pager IS already a BfCache (cast-compatible
+  ** because BfCacheInt.base is BfCache and is the first member).  Re-use that
+  ** instance for the btree mini-page hooks rather than allocating a separate
+  ** circular buffer — one BfCache per pager is the correct architecture.
+  **
+  ** The pcache2 BfCache is not owned by the pager; pcache2 teardown will
+  ** free it.  Set bBfCacheShared=1 so sqlite3BfClosePagerCache skips the
+  ** destroy call.
+  */
+  if( pPager->pPCache ){
+    sqlite3_pcache *pUnderlying = sqlite3PcacheGetUnderlying(pPager->pPCache);
+    if( pUnderlying ){
+      BfCache *pBf = (BfCache*)pUnderlying;
+      /* Distinguish a BfCache (szPage > 0) from a default pcache1 object
+      ** which has a different internal layout. */
+      if( pBf->szPage > 0 ){
+        pPager->pBfCache = (void*)pBf;
+        pPager->bBfCacheShared = 1;
+        return;
+      }
+    }
+  }
+
+  /* BF is not active as pcache2 (or pcache not yet initialised).
+  ** Create a standalone per-pager mini-page cache. */
+  pCache = sqlite3BfCacheCreate((int)pPager->pageSize, (int)pPager->nExtra, 1);
+  if( pCache ){
+    pPager->pBfCache = (void*)pCache;
+    pPager->bBfCacheShared = 0;
+    return;
+  }
+
+  pPager->errCode = SQLITE_NOMEM;
+  pPager->eState = PAGER_ERROR;
+  setGetterMethod(pPager);
+}
+
+/*
+** Get the BF-Tree cache for a specific pager (P0.3).
+** Returns the cache pointer or NULL if not created.
+** Implemented in pager.c where the Pager struct is fully defined.
+*/
+BfCache *sqlite3BfGetPagerCache(Pager *pPager){
+  if( !pPager ) return 0;
+  return (BfCache*)pPager->pBfCache;
+}
+
+/*
+** Close and destroy the BF-Tree cache for a specific pager (P0.3).
+** Called during pagerClose().
+** Implemented in pager.c where the Pager struct is fully defined.
+*/
+void sqlite3BfClosePagerCache(Pager *pPager){
+  if( pPager && pPager->pBfCache ){
+    if( !pPager->bBfCacheShared ){
+      /* Standalone cache (not the pcache2 instance) — we own it. */
+      sqlite3BfCacheDestroy((BfCache*)pPager->pBfCache);
+    }
+    pPager->pBfCache = 0;
+    pPager->bBfCacheShared = 0;
+  }
+}
+
+/*
+** Check if a pager is using Bf-Tree cache (P0.3).
+*/
+int sqlite3PagerUsesBfCache(Pager *pPager){
+  if( !pPager ) return 0;
+  /* Create cache on first check if not already present */
+  if( !pPager->pBfCache && sqlite3BfCacheEnabled() ){
+    sqlite3PagerOpenBfCache(pPager);
+  }
+  return pPager->pBfCache != 0;
+}
+
+/*
+** Get the BfCache associated with a pager, if any (P0.3).
+*/
+BfCache *sqlite3PagerGetBfCache(Pager *pPager){
+  if( !pPager ) return 0;
+  /* Get or create per-pager cache on demand */
+  if( !pPager->pBfCache && sqlite3BfCacheEnabled() ){
+    sqlite3PagerOpenBfCache(pPager);
+  }
+  return sqlite3BfGetPagerCache(pPager);
+}
+#endif /* !defined(SQLITE_OMIT_BF_CACHE) */
 
 #if !defined(NDEBUG) || defined(SQLITE_TEST)
 /*
@@ -5025,6 +5131,12 @@ act_like_temp_file:
     assert( nExtra>=8 && nExtra<1000 );
     rc = sqlite3PcacheOpen(szPageDflt, nExtra, !memDb,
                        !memDb?pagerStress:0, (void *)pPager, pPager->pPCache);
+  }
+
+  /* BF-Tree cache is created lazily on first btree access. */
+  if( rc==SQLITE_OK ){
+    pPager->pBfCache = 0;
+    pPager->bBfCacheShared = 0;
   }
 
   /* If an error occurred above, free the  Pager structure and close the file.
@@ -6971,6 +7083,13 @@ int sqlite3PagerOpenSavepoint(Pager *pPager, int nSavepoint){
   }else{
     return SQLITE_OK;
   }
+}
+
+/*
+** Return the number of pager-level savepoints currently open.
+*/
+int sqlite3PagerNSavepoint(Pager *pPager){
+  return pPager->nSavepoint;
 }
 
 

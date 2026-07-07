@@ -934,3 +934,15 @@ void sqlite3PcacheIterateDirty(PCache *pCache, void (*xIter)(PgHdr *)){
   }
 }
 #endif
+
+/*
+** Return the underlying sqlite3_pcache object managed by a PCache.
+**
+** This is used by the BF-tree layer to reach the BfCache instance when
+** BF is registered as the global pcache2 provider: the sqlite3_pcache*
+** returned here is actually a BfCacheInt* (cast-compatible with BfCache*
+** because BfCache is BfCacheInt's first member).
+*/
+sqlite3_pcache *sqlite3PcacheGetUnderlying(PCache *p){
+  return p ? p->pCache : 0;
+}

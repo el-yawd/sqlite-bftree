@@ -140,6 +140,17 @@
 # define _BSD_SOURCE
 #endif
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#ifdef SQLITE_BF_MALLOC_TRACE
+#include <execinfo.h>
+extern int backtrace(void **, int);
+extern char **backtrace_symbols(void *const *, int);
+#endif
+
 /*
 ** Macro to disable warnings about missing "break" at the end of a "case".
 */
@@ -1433,6 +1444,7 @@ typedef int VList;
 #include "btree.h"
 #include "vdbe.h"
 #include "pcache.h"
+#include "bf_cache.h"  /* P0.3: BF-Tree cache integration */
 #include "mutex.h"
 
 /* The SQLITE_EXTRA_DURABLE compile-time option used to set the default
