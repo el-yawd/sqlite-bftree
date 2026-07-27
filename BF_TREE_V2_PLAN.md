@@ -186,3 +186,43 @@ AddressSanitizer**, and a static mini-page reference model. We mirror and extend
   (durability = §5.7; eviction/copy-on-access = §5.2; range scan §5.3; negative search §5.6).
 - Reference impl (Rust): https://github.com/microsoft/bf-tree (see `doc/snapshot-recovery.md`).
 - Companion docs: https://github.com/XiangpengHao/bf-tree-docs
+
+## Future work — the "faithful" branch (evaluate both approaches)
+
+The staged plan above keeps SQLite's fixed-page `btree.c` and inserts Bf-Tree as a record
+cache *beside* it. This is a pragmatic engineering choice — reuse SQLite's B-tree, keep the
+differential oracle applicable, land correctness incrementally — **not** a file-format
+compatibility requirement. v2 does **not** care about on-disk compatibility with stock SQLite
+(a lesson from v1): it is only a convenient invariant for the differential oracle, not a goal.
+
+The reference (`microsoft/bf-tree`) is **variable-size and record-granular natively**: a logical
+leaf resolves through the page table to `PageLocation::{Mini, Full, Base, Null}`, where `Mini`,
+`Full`, and `Base` are the *same* `LeafNode` at different `node_size` (up to
+`MAX_LEAF_PAGE_SIZE = 32 KB`), a mini-page chains to its base page, and reads consult the
+mini-page delta before falling through. The fixed-page adaptation therefore leaves performance on
+the table: the larger-than-memory win comes from **memory density** (RAM holds only hot records
+as compact mini-pages), and a fixed-page pcache that also pins full 4 KB pages for the same
+leaves dilutes exactly that advantage.
+
+**Plan:** once the file-compatible v2 (Phases 0–4) is complete and measured, branch and build a
+**file-incompatible, maximally faithful** variant, then evaluate the two head-to-head. The
+faithful branch should transfer the Bf-Tree design decisions the fixed-page adaptation cannot,
+squeezing peak performance:
+- **Variable-size leaves as the on-disk unit** — replace SQLite's fixed-page leaf format (own
+  file format; break stock compatibility deliberately). Leaves are `LeafNode`s of varying
+  `node_size`; mini/full/base are one type at different sizes.
+- **Mini-page-native B-tree navigation** — the leaf level addresses `PageID -> PageLocation`
+  through the mapping table (Mini/Full/Base/Null), with the mini-page chained over its base
+  page, rather than reconstructing a 4 KB page for `btree.c`.
+- **Density-first buffer pool** — the circular buffer (mini-pages) is the dominant resident
+  representation of hot data; full/base pages fall back to disk under direct I/O. Promotion
+  Mini→Full and copy-on-access follow the paper (§5.2).
+- **Direct-I/O, larger-than-RAM path** as a first-class mode (the regime the paper's wins live
+  in), not an afterthought.
+
+**Evaluation goal:** quantify how much of Bf-Tree's headline advantage the pragmatic fixed-page
+integration captures vs. what the faithful, file-incompatible design recovers — reporting resident
+bytes (mini vs full), point/scan/write throughput, and write amplification for both, so the thesis
+can state the cost of SQLite-shaped integration explicitly. Correctness for the faithful branch
+can no longer lean on the byte-identical `.dump` oracle; use the model-based / property oracle
+(reference row-map vs engine) instead.

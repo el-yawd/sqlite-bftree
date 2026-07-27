@@ -11,12 +11,24 @@
 *************************************************************************
 ** This file implements the main Bf-Tree cache module.
 **
-** This module provides a sqlite3_pcache_methods2 implementation that
-** uses variable-length mini-pages for improved cache efficiency.
+** The module has two distinct parts:
 **
-** The implementation maintains compatibility with SQLite's btree.c by
-** still returning full-size page buffers, but internally uses mini-pages
-** to track hot records and buffer writes more efficiently.
+**   1. A sqlite3_pcache_methods2 implementation (bfCacheCreate/Fetch/Unpin/…)
+**      that hands the pager FULL-size page buffers, i.e. a drop-in page cache.
+**      This layer does NOT itself use mini-pages (bfCacheFetch leaves
+**      pPage->pMiniPage == 0); it exists so btree.c/pager.c see the ordinary
+**      fixed-page contract.
+**
+**   2. A record-level API (sqlite3BfRecordRead/Write, sqlite3BfCacheMerge*,
+**      eviction) layered over the mapping table + the circular buffer of
+**      variable-length mini-pages.  This is the actual Bf-Tree behaviour —
+**      buffering writes and caching hot records at record granularity — and
+**      it is driven from the btree.c hooks, not from the pcache path above.
+**
+** So mini-pages are an internal record-cache/write-buffer layer beside the
+** fixed-page B-tree, not the buffers returned to the pager.  Keeping btree.c
+** on fixed pages is a pragmatic adaptation (see BF_TREE_V2_PLAN.md "Future
+** work — the faithful branch"), not a file-format compatibility requirement.
 */
 #include "sqliteInt.h"
 #include "bf_cache.h"
