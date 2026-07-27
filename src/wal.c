@@ -250,6 +250,9 @@
 #ifndef SQLITE_OMIT_WAL
 
 #include "wal.h"
+#ifndef SQLITE_OMIT_BF_CACHE
+#include "bf_wal.h"
+#endif
 
 /*
 ** Trace output macros
@@ -476,6 +479,20 @@ struct WalCkptInfo {
 /* Size of header before each frame in wal */
 #define WAL_FRAME_HDRSIZE 24
 
+#ifndef SQLITE_OMIT_BF_CACHE
+/* Frame-kind marker for the BF-Tree physiological WAL.  A normal frame stores
+** its target page number in bytes [0..3] of the frame header; walDecodeFrame()
+** already rejects page number 0, and the largest real page number is
+** 0xfffffffe, so 0xffffffff is a page number that can never occur naturally.
+** We reuse it as a sentinel meaning "this frame's payload is a record batch
+** (a list of [pgno,op,key,val] leaf mutations) rather than a single page
+** image".  The real target page numbers live inside the payload; the frame's
+** checksum still covers the payload exactly as for a page-image frame, so the
+** WAL checksum chain, salt matching, and the nTruncate commit marker are all
+** unaffected.  See bf_wal.h and BF_TREE_V2_KNOWLEDGE.md §1.5. */
+#define WAL_BF_RECORD_PGNO 0xffffffffu
+#endif
+
 /* Size of write ahead log header, including checksum. */
 #define WAL_HDRSIZE 32
 
@@ -533,6 +550,9 @@ struct Wal {
   u32 iReCksum;              /* On commit, recalculate checksums from here */
   const char *zWalName;      /* Name of WAL file */
   u32 nCkpt;                 /* Checkpoint sequence counter in the wal-header */
+#ifndef SQLITE_OMIT_BF_CACHE
+  BfWalIndex *pBfWal;        /* pgno -> ordered record-ops index (record frames) */
+#endif
 #ifdef SQLITE_USE_SEH
   u32 lockMask;              /* Mask of locks held */
   void *pFree;               /* Pointer to sqlite3_free() if exception thrown */
@@ -1046,6 +1066,29 @@ static int walDecodeFrame(
   return 1;
 }
 
+#ifndef SQLITE_OMIT_BF_CACHE
+/*
+** A record-batch frame (page number == WAL_BF_RECORD_PGNO) has just been
+** decoded during a WAL scan.  Feed its payload of [pgno,op,key,val] leaf
+** mutations into pWal->pBfWal, the in-memory pgno -> ordered-record-ops index
+** that the reader/checkpoint path replays onto base pages.  The index is
+** allocated lazily on the first record frame seen.  aData points at the
+** szPage-byte frame payload.  Returns SQLITE_OK, or SQLITE_NOMEM_BKPT /
+** SQLITE_CORRUPT_BKPT on an unallocatable or malformed payload.
+*/
+static int walBfIngestRecordFrame(Wal *pWal, const u8 *aData){
+  int rc;
+  if( pWal->pBfWal==0 ){
+    pWal->pBfWal = sqlite3BfWalIndexNew();
+    if( pWal->pBfWal==0 ) return SQLITE_NOMEM_BKPT;
+  }
+  rc = sqlite3BfWalIndexAddFrame(pWal->pBfWal, aData, (int)pWal->szPage);
+  if( rc==BFWAL_NOMEM ) return SQLITE_NOMEM_BKPT;
+  if( rc!=BFWAL_OK ) return SQLITE_CORRUPT_BKPT;
+  return SQLITE_OK;
+}
+#endif /* SQLITE_OMIT_BF_CACHE */
+
 
 #if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
 /*
@@ -1479,6 +1522,14 @@ static int walIndexRecover(Wal *pWal){
     aData = &aFrame[WAL_FRAME_HDRSIZE];
     aPrivate = (u32*)&aData[szPage];
 
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* walIndexRecover() rebuilds the wal-index from scratch and may run more
+    ** than once (e.g. WAL_RETRY).  Discard any prior BF record index so the
+    ** scan below repopulates it without double-counting record ops. */
+    sqlite3BfWalIndexFree(pWal->pBfWal);
+    pWal->pBfWal = 0;
+#endif
+
     /* Read all frames from the log file. */
     iLastFrame = (nSize - WAL_HDRSIZE) / szFrame;
     for(iPg=0; iPg<=(u32)walFramePage(iLastFrame); iPg++){
@@ -1503,8 +1554,20 @@ static int walIndexRecover(Wal *pWal){
         if( rc!=SQLITE_OK ) break;
         isValid = walDecodeFrame(pWal, &pgno, &nTruncate, aData, aFrame);
         if( !isValid ) break;
-        rc = walIndexAppend(pWal, iFrame, pgno);
-        if( NEVER(rc!=SQLITE_OK) ) break;
+#ifndef SQLITE_OMIT_BF_CACHE
+        if( pgno==WAL_BF_RECORD_PGNO ){
+          /* A record-batch frame carries no single target page, so it must not
+          ** be entered into the pgno->frame hash; its ops feed the BF record
+          ** index instead.  The frame still counts toward mxFrame and can carry
+          ** the nTruncate commit marker, handled below. */
+          rc = walBfIngestRecordFrame(pWal, aData);
+          if( rc!=SQLITE_OK ) break;
+        }else
+#endif
+        {
+          rc = walIndexAppend(pWal, iFrame, pgno);
+          if( NEVER(rc!=SQLITE_OK) ) break;
+        }
 
         /* If nTruncate is non-zero, this is a commit record. */
         if( nTruncate ){
@@ -2559,6 +2622,9 @@ int sqlite3WalClose(
     }
     WALTRACE(("WAL%p: closed\n", pWal));
     sqlite3_free((void *)pWal->apWiData);
+#ifndef SQLITE_OMIT_BF_CACHE
+    sqlite3BfWalIndexFree(pWal->pBfWal);
+#endif
     sqlite3_free(pWal);
   }
   return rc;
