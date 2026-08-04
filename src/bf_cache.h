@@ -137,19 +137,31 @@ struct BfCircularBuffer {
 struct BfKVMeta {
   u16 offset;               /* Offset to key/value data from page end */
   u16 keyLenAndOp;          /* Bits 0-13: key length, 14-15: operation type */
-  u16 valueLenAndRef;       /* Bits 0-14: value length, 15: referenced flag */
+  u16 valueLenAndRef;       /* Bits 0-13: value length, 14: WAL-logged flag,
+                            ** 15: referenced flag */
   u8 preview[2];            /* First 2 bytes of key (for fast comparison) */
 };
 
-/* Macros for BfKVMeta field access */
+/* Macros for BfKVMeta field access.
+**
+** The "logged" flag (bit 14 of valueLenAndRef) marks a dirty record
+** (BFOP_INSERT/BFOP_DELETE) whose op has already been written to the WAL as a
+** physiological record frame in the CURRENT WAL generation (Phase 2).  It is
+** orthogonal to the 2-bit op: a logged record is still DIRTY (not yet in the
+** base B-tree) — it must still be flushed to base at checkpoint/eviction — but
+** the commit-time gather skips it so its op is logged exactly once.  The value
+** length is bounded by BF_MAX_MINI_PAGE (4096) << 0x3FFF, so narrowing it from
+** 15 to 14 bits is safe and frees bit 14 for this flag. */
 #define BF_KV_KEY_LEN(m)     ((m)->keyLenAndOp & 0x3FFF)
 #define BF_KV_OP_TYPE(m)     (((m)->keyLenAndOp >> 14) & 0x03)
-#define BF_KV_VALUE_LEN(m)   ((m)->valueLenAndRef & 0x7FFF)
+#define BF_KV_VALUE_LEN(m)   ((m)->valueLenAndRef & 0x3FFF)
+#define BF_KV_IS_LOGGED(m)   (((m)->valueLenAndRef >> 14) & 0x01)
 #define BF_KV_IS_REF(m)      (((m)->valueLenAndRef >> 15) & 0x01)
 
 #define BF_KV_SET_KEY_LEN(m, len)   ((m)->keyLenAndOp = ((m)->keyLenAndOp & 0xC000) | ((len) & 0x3FFF))
 #define BF_KV_SET_OP_TYPE(m, op)    ((m)->keyLenAndOp = ((m)->keyLenAndOp & 0x3FFF) | (((op) & 0x03) << 14))
-#define BF_KV_SET_VALUE_LEN(m, len) ((m)->valueLenAndRef = ((m)->valueLenAndRef & 0x8000) | ((len) & 0x7FFF))
+#define BF_KV_SET_VALUE_LEN(m, len) ((m)->valueLenAndRef = ((m)->valueLenAndRef & 0xC000) | ((len) & 0x3FFF))
+#define BF_KV_SET_LOGGED(m, lg)     ((m)->valueLenAndRef = ((m)->valueLenAndRef & 0xBFFF) | (((lg) & 0x01) << 14))
 #define BF_KV_SET_REF(m, ref)       ((m)->valueLenAndRef = ((m)->valueLenAndRef & 0x7FFF) | (((ref) & 0x01) << 15))
 
 /*
@@ -407,6 +419,12 @@ SQLITE_PRIVATE int sqlite3BfMiniPageCount(BfMiniPage *pMini);
 ** until the next mutation of pMini (merge-scan reads them between steps). */
 SQLITE_PRIVATE int sqlite3BfMiniPageAt(BfMiniPage *pMini, int ix,
     const u8 **ppKey, int *pnKey, const u8 **ppVal, int *pnVal, u8 *pOp);
+/* Phase 2 (WAL) commit-gather: report record ix only if it is dirty AND not yet
+** WAL-logged this generation (fills out-params, returns 1); mark record ix as
+** logged once its op has been staged into a record-batch.  See bf_mini_page.c. */
+SQLITE_PRIVATE int sqlite3BfMiniPageDirtyUnloggedAt(BfMiniPage *pMini, int ix,
+    const u8 **ppKey, int *pnKey, const u8 **ppVal, int *pnVal, u8 *pOp);
+SQLITE_PRIVATE void sqlite3BfMiniPageMarkLoggedAt(BfMiniPage *pMini, int ix);
 
 /*
 ** Additional mapping operations.
@@ -488,6 +506,12 @@ SQLITE_PRIVATE int sqlite3BfBtreeDebugHasMiniPage(BtShared *pBt, Pgno pgno);
 #endif
 /* Flush all dirty mini-pages for a B-tree to base pages (called at commit). */
 SQLITE_PRIVATE int sqlite3BfBtreeFlushAllDirty(Btree *p);
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+/* Phase 2 (WAL): gather dirty-but-unlogged records into WAL record-batch frames
+** and stage them for the pending commit, WITHOUT writing base pages (WAL mode
+** only).  Records stay dirty in the cache, materialised to base at checkpoint. */
+SQLITE_PRIVATE int sqlite3BfBtreeLogAllDirty(Btree *p);
+#endif
 /* Flush a table's dirty mini-pages before a base mutation that may rebalance
 ** or free its leaves (Phase 1 per-leaf survival).  Returns non-zero if work
 ** was done (caller should re-seek its cursor). */

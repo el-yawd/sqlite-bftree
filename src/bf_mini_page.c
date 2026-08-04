@@ -239,6 +239,7 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
       BF_KV_SET_VALUE_LEN(pNewMeta, nVal);
       BF_KV_SET_OP_TYPE(pNewMeta, opType);
       BF_KV_SET_REF(pNewMeta, 1);
+      BF_KV_SET_LOGGED(pNewMeta, 0);  /* fresh mutation: not yet in the WAL */
       return BF_OK;
     }
 
@@ -327,6 +328,7 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
   BF_KV_SET_OP_TYPE(pNewMeta, opType);
   BF_KV_SET_VALUE_LEN(pNewMeta, nVal);
   BF_KV_SET_REF(pNewMeta, 1);
+  BF_KV_SET_LOGGED(pNewMeta, 0);  /* brand-new record: not yet in the WAL */
 
   /* Set preview bytes */
   pNewMeta->preview[0] = nKey >= 1 ? ((const u8*)pKey)[0] : 0;
@@ -468,8 +470,10 @@ void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini){
     opType = BF_KV_OP_TYPE(&aMeta[i]);
     if( opType == BFOP_INSERT ){
       BF_KV_SET_OP_TYPE(&aMeta[i], BFOP_CACHE);
+      BF_KV_SET_LOGGED(&aMeta[i], 0);   /* now in base: no pending WAL log */
     }else if( opType == BFOP_DELETE ){
       BF_KV_SET_OP_TYPE(&aMeta[i], BFOP_PHANTOM);
+      BF_KV_SET_LOGGED(&aMeta[i], 0);
     }
   }
 }
@@ -601,6 +605,44 @@ int sqlite3BfMiniPageAt(BfMiniPage *pMini, int ix,
   if( pnVal ) *pnVal = BF_KV_VALUE_LEN(&aMeta[ix]);
   if( pOp )   *pOp   = BF_KV_OP_TYPE(&aMeta[ix]);
   return 1;
+}
+
+/*
+** Phase 2 (WAL) commit-gather support.
+**
+** sqlite3BfMiniPageDirtyUnloggedAt: like sqlite3BfMiniPageAt, but only reports
+** the record at index ix when it is DIRTY (BFOP_INSERT/BFOP_DELETE) AND its
+** WAL-logged flag is clear — i.e. an op that still needs to be written to the
+** WAL as a physiological record frame this generation.  Returns 1 and fills the
+** out-params in that case, 0 otherwise (clean, already-logged, or out of range).
+**
+** sqlite3BfMiniPageMarkLoggedAt: set the logged flag on record ix, called once
+** the record's op has been safely staged into a WAL record-batch.  Setting only
+** a bit in an existing meta slot performs no array shift, so it is safe to call
+** while walking the mini-page by index.
+*/
+int sqlite3BfMiniPageDirtyUnloggedAt(BfMiniPage *pMini, int ix,
+    const u8 **ppKey, int *pnKey, const u8 **ppVal, int *pnVal, u8 *pOp){
+  BfKVMeta *aMeta;
+  u8 op;
+  if( ix<0 || ix>=pMini->metaCount ) return 0;
+  aMeta = bfMiniPageMeta(pMini);
+  op = BF_KV_OP_TYPE(&aMeta[ix]);
+  if( op!=BFOP_INSERT && op!=BFOP_DELETE ) return 0;
+  if( BF_KV_IS_LOGGED(&aMeta[ix]) ) return 0;
+  if( ppKey ) *ppKey = bfGetKeyPtr(pMini, &aMeta[ix]);
+  if( pnKey ) *pnKey = BF_KV_KEY_LEN(&aMeta[ix]);
+  if( ppVal ) *ppVal = bfGetValuePtr(pMini, &aMeta[ix]);
+  if( pnVal ) *pnVal = BF_KV_VALUE_LEN(&aMeta[ix]);
+  if( pOp )   *pOp   = op;
+  return 1;
+}
+
+void sqlite3BfMiniPageMarkLoggedAt(BfMiniPage *pMini, int ix){
+  BfKVMeta *aMeta;
+  if( ix<0 || ix>=pMini->metaCount ) return;
+  aMeta = bfMiniPageMeta(pMini);
+  BF_KV_SET_LOGGED(&aMeta[ix], 1);
 }
 
 /*

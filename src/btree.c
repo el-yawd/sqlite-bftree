@@ -4370,10 +4370,27 @@ int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
     BtShared *pBt = p->pBt;
     sqlite3BtreeEnter(p);
 #ifndef SQLITE_OMIT_BF_CACHE
-    /* Flush any BF write-buffered inserts to their base B-tree pages before
-    ** the pager commits.  With journal_mode=OFF / synchronous=OFF this is
-    ** the only "persistence" step for BF-buffered rows. */
-    sqlite3BfBtreeFlushAllDirty(p);
+    /* Materialise BF write-buffered records before the pager commits. */
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+    if( sqlite3PagerIsWal(pBt->pPager) ){
+      /* Phase 2 (WAL): log the dirty records as small physiological record
+      ** frames instead of merging them into base pages — a commit persists
+      ** records, not whole pages.  The records stay in the cache (dirty) and
+      ** reach base lazily at checkpoint/eviction.  On failure the commit must
+      ** abort so the rollback discards the just-set "logged" marks. */
+      rc = sqlite3BfBtreeLogAllDirty(p);
+      if( rc!=SQLITE_OK ){
+        sqlite3BtreeLeave(p);
+        return rc;
+      }
+    }else
+# endif
+    {
+      /* Non-WAL (or write-buffering disabled): flush buffered inserts straight
+      ** to their base B-tree pages.  With journal_mode=OFF / synchronous=OFF
+      ** this is the only "persistence" step for BF-buffered rows. */
+      sqlite3BfBtreeFlushAllDirty(p);
+    }
 #endif
 #ifndef SQLITE_OMIT_AUTOVACUUM
     if( pBt->autoVacuum ){

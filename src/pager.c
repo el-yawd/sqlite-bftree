@@ -4336,6 +4336,49 @@ BfCache *sqlite3PagerGetBfCache(Pager *pPager){
   }
   return sqlite3BfGetPagerCache(pPager);
 }
+
+/*
+** Phase 2 (WAL): stage one finalised BF record-batch payload (szPage bytes,
+** produced by sqlite3BfWalBatchFinish) so it is written as a non-commit record
+** frame by the next WAL commit of this transaction.  A private copy is taken by
+** the WAL layer, so the caller may reuse its scratch buffer.
+**
+** Only meaningful in WAL mode: the record log rides the WAL frame stream.  When
+** the pager is not using a WAL there is nowhere to stage records — the caller
+** (btree commit) falls back to the base-page flush path — so this is a no-op
+** returning SQLITE_OK.
+*/
+int sqlite3PagerBfStage(Pager *pPager, const u8 *aData, int szPage){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    return sqlite3WalBfStage(pPager->pWal, aData, szPage);
+  }
+#endif
+  return SQLITE_OK;
+}
+
+/*
+** Phase 2 (WAL): return true iff this pager is currently using a WAL (so a
+** commit rides record frames rather than page-image journal frames).  Matches
+** the internal pagerUseWal() test that sqlite3PagerBfStage guards on, so the
+** btree commit can decide between record-logging and base-page flushing.
+*/
+int sqlite3PagerIsWal(Pager *pPager){
+  return pPager!=0 && pagerUseWal(pPager);
+}
+
+/*
+** Phase 2 (WAL): discard any staged-but-unwritten BF record payloads
+** (transaction rollback / teardown).  No-op outside WAL mode or when nothing
+** is staged.
+*/
+void sqlite3PagerBfStageClear(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    sqlite3WalBfStageClear(pPager->pWal);
+  }
+#endif
+}
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */
 
 #if !defined(NDEBUG) || defined(SQLITE_TEST)
@@ -6888,6 +6931,12 @@ int sqlite3PagerRollback(Pager *pPager){
   assert( assert_pager_state(pPager) );
   if( pPager->eState==PAGER_ERROR ) return pPager->errCode;
   if( pPager->eState<=PAGER_READER ) return SQLITE_OK;
+
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Discard any BF record-batch payloads staged for a commit that is now being
+  ** rolled back; the durable log is rebuilt from the WAL at recovery. */
+  sqlite3PagerBfStageClear(pPager);
+#endif
 
   if( pagerUseWal(pPager) ){
     int rc2;

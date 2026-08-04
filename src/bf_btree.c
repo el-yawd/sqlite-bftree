@@ -35,6 +35,9 @@
 #include "sqliteInt.h"
 #include "btreeInt.h"
 #include "bf_cache.h"
+#if defined(SQLITE_BF_INSERT_BUFFERING) && !defined(SQLITE_OMIT_BF_CACHE)
+#include "bf_wal.h"   /* record-batch codec for commit-time WAL logging */
+#endif
 
 #ifdef SQLITE_BF_DEBUG
 #include <fcntl.h>
@@ -292,6 +295,132 @@ int sqlite3BfBtreeFlushAllDirty(Btree *p){
   pBf->bDirtyInserts = 0;  /* all buffered inserts materialised */
   return SQLITE_OK;
 }
+
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+/* -------------------------------------------------------------------------
+** Phase 2 (WAL): commit-time record LOGGING (as opposed to flushing to base).
+**
+** Instead of merging dirty mini-page records into their base B-tree pages at
+** commit (sqlite3BfBtreeFlushAllDirty, which forces 4 KB page-image WAL frames),
+** we serialise each dirty-but-unlogged record into a physiological record-batch
+** payload and stage it for the pending WAL commit (sqlite3PagerBfStage).  The
+** records stay authoritative in the mini-page cache (still DIRTY) and are
+** materialised to base lazily at checkpoint/eviction — that is the write win:
+** a commit persists small records, not whole pages.
+**
+** Each logged record is marked (BF_KV logged flag) so a subsequent commit in the
+** same WAL generation does not re-log it.  Marking happens as the record is
+** appended; if any later step fails, the whole commit fails and btree rollback
+** calls sqlite3BfBtreeClearCache, discarding the marks — so a mark can never
+** outlive an uncommitted transaction.
+** ----------------------------------------------------------------------- */
+typedef struct BfLogAllCtx BfLogAllCtx;
+struct BfLogAllCtx {
+  Pager      *pPager;   /* stage target (WAL) */
+  u8         *aBuf;     /* batch scratch buffer, szPage bytes */
+  int         szPage;   /* record-frame payload size */
+  BfWalBatch  batch;    /* current open (unstaged) batch */
+  int         nOpen;    /* records appended to the current batch */
+  int         rc;       /* first error encountered, sticky */
+};
+
+/* Finish and stage the current batch (if non-empty), then re-init it empty. */
+static void bfLogFlushBatch(BfLogAllCtx *ctx){
+  if( ctx->rc!=SQLITE_OK || ctx->nOpen==0 ) return;
+  sqlite3BfWalBatchFinish(&ctx->batch);
+  ctx->rc = sqlite3PagerBfStage(ctx->pPager, ctx->aBuf, ctx->szPage);
+  ctx->nOpen = 0;
+  sqlite3BfWalBatchInit(&ctx->batch, ctx->aBuf, ctx->szPage);
+}
+
+/* Append one record; on a full batch, stage it and retry into a fresh one. */
+static void bfLogAppendRec(BfLogAllCtx *ctx, const BfWalRec *pRec){
+  int wrc;
+  if( ctx->rc!=SQLITE_OK ) return;
+  wrc = sqlite3BfWalBatchAppend(&ctx->batch, pRec);
+  if( wrc==BFWAL_FULL ){
+    bfLogFlushBatch(ctx);                            /* stage what we have */
+    if( ctx->rc!=SQLITE_OK ) return;
+    wrc = sqlite3BfWalBatchAppend(&ctx->batch, pRec);/* retry into fresh batch */
+  }
+  if( wrc==BFWAL_OK ){
+    ctx->nOpen++;
+  }else{
+    /* A single record that will not fit an empty page-sized batch, or NOMEM. */
+    ctx->rc = (wrc==BFWAL_NOMEM) ? SQLITE_NOMEM_BKPT : SQLITE_CORRUPT_BKPT;
+  }
+}
+
+static int bfLogAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
+  BfLogAllCtx *ctx = (BfLogAllCtx*)pCtx;
+  BfMiniPage *pMini;
+  int i, n;
+
+  UNUSED_PARAMETER(pgno);
+  if( ctx->rc!=SQLITE_OK ) return 0;
+  if( pgno<=1 || pEntry->locType!=BF_LOC_MINI ) return 0;
+  pMini = (BfMiniPage*)pEntry->pPage;
+  if( !pMini ) return 0;
+
+  n = sqlite3BfMiniPageCount(pMini);
+  for(i=0; i<n; i++){
+    const u8 *pKey, *pVal;
+    int nKey, nVal;
+    u8 op;
+    BfWalRec rec;
+    if( !sqlite3BfMiniPageDirtyUnloggedAt(pMini, i, &pKey,&nKey,&pVal,&nVal,&op) ){
+      continue;
+    }
+    rec.pgno = pMini->ownerPgno;                     /* leaf pgno (Phase 1 key) */
+    rec.op   = (op==BFOP_DELETE) ? BFWAL_OP_DELETE : BFWAL_OP_INSERT;
+    rec.nKey = (u32)nKey;
+    rec.pKey = pKey;
+    rec.nVal = (op==BFOP_DELETE) ? 0 : (u32)nVal;
+    rec.pVal = (op==BFOP_DELETE) ? 0 : pVal;
+    bfLogAppendRec(ctx, &rec);
+    if( ctx->rc!=SQLITE_OK ) return 0;
+    sqlite3BfMiniPageMarkLoggedAt(pMini, i);         /* safe: see header note */
+  }
+  return 0;
+}
+
+/*
+** Gather every dirty-but-unlogged BF record across all mini-pages into WAL
+** record-batch payloads and stage them for the pending commit.  Does NOT touch
+** the base B-tree.  Returns SQLITE_OK, or an error (NOMEM/CORRUPT) in which case
+** the caller MUST fail the commit so the rollback discards the logged marks.
+**
+** No-op (returns SQLITE_OK) when nothing is buffered.  Must only be called in
+** WAL mode — in a non-WAL journal there is no record log to ride, so the caller
+** uses sqlite3BfBtreeFlushAllDirty instead.
+*/
+int sqlite3BfBtreeLogAllDirty(Btree *p){
+  BfCache *pBf;
+  BfLogAllCtx ctx;
+
+  if( !p || !p->pBt ) return SQLITE_OK;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( !pBf ) return SQLITE_OK;
+  if( !pBf->bDirtyInserts ) return SQLITE_OK;    /* nothing buffered to log */
+
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.pPager = p->pBt->pPager;
+  ctx.szPage = pBf->szPage;
+  ctx.aBuf   = (u8*)sqlite3_malloc(ctx.szPage);
+  if( !ctx.aBuf ) return SQLITE_NOMEM_BKPT;
+  ctx.rc     = SQLITE_OK;
+  ctx.nOpen  = 0;
+  sqlite3BfWalBatchInit(&ctx.batch, ctx.aBuf, ctx.szPage);
+
+  sqlite3BfMapIterate(pBf, bfLogAllCallback, &ctx);
+  bfLogFlushBatch(&ctx);                          /* stage the final batch */
+
+  sqlite3_free(ctx.aBuf);
+  /* bDirtyInserts stays set: the records are logged but still not in base, so
+  ** pre-mutation flush + checkpoint/eviction flush must still run for them. */
+  return ctx.rc;
+}
+#endif /* SQLITE_BF_INSERT_BUFFERING */
 
 /*
 ** Context + callback to flush only the dirty leaves of one table (root).

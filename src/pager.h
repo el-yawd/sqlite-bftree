@@ -273,4 +273,11 @@ BfCache *sqlite3PagerGetBfCache(Pager *pPager);
 void sqlite3BfClosePagerCache(Pager *pPager);
 BfCache *sqlite3BfGetPagerCache(Pager *pPager);
 
+/* Phase 2 (WAL): stage a BF record-batch payload for the next WAL commit, and
+** discard any staged-but-unwritten payloads on rollback/teardown.  Both are
+** no-ops when the pager is not in WAL mode (the record log rides the WAL). */
+int sqlite3PagerBfStage(Pager *pPager, const u8 *aData, int szPage);
+void sqlite3PagerBfStageClear(Pager *pPager);
+int sqlite3PagerIsWal(Pager *pPager);
+
 #endif /* SQLITE_PAGER_H */

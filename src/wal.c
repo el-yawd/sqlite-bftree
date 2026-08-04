@@ -552,6 +552,9 @@ struct Wal {
   u32 nCkpt;                 /* Checkpoint sequence counter in the wal-header */
 #ifndef SQLITE_OMIT_BF_CACHE
   BfWalIndex *pBfWal;        /* pgno -> ordered record-ops index (record frames) */
+  u8 **apBfStage;           /* Staged record-batch payloads to emit next commit */
+  int nBfStage;             /* Number of staged payloads */
+  int nBfStageAlloc;        /* Allocated slots in apBfStage */
 #endif
 #ifdef SQLITE_USE_SEH
   u32 lockMask;              /* Mask of locks held */
@@ -2624,6 +2627,8 @@ int sqlite3WalClose(
     sqlite3_free((void *)pWal->apWiData);
 #ifndef SQLITE_OMIT_BF_CACHE
     sqlite3BfWalIndexFree(pWal->pBfWal);
+    sqlite3WalBfStageClear(pWal);
+    sqlite3_free(pWal->apBfStage);
 #endif
     sqlite3_free(pWal);
   }
@@ -4089,60 +4094,15 @@ static int walRewriteChecksums(Wal *pWal, u32 iLast){
 }
 
 /*
-** Write a set of frames to the log. The caller must hold the write-lock
-** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
+** If this is the first frame to be written into the log (mxFrame==0), write
+** the WAL header to the start of the file and initialise the running frame
+** checksum and salt.  Then validate that szPage matches the WAL's page size.
+** Factored out of walFrames() so that a BF record-batch frame
+** (sqlite3WalBfFrame) can legitimately be the very first frame in the WAL.
 */
-static int walFrames(
-  Wal *pWal,                      /* Wal handle to write to */
-  int szPage,                     /* Database page-size in bytes */
-  PgHdr *pList,                   /* List of dirty pages to write */
-  Pgno nTruncate,                 /* Database size after this commit */
-  int isCommit,                   /* True if this is a commit */
-  int sync_flags                  /* Flags to pass to OsSync() (or 0) */
-){
-  int rc;                         /* Used to catch return codes */
-  u32 iFrame;                     /* Next frame address */
-  PgHdr *p;                       /* Iterator to run through pList with. */
-  PgHdr *pLast = 0;               /* Last frame in list */
-  int nExtra = 0;                 /* Number of extra copies of last page */
-  int szFrame;                    /* The size of a single frame */
-  i64 iOffset;                    /* Next byte to write in WAL file */
-  WalWriter w;                    /* The writer */
-  u32 iFirst = 0;                 /* First frame that may be overwritten */
-  WalIndexHdr *pLive;             /* Pointer to shared header */
-
-  assert( pList );
-  assert( pWal->writeLock );
-
-  /* If this frame set completes a transaction, then nTruncate>0.  If
-  ** nTruncate==0 then this frame set does not complete the transaction. */
-  assert( (isCommit!=0)==(nTruncate!=0) );
-
-#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
-  { int cnt; for(cnt=0, p=pList; p; p=p->pDirty, cnt++){}
-    WALTRACE(("WAL%p: frame write begin. %d frames. mxFrame=%d. %s\n",
-              pWal, cnt, pWal->hdr.mxFrame, isCommit ? "Commit" : "Spill"));
-  }
-#endif
-
-  pLive = (WalIndexHdr*)walIndexHdr(pWal);
-  if( memcmp(&pWal->hdr, (void *)pLive, sizeof(WalIndexHdr))!=0 ){
-    iFirst = pLive->mxFrame+1;
-  }
-
-  /* See if it is possible to write these frames into the start of the
-  ** log file, instead of appending to it at pWal->hdr.mxFrame.
-  */
-  if( SQLITE_OK!=(rc = walRestartLog(pWal)) ){
-    return rc;
-  }
-
-  /* If this is the first frame written into the log, write the WAL
-  ** header to the start of the WAL file. See comments at the top of
-  ** this source file for a description of the WAL header format.
-  */
-  iFrame = pWal->hdr.mxFrame;
-  if( iFrame==0 ){
+static int walWriteWalHeader(Wal *pWal, int szPage, int sync_flags){
+  int rc;
+  if( pWal->hdr.mxFrame==0 ){
     u8 aWalHdr[WAL_HDRSIZE];      /* Buffer to assemble wal-header in */
     u32 aCksum[2];                /* Checksum for wal-header */
 
@@ -4183,6 +4143,68 @@ static int walFrames(
   if( (int)pWal->szPage!=szPage ){
     return SQLITE_CORRUPT_BKPT;  /* TH3 test case: cov1/corrupt155.test */
   }
+  return SQLITE_OK;
+}
+
+/*
+** Write a set of frames to the log. The caller must hold the write-lock
+** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
+*/
+static int walFrames(
+  Wal *pWal,                      /* Wal handle to write to */
+  int szPage,                     /* Database page-size in bytes */
+  PgHdr *pList,                   /* List of dirty pages to write */
+  Pgno nTruncate,                 /* Database size after this commit */
+  int isCommit,                   /* True if this is a commit */
+  int sync_flags                  /* Flags to pass to OsSync() (or 0) */
+){
+  int rc;                         /* Used to catch return codes */
+  u32 iFrame;                     /* Next frame address */
+  PgHdr *p;                       /* Iterator to run through pList with. */
+  PgHdr *pLast = 0;               /* Last frame in list */
+  int nExtra = 0;                 /* Number of extra copies of last page */
+  int szFrame;                    /* The size of a single frame */
+  i64 iOffset;                    /* Next byte to write in WAL file */
+  WalWriter w;                    /* The writer */
+  u32 iFirst = 0;                 /* First frame that may be overwritten */
+  WalIndexHdr *pLive;             /* Pointer to shared header */
+  int nBf = 0;                    /* BF record frames emitted before pList */
+
+  assert( pList );
+  assert( pWal->writeLock );
+
+  /* If this frame set completes a transaction, then nTruncate>0.  If
+  ** nTruncate==0 then this frame set does not complete the transaction. */
+  assert( (isCommit!=0)==(nTruncate!=0) );
+
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+  { int cnt; for(cnt=0, p=pList; p; p=p->pDirty, cnt++){}
+    WALTRACE(("WAL%p: frame write begin. %d frames. mxFrame=%d. %s\n",
+              pWal, cnt, pWal->hdr.mxFrame, isCommit ? "Commit" : "Spill"));
+  }
+#endif
+
+  pLive = (WalIndexHdr*)walIndexHdr(pWal);
+  if( memcmp(&pWal->hdr, (void *)pLive, sizeof(WalIndexHdr))!=0 ){
+    iFirst = pLive->mxFrame+1;
+  }
+
+  /* See if it is possible to write these frames into the start of the
+  ** log file, instead of appending to it at pWal->hdr.mxFrame.
+  */
+  if( SQLITE_OK!=(rc = walRestartLog(pWal)) ){
+    return rc;
+  }
+
+  /* If this is the first frame written into the log, write the WAL
+  ** header to the start of the WAL file. See comments at the top of
+  ** this source file for a description of the WAL header format.
+  */
+  rc = walWriteWalHeader(pWal, szPage, sync_flags);
+  if( rc!=SQLITE_OK ){
+    return rc;
+  }
+  iFrame = pWal->hdr.mxFrame;
 
   /* Setup information needed to write frames into the WAL */
   w.pWal = pWal;
@@ -4192,6 +4214,45 @@ static int walFrames(
   w.szPage = szPage;
   iOffset = walFrameOffset(iFrame+1, szPage);
   szFrame = szPage + WAL_FRAME_HDRSIZE;
+
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* Emit any staged BF record-batch frames first, as non-commit frames of this
+  ** same WAL transaction (the trailing page-image frame from pList carries the
+  ** nTruncate commit marker; sqlite3PagerCommitPhaseOne guarantees at least one
+  ** such frame).  Record frames occupy frame slots and join the checksum chain,
+  ** but are NOT added to the pgno->frame hash — their target pages are served as
+  ** base image + record-cache delta — so the wal-index append loop below skips
+  ** past them via nBf.  Their ops are also fed into pBfWal for cache rehydration.
+  ** walRestartLog() has already run, so these writes cannot be clobbered by a
+  ** log reset. */
+  nBf = pWal->nBfStage;
+  {
+    int iBf;
+    for(iBf=0; iBf<nBf && rc==SQLITE_OK; iBf++){
+      u8 aRecHdr[WAL_FRAME_HDRSIZE]; /* Frame header for the record frame */
+      u8 *aBody = pWal->apBfStage[iBf];
+      iFrame++;
+      assert( iOffset==walFrameOffset(iFrame, szPage) );
+      walEncodeFrame(pWal, WAL_BF_RECORD_PGNO, 0, aBody, aRecHdr);
+      rc = walWriteToLog(&w, aRecHdr, sizeof(aRecHdr), iOffset);
+      if( rc==SQLITE_OK ){
+        rc = walWriteToLog(&w, aBody, szPage, iOffset+sizeof(aRecHdr));
+      }
+      if( rc==SQLITE_OK ){
+        rc = walBfIngestRecordFrame(pWal, aBody);
+      }
+      iOffset += szFrame;
+    }
+    /* Staged payloads are consumed whether or not the write succeeded: on
+    ** failure the transaction rolls back and pBfWal is rebuilt at recovery. */
+    for(iBf=0; iBf<pWal->nBfStage; iBf++){
+      sqlite3_free(pWal->apBfStage[iBf]);
+      pWal->apBfStage[iBf] = 0;
+    }
+    pWal->nBfStage = 0;
+    if( rc!=SQLITE_OK ) return rc;
+  }
+#endif
 
   /* Write all frames into the log file exactly once */
   for(p=pList; p; p=p->pDirty){
@@ -4288,7 +4349,7 @@ static int walFrames(
   ** guarantees that there are no other writers, and no data that may
   ** be in use by existing readers is being overwritten.
   */
-  iFrame = pWal->hdr.mxFrame;
+  iFrame = pWal->hdr.mxFrame + nBf;   /* nBf record frames precede the pages */
   for(p=pList; p && rc==SQLITE_OK; p=p->pDirty){
     if( (p->flags & PGHDR_WAL_APPEND)==0 ) continue;
     iFrame++;
@@ -4344,6 +4405,47 @@ int sqlite3WalFrames(
   SEH_EXCEPT( rc = walHandleException(pWal); )
   return rc;
 }
+
+#ifndef SQLITE_OMIT_BF_CACHE
+/*
+** Stage one finalised record-batch payload (szPage bytes, produced by
+** sqlite3BfWalBatchFinish) to be written as a record frame by the next
+** walFrames() call of this transaction.  The WAL takes a private copy so the
+** caller may reuse its scratch buffer.  The staged payloads are emitted (and
+** freed) inside walFrames(), after walRestartLog(), ahead of the page-image
+** frames — see the emission block there.  Returns SQLITE_OK or SQLITE_NOMEM.
+*/
+int sqlite3WalBfStage(Wal *pWal, const u8 *aData, int szPage){
+  u8 *aCopy;
+  assert( pWal->writeLock );
+  if( pWal->nBfStage>=pWal->nBfStageAlloc ){
+    int nNew = pWal->nBfStageAlloc ? pWal->nBfStageAlloc*2 : 8;
+    u8 **apNew = (u8**)sqlite3_realloc(pWal->apBfStage, nNew*(int)sizeof(u8*));
+    if( apNew==0 ) return SQLITE_NOMEM_BKPT;
+    pWal->apBfStage = apNew;
+    pWal->nBfStageAlloc = nNew;
+  }
+  aCopy = (u8*)sqlite3_malloc(szPage);
+  if( aCopy==0 ) return SQLITE_NOMEM_BKPT;
+  memcpy(aCopy, aData, szPage);
+  pWal->apBfStage[pWal->nBfStage++] = aCopy;
+  return SQLITE_OK;
+}
+
+/*
+** Discard any staged-but-unwritten record payloads (transaction rollback /
+** teardown).  Safe to call when nothing is staged.
+*/
+void sqlite3WalBfStageClear(Wal *pWal){
+  int i;
+  if( pWal==0 ) return;
+  for(i=0; i<pWal->nBfStage; i++){
+    sqlite3_free(pWal->apBfStage[i]);
+    pWal->apBfStage[i] = 0;
+  }
+  pWal->nBfStage = 0;
+}
+#endif /* SQLITE_OMIT_BF_CACHE */
 
 /*
 ** This routine is called to implement sqlite3_wal_checkpoint() and

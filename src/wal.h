@@ -45,6 +45,10 @@
 # define sqlite3WalFramesize(z)                  0
 # define sqlite3WalFindFrame(x,y,z)              0
 # define sqlite3WalFile(x)                       0
+# ifndef SQLITE_OMIT_BF_CACHE
+#  define sqlite3WalBfStage(x,y,z)               0
+#  define sqlite3WalBfStageClear(x)
+# endif
 # undef SQLITE_USE_SEH
 #else
 
@@ -96,6 +100,12 @@ int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData);
 
 /* Write a frame or frames to the log. */
 int sqlite3WalFrames(Wal *pWal, int, PgHdr *, Pgno, int, int);
+
+#ifndef SQLITE_OMIT_BF_CACHE
+/* Stage a BF record-batch payload for the next commit; discard staged ones. */
+int  sqlite3WalBfStage(Wal *pWal, const u8 *aData, int szPage);
+void sqlite3WalBfStageClear(Wal *pWal);
+#endif
 
 /* Copy pages from the log to the database file */ 
 int sqlite3WalCheckpoint(
