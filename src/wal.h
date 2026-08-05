@@ -48,6 +48,7 @@
 # ifndef SQLITE_OMIT_BF_CACHE
 #  define sqlite3WalBfStage(x,y,z)               0
 #  define sqlite3WalBfStageClear(x)
+#  define sqlite3WalBfIndex(x)                   0
 # endif
 # undef SQLITE_USE_SEH
 #else
@@ -105,6 +106,10 @@ int sqlite3WalFrames(Wal *pWal, int, PgHdr *, Pgno, int, int);
 /* Stage a BF record-batch payload for the next commit; discard staged ones. */
 int  sqlite3WalBfStage(Wal *pWal, const u8 *aData, int szPage);
 void sqlite3WalBfStageClear(Wal *pWal);
+/* The pgno->ops index rebuilt at recovery (NULL in steady state).  Opaque here;
+** forward-declared so callers need not include bf_wal.h. */
+typedef struct BfWalIndex BfWalIndex;
+BfWalIndex *sqlite3WalBfIndex(Wal *pWal);
 #endif
 
 /* Copy pages from the log to the database file */ 

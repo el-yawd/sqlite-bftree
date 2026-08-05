@@ -384,6 +384,10 @@ SQLITE_PRIVATE int sqlite3BfRecordRead(BfCache *pCache, u32 pgno,
     const void *pKey, int nKey, void *pBuf, int *pnBuf);
 SQLITE_PRIVATE int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     const void *pKey, int nKey, const void *pVal, int nVal, u8 opType);
+/* Phase 2 (WAL) recovery: replay the WAL's rebuilt pgno->ops index back into
+** the mini-page cache (records written back dirty, unlogged).  See bf_cache.c. */
+typedef struct BfWalIndex BfWalIndex;
+SQLITE_PRIVATE int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx);
 
 /*
 ** Pluggable cache interface for SQLite integration.

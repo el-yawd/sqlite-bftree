@@ -4445,6 +4445,15 @@ void sqlite3WalBfStageClear(Wal *pWal){
   }
   pWal->nBfStage = 0;
 }
+
+/*
+** Expose the record-ops index (pgno -> ordered ops) so the pager can replay
+** logged records back into the BF record cache after recovery.  Returns NULL
+** when no record frames have been seen (steady state) — the common case.
+*/
+BfWalIndex *sqlite3WalBfIndex(Wal *pWal){
+  return pWal ? pWal->pBfWal : 0;
+}
 #endif /* SQLITE_OMIT_BF_CACHE */
 
 /*

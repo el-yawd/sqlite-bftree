@@ -121,5 +121,11 @@ void        sqlite3BfWalIndexClearPage(BfWalIndex *p, u32 pgno);
 ** BFWAL_NOMEM. */
 int         sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf);
 
+/* Visit each distinct target pgno held in the index (any order).  The callback
+** may then walk that page's ops via PageCount/Get.  Iteration stops early if a
+** callback returns non-BFWAL_OK, and that code is returned. */
+int         sqlite3BfWalIndexForEachPage(BfWalIndex *p,
+                int (*xPage)(void *pCtx, u32 pgno), void *pCtx);
+
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */
 #endif /* SQLITE_BF_WAL_H */

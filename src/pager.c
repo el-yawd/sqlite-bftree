@@ -3263,6 +3263,19 @@ static int pagerBeginReadTransaction(Pager *pPager){
   if( rc!=SQLITE_OK || changed ){
     pager_reset(pPager);
     if( USEFETCH(pPager) ) sqlite3OsUnfetch(pPager->fd, 0, 0);
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* Phase 2 (WAL): the read snapshot changed (recovery ran, or another
+    ** connection advanced the WAL), so the BF record cache was just reset.
+    ** Rehydrate it from any record ops the WAL holds (NULL in steady state, so
+    ** this is a no-op on the common path). */
+    if( rc==SQLITE_OK ){
+      BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
+      if( pWalIdx ){
+        BfCache *pBf = sqlite3PagerGetBfCache(pPager);
+        if( pBf ) rc = sqlite3BfCacheReplayWal(pBf, pWalIdx);
+      }
+    }
+#endif
   }
 
   return rc;

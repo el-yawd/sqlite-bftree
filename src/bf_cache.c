@@ -32,6 +32,7 @@
 */
 #include "sqliteInt.h"
 #include "bf_cache.h"
+#include "bf_wal.h"    /* record-ops index replayed into the cache at recovery */
 
 #ifndef SQLITE_OMIT_BF_CACHE
 
@@ -787,6 +788,72 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   /* Mini-page is at max size and upgrade failed — caller must use the full
   ** base-page path for this record. */
   return BF_FULL;
+}
+
+/*
+** Phase 2 (WAL) recovery: repopulate the record cache from the WAL's rebuilt
+** pgno->ops index.  After a crash, walIndexRecover reconstructs pWalIdx by
+** scanning the WAL's record frames; this replays those ops (in log order) back
+** into the mini-page cache so the Phase-1 read hook surfaces them to queries —
+** the WAL is the durable source that rehydrates the RAM cache.
+**
+** Records are written back as DIRTY (BFOP_INSERT/BFOP_DELETE): they are durable
+** in the WAL but NOT yet in the base B-tree (checkpoint applies them lazily), so
+** they must still be flushed to base at checkpoint/eviction.  They are left
+** UNLOGGED (the logged flag stays clear): a subsequent commit will re-log them
+** once — harmless because replay is idempotent and order-preserving — which is
+** simpler than reconstructing the exactly-once marks across a crash.
+**
+** KNOWN GAP (leaf->root): a mini-page created here has no rootPgno (the WAL
+** stores only the leaf pgno).  Reads work (they key by leaf), but a checkpoint
+** that must flush a purely-recovered record to base needs the owning table root
+** — which is re-established when a query descends that table (bfTagLeafRoot in
+** the btree hooks).  Post-recovery checkpoint of never-touched pages is future
+** work (see [[phase2-progress]] task 6).
+**
+** Returns SQLITE_OK, or SQLITE_NOMEM if a write ran out of memory.
+*/
+typedef struct BfReplayCtx BfReplayCtx;
+struct BfReplayCtx {
+  BfCache    *pCache;
+  BfWalIndex *pWalIdx;
+  int         rc;       /* first error, sticky */
+};
+
+static int bfReplayOnePage(void *pCtx, u32 pgno){
+  BfReplayCtx *ctx = (BfReplayCtx*)pCtx;
+  int n = sqlite3BfWalIndexPageCount(ctx->pWalIdx, pgno);
+  int i;
+  for(i=0; i<n; i++){
+    BfWalRec rec;
+    u8 op;
+    int wr;
+    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
+    op = (rec.op==BFWAL_OP_DELETE) ? BFOP_DELETE : BFOP_INSERT;
+    wr = sqlite3BfRecordWrite(ctx->pCache, pgno, rec.pKey, (int)rec.nKey,
+                              rec.pVal, (int)rec.nVal, op);
+    if( wr==SQLITE_NOMEM ){
+      ctx->rc = SQLITE_NOMEM;
+      return BFWAL_NOMEM;   /* stop the walk */
+    }
+    /* BF_FULL (mini-page maxed) is tolerated: the record stays durable in the
+    ** WAL and is re-applied at the next checkpoint from the base path. */
+  }
+  return BFWAL_OK;
+}
+
+int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx){
+  BfReplayCtx ctx;
+  if( pCache==0 || pWalIdx==0 ) return SQLITE_OK;
+  ctx.pCache  = pCache;
+  ctx.pWalIdx = pWalIdx;
+  ctx.rc      = SQLITE_OK;
+  sqlite3BfWalIndexForEachPage(pWalIdx, bfReplayOnePage, &ctx);
+  if( ctx.rc==SQLITE_OK ){
+    /* Arm the pre-mutation / pre-scan / commit flush for the replayed rows. */
+    pCache->bDirtyInserts = 1;
+  }
+  return ctx.rc;
 }
 
 /*

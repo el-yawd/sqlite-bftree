@@ -442,6 +442,20 @@ void sqlite3BfWalIndexClearPage(BfWalIndex *p, u32 pgno){
   }
 }
 
+int sqlite3BfWalIndexForEachPage(BfWalIndex *p,
+    int (*xPage)(void *pCtx, u32 pgno), void *pCtx){
+  int i;
+  if( p==0 || xPage==0 ) return BFWAL_OK;
+  for(i=0; i<p->nBucket; i++){
+    BfWalIdxPage *pP;
+    for(pP = p->apBucket[i]; pP; pP = pP->pNext){
+      int rc = xPage(pCtx, pP->pgno);
+      if( rc!=BFWAL_OK ) return rc;
+    }
+  }
+  return BFWAL_OK;
+}
+
 int sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf){
   BfWalIter it;
   BfWalRec r;
