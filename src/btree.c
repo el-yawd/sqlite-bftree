@@ -4372,12 +4372,17 @@ int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
 #ifndef SQLITE_OMIT_BF_CACHE
     /* Materialise BF write-buffered records before the pager commits. */
 # if defined(SQLITE_BF_INSERT_BUFFERING)
-    if( sqlite3PagerIsWal(pBt->pPager) ){
+    if( sqlite3PagerIsWal(pBt->pPager) && !pBt->bfForceBaseFlush ){
       /* Phase 2 (WAL): log the dirty records as small physiological record
       ** frames instead of merging them into base pages — a commit persists
       ** records, not whole pages.  The records stay in the cache (dirty) and
       ** reach base lazily at checkpoint/eviction.  On failure the commit must
-      ** abort so the rollback discards the just-set "logged" marks. */
+      ** abort so the rollback discards the just-set "logged" marks.
+      **
+      ** bfForceBaseFlush overrides this to take the flush branch below: it is
+      ** set only by the checkpoint materialise pass, which must turn logged
+      ** records into base pages (page-image frames) so the checkpoint can
+      ** backfill them — record frames are never backfilled. */
       rc = sqlite3BfBtreeLogAllDirty(p);
       if( rc!=SQLITE_OK ){
         sqlite3BtreeLeave(p);
@@ -12131,6 +12136,43 @@ int sqlite3BtreeTxnState(Btree *p){
 **
 ** Parameter eMode is one of SQLITE_CHECKPOINT_PASSIVE, FULL or RESTART.
 */
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+/*
+** Phase 2 (WAL): before a checkpoint, materialise every logged-but-not-in-base
+** BF record to its base B-tree page.  A checkpoint only backfills page-image
+** frames (record frames are not in the pgno->frame hash, so walIterator never
+** yields them); if the WAL reset past unmaterialised record frames, their data
+** would be lost.  We therefore run a self-contained write transaction that
+** flushes the dirty records to base pages — the resulting page-image frames are
+** what the checkpoint backfills.  Called with no transaction open (checkpoint
+** context) and the btree mutex held.
+*/
+static int bfCheckpointMaterialize(Btree *p){
+  BtShared *pBt = p->pBt;
+  BfCache *pBf;
+  int rc;
+
+  if( !sqlite3PagerIsWal(pBt->pPager) ) return SQLITE_OK; /* flushed at commit */
+  pBf = sqlite3PagerGetBfCache(pBt->pPager);
+  if( pBf==0 || pBf->bDirtyInserts==0 ) return SQLITE_OK; /* nothing logged */
+
+  rc = sqlite3BtreeBeginTrans(p, 1, 0);
+  if( rc!=SQLITE_OK ) return rc;
+
+  /* Force CommitPhaseOne's flush branch: turn logged records into base-page
+  ** writes (page-image frames) rather than re-logging them. */
+  pBt->bfForceBaseFlush = 1;
+  rc = sqlite3BtreeCommitPhaseOne(p, 0);
+  pBt->bfForceBaseFlush = 0;
+  if( rc==SQLITE_OK ){
+    rc = sqlite3BtreeCommitPhaseTwo(p, 0);
+  }else{
+    sqlite3BtreeRollback(p, SQLITE_ABORT_ROLLBACK, 0);
+  }
+  return rc;
+}
+#endif
+
 int sqlite3BtreeCheckpoint(Btree *p, int eMode, int *pnLog, int *pnCkpt){
   int rc = SQLITE_OK;
   if( p ){
@@ -12139,6 +12181,10 @@ int sqlite3BtreeCheckpoint(Btree *p, int eMode, int *pnLog, int *pnCkpt){
     if( pBt->inTransaction!=TRANS_NONE ){
       rc = SQLITE_LOCKED;
     }else{
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+      rc = bfCheckpointMaterialize(p);
+      if( rc==SQLITE_OK )
+#endif
       rc = sqlite3PagerCheckpoint(pBt->pPager, p->db, eMode, pnLog, pnCkpt);
     }
     sqlite3BtreeLeave(p);

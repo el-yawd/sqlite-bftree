@@ -457,6 +457,10 @@ struct BtShared {
 #endif
   u8 *pTmpSpace;        /* Temp space sufficient to hold a single cell */
   int nPreformatSize;   /* Size of last cell written by TransferRow() */
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  u8 bfForceBaseFlush;  /* Phase 2: force CommitPhaseOne to flush BF records to
+                        ** base pages even in WAL mode (checkpoint materialise) */
+#endif
 };
 
 /*
