@@ -4909,7 +4909,13 @@ case OP_SeekGT: {       /* jump0, in3, group, ncycle */
         if( (oc & 0x0001)==(OP_SeekLT & 0x0001) ) oc++;
       }
     }
-    rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, (u64)iKey, 0, &res);
+    /* Range-seek entry point: this positions a cursor for ITERATION (the
+    ** following Next/Prev loop), so BF-buffered rows for this table must be
+    ** materialised up front — flushing later, mid-iteration, would mutate the
+    ** tree under the seek.  ForScan is a plain TableMoveto in the write-through
+    ** default build (see btree.c). */
+    rc = sqlite3BtreeTableMovetoForScan(pC->uc.pCursor, (u64)iKey, 0, &res,
+                                        oc>=OP_SeekGE);
     pC->movetoTarget = iKey;  /* Used by OP_Delete */
     if( rc!=SQLITE_OK ){
       goto abort_due_to_error;

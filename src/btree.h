@@ -256,6 +256,13 @@ int sqlite3BtreeTableMoveto(
   int bias,
   int *pRes
 );
+int sqlite3BtreeTableMovetoForScan(
+  BtCursor*,
+  i64 intKey,
+  int bias,
+  int *pRes,
+  int bForward
+);
 int sqlite3BtreeIndexMoveto(
   BtCursor*,
   UnpackedRecord *pUnKey,

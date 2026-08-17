@@ -224,6 +224,16 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
 
   if( !pBf || !pBtree || pgnoRoot==0 || !pMini ) return SQLITE_OK;
   if( !sqlite3BfMiniPageIsDirty(pMini) ) return SQLITE_OK;
+  /* A flush WRITES base pages, so it needs a write transaction.  Under a read
+  ** transaction the bypass cursor's inserts all fail, yet the records would be
+  ** marked clean below — with Phase-2 record logging (records live in the cache
+  ** + their WAL record frames until a checkpoint materialises them) that would
+  ** silently destroy committed rows: the next checkpoint sees nothing dirty,
+  ** materialises nothing, and resets the WAL.  Read paths must merge instead of
+  ** flushing (sqlite3BtreeFirst / bfMergeSeek); refuse here so a path that has
+  ** no merge support degrades to "does not see buffered rows" rather than
+  ** "loses them". */
+  if( pBtree->inTrans!=TRANS_WRITE ) return SQLITE_OK;
 
   memset(&ctx, 0, sizeof(ctx));
   memset(&tmpCur, 0, (size_t)sqlite3BtreeCursorSize());
@@ -290,6 +300,11 @@ int sqlite3BfBtreeFlushAllDirty(Btree *p){
 
   ctx.pBf    = pBf;
   ctx.pBtree = p;
+
+  /* Without a write transaction nothing can be materialised (see
+  ** bfFlushOneMiniPage); leave the records dirty rather than declaring them
+  ** flushed. */
+  if( p->inTrans!=TRANS_WRITE ) return SQLITE_OK;
 
   sqlite3BfMapIterate(pBf, bfFlushAllCallback, &ctx);
   pBf->bDirtyInserts = 0;  /* all buffered inserts materialised */
@@ -459,6 +474,10 @@ static int bfFlushTableDirty(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot){
   BfFlushTableCtx ctx;
   if( !pBf || !pBtree || pgnoRoot<=1 ) return 0;
   if( pBf->bBypassActive || pBf->bMergingActive ) return 0;
+  /* No write transaction ⇒ nothing can be materialised (see bfFlushOneMiniPage).
+  ** Must report 0: callers treat a non-zero return as "the tree changed, redo
+  ** the descent", which would spin forever against an unchanged tree. */
+  if( pBtree->inTrans!=TRANS_WRITE ) return 0;
   /* Nothing buffered since the last commit/rollback ⇒ no dirty mini-page can
   ** exist; skip the O(map) walk.  Conservative: never 0 while dirty. */
   if( !pBf->bDirtyInserts ) return 0;
@@ -805,7 +824,13 @@ int sqlite3BfBtreeKeyTombstoned(BtCursor *pCur, Pgno leaf, i64 rowid){
 static int bfScanCanMerge(BtCursor *pCur){
   BfCache *pBf;
   if( !pCur || !pCur->pBt ) return 0;
-  if( !pCur->curIntKey || pCur->pgnoRoot<=1 ) return 0;
+  /* curIntKey is only latched by moveToRoot (btree.c), so it is still 0 on a
+  ** cursor that has not descended yet — which is exactly the state
+  ** sqlite3BtreeFirst arms merge in.  pKeyInfo==0 is the static "this is a
+  ** rowid table cursor" fact, known from cursor creation, so use it as the
+  ** pre-descent form of the same test (without it merge never armed on a fresh
+  ** cursor and every scan fell back to the flush path). */
+  if( (!pCur->curIntKey && pCur->pKeyInfo!=0) || pCur->pgnoRoot<=1 ) return 0;
   if( (pCur->curFlags & BTCF_WriteFlag)!=0 ) return 0;
   pBf = btreeGetBfCache(pCur->pBt);
   if( !pBf || !pBf->bDirtyInserts ) return 0;

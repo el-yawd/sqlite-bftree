@@ -1734,6 +1734,28 @@ void sqlite3Pragma(
     assert( iDb==0 || pId2->z );
     if( pId2->z==0 ) iDb = -1;
 
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
+ && !defined(SQLITE_OMIT_WAL)
+    /* Phase 2 (WAL): the integrity check walks the BASE b-tree only.  With
+    ** record-level logging a committed row may live solely in the BF cache plus
+    ** its WAL record frame (leaves are written lazily), while its index entries
+    ** were written through to base — the checker would then report "wrong # of
+    ** entries in index".  Materialise the logged records into base first; the
+    ** checkpoint path already does exactly this (bfCheckpointMaterialize) and
+    ** is a no-op when nothing is buffered or the db is not in WAL mode.  Done
+    ** at code-generation time, before the VDBE opens its read transaction:
+    ** materialising needs a write transaction of its own.  SQLITE_LOCKED (a
+    ** transaction is already open) is ignored — inside an explicit transaction
+    ** the check simply keeps its pre-existing base-only view. */
+    for(j=0; j<db->nDb; j++){
+      if( iDb>=0 && iDb!=j ) continue;
+      if( db->aDb[j].pBt ){
+        (void)sqlite3BtreeCheckpoint(db->aDb[j].pBt, SQLITE_CHECKPOINT_PASSIVE,
+                                     0, 0);
+      }
+    }
+#endif
+
     /* Initialize the VDBE program */
     pParse->nMem = 6;
 

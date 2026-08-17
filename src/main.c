@@ -1394,6 +1394,30 @@ void sqlite3LeaveMutexAndCloseZombie(sqlite3 *db){
   ** go ahead and free all resources.
   */
 
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Phase 2 (WAL) durability: before teardown, materialise every logged-but-not-
+  ** in-base BF record to its base page and TRUNCATE the WAL.  Commit persists a
+  ** mutation as a small record frame (sentinel pgno), not a 4KB page image; but
+  ** the wal-layer close-checkpoint (sqlite3WalClose) and the pager auto-checkpoint
+  ** both backfill only page-image frames, silently dropping record frames.  A
+  ** session that never issued an explicit checkpoint would therefore lose every
+  ** buffered insert/update/delete on reopen.  Routing through
+  ** sqlite3BtreeCheckpoint runs bfCheckpointMaterialize first (turning the logged
+  ** records into base-page writes) and then resets the WAL, so the reopened db
+  ** reads a fully-materialised base with no stale record frames to replay.  This
+  ** must run while the BF cache still holds the dirty records — i.e. BEFORE
+  ** sqlite3RollbackAll below wipes the cache.  A no-op when nothing is buffered
+  ** (bfCheckpointMaterialize early-outs) or the db is not in WAL mode; returns
+  ** SQLITE_LOCKED (ignored) if a transaction is somehow still open, which the
+  ** rollback below then discards. */
+  for(j=0; j<db->nDb; j++){
+    Btree *pBt = db->aDb[j].pBt;
+    if( pBt ){
+      (void)sqlite3BtreeCheckpoint(pBt, SQLITE_CHECKPOINT_TRUNCATE, 0, 0);
+    }
+  }
+#endif
+
   /* If a transaction is open, roll it back. This also ensures that if
   ** any database schemas have been modified by an uncommitted transaction
   ** they are reset. And that the required b-tree mutex is held to make
@@ -3667,6 +3691,18 @@ static int openDatabase(
                         sqlite3GlobalConfig.nLookaside);
 
   sqlite3_wal_autocheckpoint(db, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT);
+
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Phase 2 (WAL) v1 durability: BF record frames reach base only at an EXPLICIT
+  ** checkpoint (sqlite3BtreeCheckpoint -> bfCheckpointMaterialize).  The pager's
+  ** auto-checkpoint and clean-close checkpoint copy only page-image frames and
+  ** silently drop record frames, so we must (a) disable auto-checkpoint and
+  ** (b) persist the WAL across close so recovery-replay restores the records on
+  ** reopen.  Known v1 limitation: the WAL grows until an explicit checkpoint. */
+  sqlite3_wal_autocheckpoint(db, 0);
+  { int bfPersist = 1;
+    sqlite3_file_control(db, "main", SQLITE_FCNTL_PERSIST_WAL, &bfPersist); }
+#endif
 
 opendb_out:
   if( db ){
