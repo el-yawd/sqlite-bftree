@@ -652,6 +652,7 @@ int sqlite3BfBtreeInsertCell(
     if( rc==BF_OK ){
       bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
       pBf->bDirtyInserts = 1;  /* arm the pre-mutation/pre-scan flush */
+      pBf->nBufferedInserts++;
       return SQLITE_OK;
     }
   }
@@ -855,12 +856,53 @@ int sqlite3BfBtreeBeginMergeScan(BtCursor *pCur){
   BfCache *pBf;
   if( !bfScanCanMerge(pCur) ) return 0;
   pCur->bfMerge = 1;
+  pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
+  pCur->bfBaseDone = 0;
   pCur->bfMergeLeaf = 0;
   pCur->bfIx = 0;
   pBf = btreeGetBfCache(pCur->pBt);
   if( pBf ) pBf->nMergeScans++;
   return 1;
+#else
+  (void)pCur;
+  return 0;
+#endif
+}
+
+/*
+** Begin a REVERSE merge scan (Stage 2.4).  Called only from sqlite3BtreeLast
+** (full-table backward scans).  Same eligibility test as the forward arm; the
+** cursor is additionally marked bfMergeRev so btreePrevious steps through
+** bfMergePickPrev and a stray forward step bails instead of mis-merging.
+*/
+int sqlite3BfBtreeBeginMergeScanRev(BtCursor *pCur){
+#if defined(SQLITE_BF_INSERT_BUFFERING) && !defined(SQLITE_BF_NO_MERGE_SCAN)
+  BfCache *pBf;
+  if( !bfScanCanMerge(pCur) ) return 0;
+  pCur->bfMerge = 1;
+  pCur->bfMergeRev = 1;
+  pCur->bfOnMini = 0;
+  pCur->bfBaseDone = 0;
+  pCur->bfMergeLeaf = 0;
+  pCur->bfIx = 0;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( pBf ) pBf->nMergeScans++;
+  return 1;
+#else
+  (void)pCur;
+  return 0;
+#endif
+}
+
+/*
+** Merge eligibility predicate with no side effects — used by sqlite3BtreeCount
+** to decide between the (merge-blind) page-walk count and a merged First/Next
+** scan.  Returns 0 in every non-buffering build.
+*/
+int sqlite3BfBtreeCanMergeScan(BtCursor *pCur){
+#if defined(SQLITE_BF_INSERT_BUFFERING) && !defined(SQLITE_BF_NO_MERGE_SCAN)
+  return bfScanCanMerge(pCur);
 #else
   (void)pCur;
   return 0;
@@ -968,6 +1010,65 @@ int sqlite3BfBtreeMergeNextInsert(
 }
 
 /*
+** Merge-scan primitive (Stage 2.4) — the reverse twin of
+** sqlite3BfBtreeMergeNextInsert.  Starting at sorted index *pIx in the
+** mini-page of leaf `leaf` and walking DOWN, find the previous buffered
+** BFOP_INSERT record.  *pIx may be any int on entry: it is clamped to the last
+** record index, so a caller starting at the leaf's end passes INT_MAX; a
+** negative *pIx means "already exhausted" and returns 0 immediately.
+**
+** On success: copies the value into pBuf, writes the rowid/value length, sets
+** *pIx to the index AT which the insert was found, returns 1.  Returns 0 when
+** no earlier INSERT exists (and sets *pIx to -1).  Returns -1 on the same bail
+** conditions as the forward routine (mini-page gone/changed, value too big).
+*/
+int sqlite3BfBtreeMergePrevInsert(
+  BtCursor *pCur, Pgno leaf, int *pIx, i64 *pRowid, void *pBuf, int nCap,
+  int *pnVal
+){
+  BtShared   *pBt;
+  BfCache    *pBf;
+  BfMapEntry *pEntry;
+  BfMiniPage *pMini;
+  int ix, n;
+
+  if( !pCur || !pCur->pBt ) return -1;
+  if( *pIx<0 ) return 0;                /* exhausted below index 0 */
+  pBt = pCur->pBt;
+  pBf = btreeGetBfCache(pBt);
+  if( !pBf ) return -1;
+  pEntry = sqlite3BfMapLookup(pBf, leaf);
+  if( !pEntry || pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ){
+    *pIx = -1;
+    return 0;                 /* no mini-page on this leaf ⇒ no inserts */
+  }
+  pMini = (BfMiniPage*)pEntry->pPage;
+  n = sqlite3BfMiniPageCount(pMini);
+  ix = *pIx;
+  if( ix>n-1 ) ix = n-1;                /* clamp the "start at the end" entry */
+  for(; ix>=0; ix--){
+    const u8 *pKey, *pVal;
+    int nKey, nVal, k;
+    i64 r = 0;
+    u8 op;
+    if( !sqlite3BfMiniPageAt(pMini, ix, &pKey, &nKey, &pVal, &nVal, &op) ){
+      return -1;
+    }
+    if( op!=BFOP_INSERT ) continue;       /* skip clean cache/phantom records */
+    if( nKey!=8 || nVal>nCap ) return -1; /* unexpected ⇒ bail */
+    for(k=0; k<8; k++){ r = (r<<8) | pKey[k]; }
+    *pRowid = r;
+    if( nVal>0 ) memcpy(pBuf, pVal, nVal);
+    *pnVal = nVal;
+    *pIx = ix;                            /* report the found index */
+    pBf->nMergeInserts++;
+    return 1;
+  }
+  *pIx = -1;
+  return 0;
+}
+
+/*
 ** Merge-scan bail (Stage 2.2).  Flush every dirty mini-page of the cursor's
 ** table to the base tree and clear the cursor's merge state, so the scan can
 ** continue as a plain base-tree walk (all buffered rows are now real cells).
@@ -983,7 +1084,9 @@ int sqlite3BfBtreeMergeBail(BtCursor *pCur){
   if( !pCur ) return 0;
   wasMerge = pCur->bfMerge;
   pCur->bfMerge = 0;
+  pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
+  pCur->bfBaseDone = 0;
   pCur->bfMergeLeaf = 0;
   pCur->bfIx = 0;
   if( !pCur->pBt ) return 0;
@@ -1426,6 +1529,48 @@ void sqlite3BfBtreeMergeStats(Btree *p, u64 *pScans, u64 *pInserts, u64 *pBail){
   if( pScans )   *pScans   = pBf ? pBf->nMergeScans   : 0;
   if( pInserts ) *pInserts = pBf ? pBf->nMergeInserts : 0;
   if( pBail )    *pBail    = pBf ? pBf->nMergeBail    : 0;
+}
+
+/*
+** Note that an insert on a rowid table took the base-page write path instead of
+** being absorbed by a mini-page (mini-page full, cursor not on a usable leaf,
+** an overwrite, or a flag combination the buffering gate excludes).  Every such
+** insert costs a page-image WAL frame at commit, so the ratio
+** buffered_inserts : insert_fallbacks is what the write win is made of.
+*/
+void sqlite3BfBtreeNoteInsertFallback(BtCursor *pCur){
+  BfCache *pBf;
+  if( !pCur || !pCur->pBt ) return;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( pBf ) pBf->nInsertFallback++;
+}
+
+/*
+** Insert-path statistics (Phase 2) for PRAGMA bf_cache_stats.
+*/
+void sqlite3BfBtreeInsertStats(Btree *p, u64 *pBuffered, u64 *pFallback){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pBuffered ) *pBuffered = pBf ? pBf->nBufferedInserts : 0;
+  if( pFallback ) *pFallback = pBf ? pBf->nInsertFallback  : 0;
+}
+
+/*
+** WAL write-amplification statistics (Phase 2) for PRAGMA bf_cache_stats.
+** wal_record_frames = record-batch frames this connection's WAL has written;
+** wal_page_frames   = 4 KB page images it had to write anyway;
+** wal_commits       = commit frames (i.e. transactions) written.
+** The Phase-2 write claim is page_frames/commits staying at ~1 (the commit
+** frame itself) while the row data rides record frames.
+*/
+void sqlite3BfBtreeWalStats(Btree *p, u64 *pRecFrames, u64 *pPageFrames,
+                            u64 *pCommits){
+  if( pRecFrames )  *pRecFrames  = 0;
+  if( pPageFrames ) *pPageFrames = 0;
+  if( pCommits )    *pCommits    = 0;
+  if( p && p->pBt && p->pBt->pPager ){
+    sqlite3PagerBfFrameStats(p->pBt->pPager, pRecFrames, pPageFrames, pCommits);
+  }
 }
 
 /*

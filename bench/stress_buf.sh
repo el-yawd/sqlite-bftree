@@ -26,11 +26,13 @@ SEEDS="$*"
 [ -z "$SEEDS" ] && SEEDS="1 2 3 5 7 11 13 17 23 42 99 123 777 1024 2024 12345 31337 65535"
 fail=0; n=0
 for seed in $SEEDS; do
-  # Three generators: monotonic (gen_stress), random-rowid (gen_stress_rand,
-  # mid-leaf buffering + splits), and gen_merge_stress (full-table forward scans
+  # Four generators: monotonic (gen_stress), random-rowid (gen_stress_rand,
+  # mid-leaf buffering + splits), gen_merge_stress (full-table forward scans
   # INSIDE transactions with pending buffered inserts — the Stage 2.2 merge path
-  # that the other two never reach, since their in-txn SELECTs are point/range).
-  for gen in gen_stress gen_stress_rand gen_merge_stress; do
+  # that the first two never reach, since their in-txn SELECTs are point/range),
+  # and gen_rev_stress (DESC scans, LIMIT-ed reverse scans, count(*)/min/max in
+  # the same state — the Stage 2.4 reverse-merge and merged-COUNT paths).
+  for gen in gen_stress gen_stress_rand gen_merge_stress gen_rev_stress; do
     for jm in delete wal memory; do
       n=$((n+1))
       b="$WORK/buf_${gen}_s${seed}_${jm}"
@@ -40,10 +42,14 @@ for seed in $SEEDS; do
         # gen_stress_rand takes (seed, nops); prepend the journal pragma.
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
         python3 ./gen_stress_rand.py "$seed" "$NOPS" >> "$b.sql"
-      else
+      elif [ "$gen" = gen_merge_stress ]; then
         # gen_merge_stress takes (seed, n_txns); prepend the journal pragma.
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
         python3 ./gen_merge_stress.py "$seed" 400 >> "$b.sql"
+      else
+        # gen_rev_stress takes (seed, n_txns); prepend the journal pragma.
+        printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
+        python3 ./gen_rev_stress.py "$seed" 400 >> "$b.sql"
       fi
       rm -f "$b.bf.db" "$b.st.db"
       "$BUF"   "$b.bf.db" < "$b.sql" > "$b.bf.out" 2>&1 || true

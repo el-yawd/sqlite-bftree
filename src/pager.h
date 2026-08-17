@@ -279,5 +279,6 @@ BfCache *sqlite3BfGetPagerCache(Pager *pPager);
 int sqlite3PagerBfStage(Pager *pPager, const u8 *aData, int szPage);
 void sqlite3PagerBfStageClear(Pager *pPager);
 int sqlite3PagerIsWal(Pager *pPager);
+void sqlite3PagerBfFrameStats(Pager*, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
 
 #endif /* SQLITE_PAGER_H */

@@ -863,7 +863,9 @@ void sqlite3BtreeClearCursor(BtCursor *pCur){
   pCur->curFlags &= ~BTCF_BfLeaf;   /* no live position ⇒ no BF-served state */
 # if defined(SQLITE_BF_INSERT_BUFFERING)
   pCur->bfMerge = 0;
+  pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
+  pCur->bfBaseDone = 0;
 # endif
 #endif
 }
@@ -4840,7 +4842,9 @@ static int btreeCursor(
   pCur->pBfScratch = 0;
   pCur->nBfScratch = 0;
   pCur->bfMerge = 0;
+  pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
+  pCur->bfBaseDone = 0;
   pCur->bfMergeLeaf = 0;
   pCur->bfIx = 0;
 #endif
@@ -5762,7 +5766,9 @@ static int moveToRoot(BtCursor *pCur){
   ** (where pCur->bfMerge would wrongly suppress promotion).  sqlite3BtreeFirst
   ** re-arms it after positioning. */
   pCur->bfMerge = 0;
+  pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
+  pCur->bfBaseDone = 0;
 # endif
 #endif
   assert( CURSOR_INVALID < CURSOR_REQUIRESEEK );
@@ -6003,6 +6009,95 @@ static int bfMergePick(BtCursor *pCur){
 }
 
 /*
+** Reverse twin of bfMergePick (Stage 2.4).  Position a merge cursor on the
+** PREVIOUS row in rowid order, drawing from the base cells of the current leaf
+** and that leaf's buffered BFOP_INSERT records, and crossing to preceding
+** leaves as both streams are exhausted.
+**
+** State conventions differ from the forward direction only where the u16
+** pCur->ix cannot express them: "base exhausted on this leaf" is pCur->bfBaseDone
+** (ix cannot go to -1), and "insert stream exhausted" is pCur->bfIx<0, with
+** bfIx==BF_MERGE_IX_END meaning "start at the last record of the mini-page".
+**
+** Returns SQLITE_OK (positioned, bfOnMini telling which stream), SQLITE_DONE
+** (no more rows) or an error code.
+*/
+#define BF_MERGE_IX_END 0x7fffffff
+
+static int bfMergePickPrev(BtCursor *pCur){
+  for(;;){
+    MemPage *pPage = pCur->pPage;
+    int haveBase, haveIns, foundIx, insVal = 0, r;
+    i64 insKey = 0, baseKey = 0;
+
+    if( !pPage->leaf ) return SQLITE_CORRUPT_BKPT;
+    if( pPage->pgno!=pCur->bfMergeLeaf ){
+      pCur->bfMergeLeaf = pPage->pgno;
+      pCur->bfIx = BF_MERGE_IX_END;
+      pCur->bfBaseDone = (pPage->nCell==0);
+    }
+    haveBase = (!pCur->bfBaseDone && pPage->nCell>0);
+    foundIx = pCur->bfIx;
+    r = sqlite3BfBtreeMergePrevInsert(pCur, pPage->pgno, &foundIx, &insKey,
+            pCur->pBfScratch, pCur->nBfScratch, &insVal);
+    if( r<0 ) return SQLITE_CORRUPT_BKPT;   /* impossible: keys are 8-byte rowid */
+    haveIns = (r==1);
+    if( haveBase ) baseKey = bfBaseCellRowid(pPage, pCur->ix);
+
+    if( haveIns && (!haveBase || insKey>=baseKey) ){
+      pCur->bfIx = foundIx - 1;             /* consume this insert */
+      if( haveBase && insKey==baseKey ){
+        /* Shadow/update: the buffered insert supersedes the surviving base
+        ** cell for the same key (see bfMergePick for how that arises). */
+        if( pCur->ix==0 ) pCur->bfBaseDone = 1; else pCur->ix--;
+      }
+      pCur->info.nKey     = insKey;
+      pCur->info.pPayload = (u8*)pCur->pBfScratch;
+      pCur->info.nPayload = (u32)insVal;
+      pCur->info.nLocal   = (u16)insVal;
+      pCur->info.nSize    = (u16)(insVal>0 ? insVal : 1);
+      pCur->bfOnMini = 1;
+      pCur->eState = CURSOR_VALID;
+      pCur->curFlags |= BTCF_ValidNKey;
+      pCur->curFlags &= ~BTCF_ValidOvfl;
+      return SQLITE_OK;
+    }
+    if( haveBase ){
+#if !defined(SQLITE_BF_NO_WRITEBACK_DELETE)
+      if( sqlite3BfBtreeKeyTombstoned(pCur, pPage->pgno, baseKey) ){
+        BfCache *pBfTomb = btreeGetBfCache(pCur->pBt);
+        if( pBfTomb ) pBfTomb->nMergeTombstones++;
+        pCur->bfIx = foundIx;               /* keep the peeked insert */
+        if( pCur->ix==0 ) pCur->bfBaseDone = 1; else pCur->ix--;
+        continue;
+      }
+#endif
+      pCur->bfIx = foundIx;                 /* keep the peeked insert for later */
+      pCur->bfOnMini = 0;
+      pCur->info.nSize = 0;
+      pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+      pCur->eState = CURSOR_VALID;
+      return SQLITE_OK;
+    }
+    /* Both streams exhausted on this leaf: cross to the previous leaf with the
+    ** stock walk (merge briefly disabled), then loop to re-evaluate.  ix==0 is
+    ** what btreePrevious needs to step off the front of a leaf. */
+    pCur->bfIx = foundIx;
+    {
+      int rc;
+      pCur->bfMerge = 0;
+      pCur->bfOnMini = 0;
+      pCur->ix = 0;
+      rc = sqlite3BtreePrevious(pCur, 0);
+      pCur->bfMerge = 1;
+      if( rc==SQLITE_DONE ) return SQLITE_DONE;
+      if( rc!=SQLITE_OK ) return rc;
+      pCur->bfBaseDone = 0;
+    }
+  }
+}
+
+/*
 ** Ensure the per-cursor scratch buffer used to serve buffered-insert payloads
 ** is allocated.  Returns SQLITE_OK or SQLITE_NOMEM.
 */
@@ -6154,6 +6249,37 @@ int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
 
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Reverse merge scan (Stage 2.4): a read cursor on a rowid table iterates the
+  ** merged base+buffered stream backwards instead of flushing.  Write cursors
+  ** (OP_NewRowid, which needs the true max rowid materialised) are rejected by
+  ** the eligibility gate and keep the flush path below.  BTCF_AtLast is left
+  ** clear in merge mode: pCur->ix is a base-cell index, not the merged
+  ** position, so the AtLast fast path must not fire. */
+  if( sqlite3BfBtreeBeginMergeScanRev(pCur) ){
+    int rc = bfMergeEnsureScratch(pCur);
+    if( rc!=SQLITE_OK ){ sqlite3BfBtreeMergeBail(pCur); return rc; }
+    rc = moveToRoot(pCur);
+    if( rc==SQLITE_EMPTY ){
+      /* Base tree empty but inserts may be buffered: flush and re-root plain. */
+      sqlite3BfBtreeMergeBail(pCur);
+      return btreeLast(pCur, pRes);
+    }
+    if( rc!=SQLITE_OK ){ sqlite3BfBtreeMergeBail(pCur); return rc; }
+    rc = moveToRightmost(pCur);
+    if( rc!=SQLITE_OK ){ sqlite3BfBtreeMergeBail(pCur); return rc; }
+    pCur->bfMerge = 1;            /* re-arm (moveToRoot cleared it) and pick */
+    pCur->bfMergeRev = 1;
+    pCur->bfMergeLeaf = 0;
+    pCur->bfOnMini = 0;
+    pCur->bfBaseDone = 0;
+    pCur->curFlags &= ~BTCF_AtLast;
+    rc = bfMergePickPrev(pCur);
+    if( rc==SQLITE_DONE ){ *pRes = 1; return SQLITE_OK; }
+    if( rc==SQLITE_OK ) *pRes = 0;
+    return rc;
+  }
+#endif
 #ifndef SQLITE_OMIT_BF_CACHE
   /* Flush BF-buffered inserts before locating the last entry.  OP_NewRowid
   ** uses BtreeLast to find the maximum rowid; if the most recent inserts are
@@ -7112,6 +7238,11 @@ int sqlite3BtreeNext(BtCursor *pCur, int flags){
   /* Merge scan (Stage 2.2): advance through the merged base+buffered-insert
   ** stream.  An invalidated merge cursor (eState!=VALID) falls through to the
   ** stock restore path, where btreeRestoreCursorPosition bails to a flush. */
+  if( pCur->bfMerge && pCur->bfMergeRev && pCur->eState==CURSOR_VALID ){
+    /* A REVERSE merge cursor stepped forwards: bail to the plain walk (the
+    ** mirror of the same case in sqlite3BtreePrevious). */
+    sqlite3BfBtreeMergeBail(pCur);
+  }
   if( pCur->bfMerge && pCur->eState==CURSOR_VALID ){
     int rc;
     pCur->info.nSize = 0;
@@ -7230,6 +7361,30 @@ int sqlite3BtreePrevious(BtCursor *pCur, int flags){
   if( pCur->curFlags & BTCF_BfLeaf ){
     int rcBf = sqlite3BfBtreeMaterializeLeaf(pCur);
     if( rcBf!=SQLITE_OK ) return rcBf;
+  }
+#endif
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Reverse merge scan (Stage 2.4): step back through the merged stream.  A
+  ** FORWARD merge cursor stepped backwards has no merged predecessor to fall
+  ** back on, so it bails to the flush + plain-walk path first. */
+  if( pCur->bfMerge && pCur->eState==CURSOR_VALID ){
+    if( !pCur->bfMergeRev ){
+      sqlite3BfBtreeMergeBail(pCur);
+    }else{
+      int rc;
+      pCur->info.nSize = 0;
+      pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidNKey|BTCF_ValidOvfl);
+      if( pCur->bfOnMini ){
+        pCur->bfOnMini = 0;        /* consumed the insert; base candidate stays */
+      }else if( pCur->ix==0 ){
+        pCur->bfBaseDone = 1;      /* base stream of this leaf is now empty */
+      }else{
+        pCur->ix--;                /* step base back within the current leaf */
+      }
+      rc = bfMergePickPrev(pCur);
+      if( rc==SQLITE_DONE ){ pCur->eState = CURSOR_INVALID; return SQLITE_DONE; }
+      return rc;
+    }
   }
 #endif
   pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidOvfl|BTCF_ValidNKey);
@@ -10432,6 +10587,12 @@ int sqlite3BtreeInsert(
     /* BF refused (full / not on a usable leaf) — fall through to base write. */
   }
 
+  /* Accounting for the write-amplification study: this insert is about to cost
+  ** a base page write (see sqlite3BfBtreeNoteInsertFallback). */
+  if( pCur->curIntKey && pCur->pgnoRoot>1 ){
+    sqlite3BfBtreeNoteInsertFallback(pCur);
+  }
+
   /* This insert/overwrite is going to the base tree and may rebalance or free
   ** leaves.  Materialise this table's buffered rows first so balance_nonroot /
   ** freePage2 never observe a dirty mini-page (per-leaf survival fallback),
@@ -11482,6 +11643,27 @@ int sqlite3BtreeCount(sqlite3 *db, BtCursor *pCur, i64 *pnEntry){
   i64 nEntry = 0;                      /* Value to return in *pnEntry */
   int rc;                              /* Return code */
 
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* The page-walk below counts base cells only, so it cannot see buffered
+  ** inserts (nor skip write-back tombstones).  When the cursor is merge-
+  ** eligible, count through the merged First/Next stream instead — slower than
+  ** the page walk, but it is the only count that stays correct inside a read
+  ** transaction, where the flush below is refused. */
+  if( sqlite3BfBtreeCanMergeScan(pCur) ){
+    int res = 0;
+    rc = sqlite3BtreeFirst(pCur, &res);
+    while( rc==SQLITE_OK && res==0 ){
+      if( AtomicLoad(&db->u1.isInterrupted) ) return SQLITE_INTERRUPT;
+      nEntry++;
+      rc = sqlite3BtreeNext(pCur, 0);
+      if( rc==SQLITE_DONE ){ rc = SQLITE_OK; break; }
+    }
+    if( rc!=SQLITE_OK ) return rc;
+    *pnEntry = nEntry;
+    rc = moveToRoot(pCur);
+    return rc==SQLITE_EMPTY ? SQLITE_OK : rc;
+  }
+#endif
 #ifndef SQLITE_OMIT_BF_CACHE
   /* OP_Count bypasses BtreeFirst/BtreeNext entirely and counts cells
   ** directly from B-tree pages.  Flush any BF-buffered inserts first so

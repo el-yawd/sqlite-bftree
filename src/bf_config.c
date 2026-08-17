@@ -318,6 +318,48 @@ void sqlite3PragmaBfCacheStats(
                             (const u8*)&nMergeTomb, P4_INT64);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
     }
+
+    {
+      u64 nBufIns = 0, nFallback = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreeInsertStats(Btree*, u64*, u64*);
+        sqlite3BfBtreeInsertStats(pBt, &nBufIns, &nFallback);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "buffered_inserts", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nBufIns, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "insert_fallbacks", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nFallback, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+
+    {
+      /* WAL write amplification (Phase 2): the write win is wal_page_frames
+      ** staying at the per-commit floor while wal_record_frames carries the
+      ** row data. */
+      u64 nRecFr = 0, nPgFr = 0, nCommits = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreeWalStats(Btree*, u64*, u64*, u64*);
+        sqlite3BfBtreeWalStats(pBt, &nRecFr, &nPgFr, &nCommits);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "wal_record_frames",P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nRecFr, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "wal_page_frames", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nPgFr, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "wal_commits", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nCommits, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
   }
 }
 

@@ -564,6 +564,10 @@ struct BtCursor {
   u8 bfOnMini;              /* Merge scan is logically ON a buffered insert: the
                             ** row is served from pBfScratch and pPage/ix is
                             ** parked at the next base cell to emit after it */
+  u8 bfMergeRev;            /* Merge scan runs backwards (Stage 2.4): steps go
+                            ** through bfMergePickPrev and a forward step bails */
+  u8 bfBaseDone;            /* Reverse merge: the base stream of the current leaf
+                            ** is exhausted (ix is u16, so it cannot go to -1) */
   Pgno bfMergeLeaf;         /* Leaf pgno bfIx indexes into (detects leaf change) */
   int bfIx;                 /* Next mini-page sorted index to examine on merge */
 #endif

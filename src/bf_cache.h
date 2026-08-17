@@ -297,6 +297,8 @@ struct BfCache {
   u64 nMergeBail;           /* Merge scans that fell back to flush + plain walk */
   u64 nWriteBackDeletes;    /* Deletes buffered as BFOP_DELETE tombstones (2.3) */
   u64 nMergeTombstones;     /* Base cells suppressed by a tombstone during merge */
+  u64 nBufferedInserts;     /* Inserts absorbed by a mini-page (no base write) */
+  u64 nInsertFallback;      /* Inserts that took the base-page write path anyway */
 };
 
 /*
@@ -487,10 +489,19 @@ SQLITE_PRIVATE int sqlite3BfBtreeMaterializeLeaf(BtCursor *pCur);
 SQLITE_PRIVATE void sqlite3BfBtreeSuppressShortcut(BtCursor *pCur, int delta);
 /* Arm forward merge-iteration for a full scan (Stage 2.2); 1 if armed. */
 SQLITE_PRIVATE int sqlite3BfBtreeBeginMergeScan(BtCursor *pCur);
+/* Arm reverse merge-iteration for a backward scan (Stage 2.4); 1 if armed. */
+SQLITE_PRIVATE int sqlite3BfBtreeBeginMergeScanRev(BtCursor *pCur);
+/* 1 iff the cursor is eligible for merge-iteration (no state change). */
+SQLITE_PRIVATE int sqlite3BfBtreeCanMergeScan(BtCursor *pCur);
 #if defined(SQLITE_BF_INSERT_BUFFERING)
 /* Merge-scan (Stage 2.2): next buffered insert on `leaf` at index >= *pIx. */
 SQLITE_PRIVATE int sqlite3BfBtreeMergeNextInsert(BtCursor *pCur, Pgno leaf,
     int *pIx, i64 *pRowid, void *pBuf, int nCap, int *pnVal);
+/* Merge-scan (Stage 2.4): previous buffered insert on `leaf` at index <= *pIx. */
+SQLITE_PRIVATE int sqlite3BfBtreeMergePrevInsert(BtCursor *pCur, Pgno leaf,
+    int *pIx, i64 *pRowid, void *pBuf, int nCap, int *pnVal);
+/* Write-amp accounting: an insert took the base-page path (not buffered). */
+SQLITE_PRIVATE void sqlite3BfBtreeNoteInsertFallback(BtCursor *pCur);
 /* Merge-scan (Stage 2.2): flush table + drop merge state, revert to plain. */
 SQLITE_PRIVATE int sqlite3BfBtreeMergeBail(BtCursor *pCur);
 #if !defined(SQLITE_BF_NO_WRITEBACK_DELETE)

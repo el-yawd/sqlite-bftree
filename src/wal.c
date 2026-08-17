@@ -555,6 +555,9 @@ struct Wal {
   u8 **apBfStage;           /* Staged record-batch payloads to emit next commit */
   int nBfStage;             /* Number of staged payloads */
   int nBfStageAlloc;        /* Allocated slots in apBfStage */
+  u64 nBfRecFrame;          /* Record-batch frames written to the WAL */
+  u64 nBfPageFrame;         /* Page-image frames written to the WAL */
+  u64 nBfCommit;            /* Commit frames (transactions) written to the WAL */
 #endif
 #ifdef SQLITE_USE_SEH
   u32 lockMask;              /* Mask of locks held */
@@ -4240,6 +4243,7 @@ static int walFrames(
       }
       if( rc==SQLITE_OK ){
         rc = walBfIngestRecordFrame(pWal, aBody);
+        pWal->nBfRecFrame++;
       }
       iOffset += szFrame;
     }
@@ -4275,6 +4279,9 @@ static int walFrames(
         pData = p->pData;
         rc = sqlite3OsWrite(pWal->pWalFd, pData, szPage, iOff);
         if( rc ) return rc;
+#ifndef SQLITE_OMIT_BF_CACHE
+        pWal->nBfPageFrame++;    /* in-place rewrite still costs a page write */
+#endif
         p->flags &= ~PGHDR_WAL_APPEND;
         continue;
       }
@@ -4285,6 +4292,14 @@ static int walFrames(
     nDbSize = (isCommit && p->pDirty==0) ? nTruncate : 0;
     rc = walWriteOneFrame(&w, p, nDbSize, iOffset);
     if( rc ) return rc;
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* Write-amplification accounting (PRAGMA bf_cache_stats): every 4 KB page
+    ** image this commit had to persist.  The BF write win is this counter
+    ** staying at the unavoidable minimum (page 1's commit frame) while the row
+    ** data rides record frames instead. */
+    pWal->nBfPageFrame++;
+    if( nDbSize ) pWal->nBfCommit++;
+#endif
     pLast = p;
     iOffset += szFrame;
     p->flags |= PGHDR_WAL_APPEND;
@@ -4444,6 +4459,28 @@ void sqlite3WalBfStageClear(Wal *pWal){
     pWal->apBfStage[i] = 0;
   }
   pWal->nBfStage = 0;
+}
+
+/*
+** True iff this Wal holds staged-but-unwritten BF record payloads, i.e. the
+** current transaction has changes that live ONLY in record frames.  The pager
+** uses this to force a WAL commit for a transaction that dirtied no page.
+*/
+int sqlite3WalBfHasStaged(Wal *pWal){
+  return pWal!=0 && pWal->nBfStage>0;
+}
+
+/*
+** Write-amplification counters for PRAGMA bf_cache_stats: how many record-batch
+** frames, page-image frames and commit frames this Wal has written since it was
+** opened.  The Phase-2 claim ("a commit persists a small record, not a 4 KB
+** page") is exactly the statement that page_frames stays at the per-commit
+** floor while record_frames absorbs the row data.
+*/
+void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit){
+  if( pnRec )    *pnRec    = pWal ? pWal->nBfRecFrame  : 0;
+  if( pnPage )   *pnPage   = pWal ? pWal->nBfPageFrame : 0;
+  if( pnCommit ) *pnCommit = pWal ? pWal->nBfCommit    : 0;
 }
 
 /*

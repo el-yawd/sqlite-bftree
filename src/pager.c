@@ -4361,6 +4361,20 @@ BfCache *sqlite3PagerGetBfCache(Pager *pPager){
 ** (btree commit) falls back to the base-page flush path — so this is a no-op
 ** returning SQLITE_OK.
 */
+/*
+** Phase 2 (WAL): true iff record payloads are staged for the pending commit.
+** Used by sqlite3PagerCommitPhaseOne to keep a page-clean, record-only
+** transaction from committing as a disk no-op.
+*/
+static int pagerBfHasStaged(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  return pPager && pagerUseWal(pPager) && sqlite3WalBfHasStaged(pPager->pWal);
+#else
+  UNUSED_PARAMETER(pPager);
+  return 0;
+#endif
+}
+
 int sqlite3PagerBfStage(Pager *pPager, const u8 *aData, int szPage){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pagerUseWal(pPager) ){
@@ -4389,6 +4403,23 @@ void sqlite3PagerBfStageClear(Pager *pPager){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pagerUseWal(pPager) ){
     sqlite3WalBfStageClear(pPager->pWal);
+  }
+#endif
+}
+
+/*
+** Phase 2 (WAL): WAL write-amplification counters for PRAGMA bf_cache_stats —
+** record-batch frames, page-image frames and commit frames written since the
+** WAL was opened.  All zero outside WAL mode.
+*/
+void sqlite3PagerBfFrameStats(Pager *pPager, u64 *pnRec, u64 *pnPage,
+                              u64 *pnCommit){
+  if( pnRec ) *pnRec = 0;
+  if( pnPage ) *pnPage = 0;
+  if( pnCommit ) *pnCommit = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pPager->pWal ){
+    sqlite3WalBfFrameStats(pPager->pWal, pnRec, pnPage, pnCommit);
   }
 #endif
 }
@@ -6654,7 +6685,21 @@ int sqlite3PagerCommitPhaseOne(
       pPager->zFilename, zSuper, pPager->dbSize));
 
   /* If no database changes have been made, return early. */
-  if( pPager->eState<PAGER_WRITER_CACHEMOD ) return SQLITE_OK;
+  if( pPager->eState<PAGER_WRITER_CACHEMOD ){
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* Phase 2 (WAL): a transaction whose ONLY changes are BF record writes
+    ** dirties no page at all, so the pager never leaves PAGER_WRITER_LOCKED.
+    ** Returning here would drop the staged record payloads on the floor and
+    ** make the commit a disk no-op — the rows would exist only in the mini-page
+    ** cache.  Fall through instead: the WAL branch below finds an empty dirty
+    ** list, pulls page 1 in as the commit frame, and pagerWalFrames emits the
+    ** record frames ahead of it.  That single page-1 frame is the per-commit
+    ** floor the write win is measured against (PRAGMA bf_cache_stats
+    ** wal_page_frames / wal_commits). */
+    if( !pagerBfHasStaged(pPager) )
+#endif
+    return SQLITE_OK;
+  }
 
   assert( MEMDB==0 || pPager->tempFile );
   assert( isOpen(pPager->fd) || pPager->tempFile );

@@ -49,6 +49,8 @@
 #  define sqlite3WalBfStage(x,y,z)               0
 #  define sqlite3WalBfStageClear(x)
 #  define sqlite3WalBfIndex(x)                   0
+#  define sqlite3WalBfFrameStats(w,x,y,z)
+#  define sqlite3WalBfHasStaged(x)               0
 # endif
 # undef SQLITE_USE_SEH
 #else
@@ -110,6 +112,10 @@ void sqlite3WalBfStageClear(Wal *pWal);
 ** forward-declared so callers need not include bf_wal.h. */
 typedef struct BfWalIndex BfWalIndex;
 BfWalIndex *sqlite3WalBfIndex(Wal *pWal);
+/* Write-amplification counters: record frames / page-image frames / commits. */
+void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
+/* True iff record payloads are staged for the pending commit. */
+int sqlite3WalBfHasStaged(Wal *pWal);
 #endif
 
 /* Copy pages from the log to the database file */ 
