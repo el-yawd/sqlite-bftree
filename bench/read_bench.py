@@ -15,6 +15,13 @@ to make the OS page cache stop hiding the difference.  This harness therefore:
   * reports wall time AND block-input counts (getrusage ru_inblock), because
     the I/O count is the hardware-independent number.
 
+KNOWN LIMITATION (2026-08-18): with --memmax, block_inputs reads 0 even when the
+run is genuinely I/O bound.  `systemd-run --scope` hands the process to systemd
+as a transient unit, so it is no longer our child and getrusage(RUSAGE_CHILDREN)
+never sees it.  The I/O number must instead be read from the scope's cgroup
+io.stat (/sys/fs/cgroup/user.slice/.../io.stat) before the scope exits.  Until
+that is done, treat block_inputs as valid ONLY in runs without --memmax.
+
 Access pattern: Zipf-skewed point reads driven through a TEMP key table joined
 against the main table, so each probe is one B-tree descent and the CLI's parse
 overhead stays constant instead of scaling with the read count.
@@ -35,6 +42,29 @@ import tempfile
 import time
 
 ROW_TEXT_BYTES = 96          # payload per row (hex text)
+
+
+def drop_file_cache(path):
+    """Evict a file's CLEAN pages from the OS page cache, without root.
+
+    This matters more than it looks: cgroup v2 charges a page-cache page to
+    whoever faulted it in FIRST, so pages left over from the build phase stay
+    usable by the capped process for free and quietly defeat MemoryMax.  fsync
+    then POSIX_FADV_DONTNEED drops them for real.
+    """
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        p = path + suffix
+        if not os.path.exists(p):
+            continue
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            total += os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+    return total
 
 
 def run_cli(binary, db, sql, memmax=None):
@@ -129,7 +159,7 @@ def read(args):
         sql.append("PRAGMA cache_size=-%d;" % (args.cache_bytes // 1024))
     else:
         sql.append("PRAGMA bf_cache_size=%d;" % args.cache_bytes)
-        sql.append("PRAGMA bf_promotion_rate=100;")
+        sql.append("PRAGMA bf_promotion_rate=%d;" % args.promotion)
         sql.append("PRAGMA cache_size=-2048;")   # small page cache: BF holds the budget
     sql.append("CREATE TEMP TABLE k(id INTEGER);")
     # One multi-row INSERT keeps parse cost constant instead of per-read.
@@ -143,6 +173,8 @@ def read(args):
     if not args.stock:
         sql.append("PRAGMA bf_cache_stats;")
 
+    if args.drop_cache:
+        drop_file_cache(args.db)
     elapsed, blocks, out = run_cli(args.binary, args.db, "\n".join(sql),
                                    memmax=args.memmax)
     hits = misses = 0
@@ -180,6 +212,10 @@ def main():
     r.add_argument("--seed", type=int, default=7)
     r.add_argument("--rows", type=int, default=None)
     r.add_argument("--stock", action="store_true")
+    r.add_argument("--promotion", type=int, default=100,
+                   help="BF read-promotion rate percent (100 = cache every read)")
+    r.add_argument("--drop-cache", action="store_true",
+                   help="evict the db from the OS page cache before reading")
 
     args = ap.parse_args()
     if args.cmd == "build":
