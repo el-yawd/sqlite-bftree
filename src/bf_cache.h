@@ -58,6 +58,8 @@ typedef struct BfFreeList BfFreeList;
 ** this many committed transactions, so keep it small enough to stay a
 ** defensible durability trade. */
 #define BF_MAX_GROUP_COMMIT       1024
+/* Tables tracked for "max buffered rowid" (see BfCache.aMaxRoot). */
+#define BF_MAXROWID_SLOTS         8
 
 /*
 ** Operation types for records in a mini-page.
@@ -185,11 +187,35 @@ struct BfKVMeta {
 **   | key/value data   | (grows backward from end)
 **   +------------------+
 */
+/* BfMiniPage.flags bits.
+**
+** BF_MINI_F_DIRTY is a CONSERVATIVE hint: it is set whenever a dirty record
+** (BFOP_INSERT/BFOP_DELETE) is written and cleared only by
+** sqlite3BfMiniPageMarkClean, which converts every dirty record to a clean one.
+** So flag clear ⇒ definitely no dirty records; flag set ⇒ scan to be sure.  The
+** over-approximation costs at most a wasted scan, never a lost write.
+**
+** It exists because sqlite3BfMiniPageIsDirty was 82% of the profile on an
+** append workload: the pre-mutation flush asks every mini-page in the map
+** whether it is dirty, on every mutation, and the answer required a full record
+** scan -- worst for CLEAN pages, which scan to the end before returning 0. */
+#define BF_MINI_F_DIRTY  0x0001
+/* Set when a balance changed this leaf's key range while a flush replay was
+** iterating the mini-page, so the stale CLEAN records could not be dropped
+** right then (rewriting the page mid-iteration loses dirty records).  The
+** flush drops them when it finishes. */
+#define BF_MINI_F_STALE  0x0002
+
 struct BfMiniPage {
   u16 nodeSize;             /* Total size of this mini-page */
   u16 metaCount;            /* Number of records (including fence keys) */
   u16 freeSpace;            /* Free space between meta array and data */
-  u16 prefixLen;            /* Common prefix length for keys (compression) */
+  u16 flags;                /* BF_MINI_F_* bits.  Was `prefixLen`, a field left
+                            ** over from an unimplemented prefix-compression
+                            ** scheme: assigned and copied, never read.  Reusing
+                            ** it keeps the header at 24 bytes -- growing it
+                            ** would cost 8 bytes of padding on EVERY mini-page,
+                            ** i.e. 12% of the 64-byte size class. */
   i64 baseDiskOffset;       /* Disk offset of base page (-1 if none) */
   /* Back-pointers into the mapping table.  ownerPgno is the page number this
   ** mini-page is mapped under (the table root today; the hot leaf after
@@ -268,6 +294,30 @@ struct BfCache {
   /* Bypass flag: when non-zero, all BF hooks skip immediately.
   ** Used during merge flush to prevent re-entrant BF writes. */
   int bBypassActive;
+
+  /* Dirty-list (perf): pgnos of mini-pages that MAY hold dirty records, so the
+  ** flush/log paths iterate only those instead of walking the whole mapping
+  ** table on every mutation and every commit.  Conservative in one direction
+  ** only: a pgno may be stale (already clean -- dropped lazily during
+  ** iteration), but a dirty mini-page is ALWAYS listed, because the only
+  ** clean->dirty transition runs through sqlite3BfRecordWrite.  If the array
+  ** cannot grow, bDirtyListOverflow forces the old full-map walk so a dirty
+  ** mini-page can never be missed. */
+  /* Max buffered rowid per table root, so OP_NewRowid can learn the true
+  ** maximum key without materialising the table.  Monotonic and never cleared:
+  ** after a flush the base max is >= this, and we always take the MAX of the
+  ** two, so a stale entry can only ever skip a few rowids (allowed) -- it can
+  ** never hand out a duplicate.  Overflowing the slots sets bMaxRowidUnknown,
+  ** which puts every table back on the old flush-then-look path. */
+  u32 aMaxRoot[BF_MAXROWID_SLOTS];
+  i64 aMaxRowid[BF_MAXROWID_SLOTS];
+  int nMaxRowid;
+  int bMaxRowidUnknown;
+
+  u32 *aDirtyPg;            /* pgnos that may have dirty records */
+  int nDirtyPg;             /* entries in use */
+  int nDirtyPgAlloc;        /* allocated slots */
+  int bDirtyListOverflow;   /* 1 => list unusable, fall back to full walk */
 
   /* Group commit (Phase 2): the open cross-transaction record batch, or NULL.
   ** Opaque here (BfGroup lives in bf_btree.c); freed by
@@ -435,6 +485,8 @@ SQLITE_PRIVATE int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini);
 #define BF_COPY_DIRTY      2   /* only BFOP_INSERT/BFOP_DELETE (compaction) */
 SQLITE_PRIVATE int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
     BfMiniPage *pSrc, int copyMode);
+/* Drop clean (cache/phantom) records, keep dirty ones — see the definition. */
+SQLITE_PRIVATE int sqlite3BfMiniPageDropClean(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageIterate(BfMiniPage *pMini,
     int (*xCallback)(void*, const u8*, int, const u8*, int, u8), void *pCtx);
 /* Number of records (any op type) in the sorted meta array. */
@@ -522,6 +574,14 @@ SQLITE_PRIVATE int sqlite3BfBtreeMergePrevInsert(BtCursor *pCur, Pgno leaf,
     int *pIx, i64 *pRowid, void *pBuf, int nCap, int *pnVal);
 /* Write-amp accounting: an insert took the base-page path (not buffered). */
 SQLITE_PRIVATE void sqlite3BfBtreeNoteInsertFallback(BtCursor *pCur);
+/* Largest rowid buffered for this cursor's table; 1 if known, 0 if not. */
+SQLITE_PRIVATE int sqlite3BfBtreeMaxBufferedRowid(BtCursor *pCur, i64 *pMax);
+/* Dirty-list maintenance (perf): note that `pgno` may now hold dirty records. */
+SQLITE_PRIVATE void sqlite3BfDirtyListAdd(BfCache *pCache, u32 pgno);
+/* Iterate only the mini-pages that may be dirty, dropping stale entries.
+** Returns 1 if the caller must fall back to sqlite3BfMapIterate (overflow). */
+SQLITE_PRIVATE int sqlite3BfDirtyListIterate(BfCache *pCache,
+    int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx);
 /* Group commit (Phase 2): force the open cross-transaction record batch into
 ** the current transaction's WAL frame stream; free it at cache teardown. */
 SQLITE_PRIVATE void sqlite3BfBtreeGroupStagePending(Btree *p);

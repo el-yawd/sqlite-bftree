@@ -6281,6 +6281,15 @@ int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
   }
 #endif
 #ifndef SQLITE_OMIT_BF_CACHE
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+  /* If the cache can report this table's largest buffered rowid, OP_NewRowid
+  ** no longer needs the rows materialised (it takes the max of the two), so
+  ** skip the flush entirely -- it was running once per appended row. */
+  {
+    i64 bfMaxIgnored;
+    if( sqlite3BfBtreeMaxBufferedRowid(pCur, &bfMaxIgnored) ) goto bf_last_no_flush;
+  }
+# endif
   /* Flush BF-buffered inserts before locating the last entry.  OP_NewRowid
   ** uses BtreeLast to find the maximum rowid; if the most recent inserts are
   ** still buffered in the BF mini-page, the base B-tree's last rowid is stale
@@ -6288,6 +6297,9 @@ int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
   ** the buffered row.  If a flush occurs, saveAllCursors moves this cursor
   ** to CURSOR_REQUIRESEEK, which also disarms the BTCF_AtLast shortcut. */
   (void)sqlite3BfBtreePrepareForScan(pCur);
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+bf_last_no_flush:
+# endif
 #endif
 
   /* If the cursor already points to the last entry, this is a no-op. */

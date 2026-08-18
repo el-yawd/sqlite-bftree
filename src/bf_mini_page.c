@@ -150,7 +150,7 @@ void sqlite3BfMiniPageInit(BfMiniPage *pMini, u16 size, i64 baseDiskOffset){
   pMini->nodeSize = size;
   pMini->metaCount = 0;
   pMini->freeSpace = size - sizeof(BfMiniPage);
-  pMini->prefixLen = 0;
+  pMini->flags = 0;
   pMini->baseDiskOffset = baseDiskOffset;
   /* Ownership back-pointers are assigned by the mapping layer
   ** (sqlite3BfRecordWrite) once the page number is known; zero means
@@ -239,6 +239,9 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
       BF_KV_SET_VALUE_LEN(pNewMeta, nVal);
       BF_KV_SET_OP_TYPE(pNewMeta, opType);
       BF_KV_SET_REF(pNewMeta, 1);
+      if( opType==BFOP_INSERT || opType==BFOP_DELETE ){
+        pMini->flags |= BF_MINI_F_DIRTY;
+      }
       BF_KV_SET_LOGGED(pNewMeta, 0);  /* fresh mutation: not yet in the WAL */
       return BF_OK;
     }
@@ -329,6 +332,9 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
   BF_KV_SET_VALUE_LEN(pNewMeta, nVal);
   BF_KV_SET_REF(pNewMeta, 1);
   BF_KV_SET_LOGGED(pNewMeta, 0);  /* brand-new record: not yet in the WAL */
+  if( opType==BFOP_INSERT || opType==BFOP_DELETE ){
+    pMini->flags |= BF_MINI_F_DIRTY;
+  }
 
   /* Set preview bytes */
   pNewMeta->preview[0] = nKey >= 1 ? ((const u8*)pKey)[0] : 0;
@@ -454,7 +460,20 @@ int sqlite3BfMiniPageDirtyCount(BfMiniPage *pMini){
 ** Check if mini-page has any dirty records.
 */
 int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini){
-  return sqlite3BfMiniPageDirtyCount(pMini) > 0;
+  /* O(1) for a clean mini-page: the flag is only ever set by a dirty record
+  ** write and cleared by MarkClean, so "clear" is authoritative. */
+  if( (pMini->flags & BF_MINI_F_DIRTY)==0 ) return 0;
+  /* Stop at the FIRST dirty record.  Counting them all made this the hottest
+  ** function in the profile (92% of samples on an append workload): the
+  ** pre-mutation flush calls it for every mini-page in the map, on every
+  ** mutation, and each call was O(records-in-mini-page). */
+  BfKVMeta *aMeta = bfMiniPageMeta(pMini);
+  int i;
+  for(i = 0; i < pMini->metaCount; i++){
+    u8 opType = BF_KV_OP_TYPE(&aMeta[i]);
+    if( opType == BFOP_INSERT || opType == BFOP_DELETE ) return 1;
+  }
+  return 0;
 }
 
 /*
@@ -465,6 +484,8 @@ void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini){
   BfKVMeta *aMeta = bfMiniPageMeta(pMini);
   int i;
   u8 opType;
+
+  pMini->flags &= ~BF_MINI_F_DIRTY;   /* every dirty record becomes clean below */
 
   for(i = 0; i < pMini->metaCount; i++){
     opType = BF_KV_OP_TYPE(&aMeta[i]);
@@ -512,7 +533,6 @@ int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini){
 
   BfMiniPage *pNewMini = (BfMiniPage*)pTemp;
   sqlite3BfMiniPageInit(pNewMini, pMini->nodeSize, pMini->baseDiskOffset);
-  pNewMini->prefixLen = pMini->prefixLen;
   pNewMini->ownerPgno = pMini->ownerPgno;
   pNewMini->rootPgno = pMini->rootPgno;
 
@@ -646,6 +666,39 @@ void sqlite3BfMiniPageMarkLoggedAt(BfMiniPage *pMini, int ix){
 }
 
 /*
+** Drop every CLEAN record (BFOP_CACHE / BFOP_PHANTOM), keeping the dirty ones.
+**
+** Used when a leaf's KEY RANGE changes under a balance: records are keyed by
+** leaf, so a clean record left behind on a leaf that no longer owns that key is
+** not merely useless, it is WRONG -- a later rebalance can hand the range back
+** and the stale entry then answers point probes ("row exists" for a row that
+** was deleted).  Dirty records are position-independent (the flush replay
+** re-descends by rowid), so they stay.
+**
+** Returns BF_OK, or SQLITE_NOMEM if the scratch page cannot be allocated (in
+** which case the mini-page is left untouched).
+*/
+int sqlite3BfMiniPageDropClean(BfMiniPage *pMini){
+  u32 size = pMini->nodeSize;
+  u8 *pTemp;
+  BfMiniPage *pNew;
+  int rc;
+
+  if( pMini->metaCount==0 ) return BF_OK;
+  pTemp = sqlite3_malloc((int)size);
+  if( !pTemp ) return SQLITE_NOMEM;
+  pNew = (BfMiniPage*)pTemp;
+  rc = sqlite3BfMiniPageCopy(pNew, (u16)size, pMini, BF_COPY_DIRTY);
+  if( rc==BF_OK ){
+    pNew->ownerPgno = pMini->ownerPgno;
+    pNew->rootPgno  = pMini->rootPgno;
+    memcpy(pMini, pNew, size);
+  }
+  sqlite3_free(pTemp);
+  return rc;
+}
+
+/*
 ** Copy a mini-page to a new location with potentially different size.
 ** Used for upgrading mini-page size class (BF_COPY_ALL), for the eviction
 ** sweep (BF_COPY_REFERENCED), and to reclaim space inside a full mini-page by
@@ -665,7 +718,6 @@ int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
   u8 opType;
 
   sqlite3BfMiniPageInit(pDst, dstSize, pSrc->baseDiskOffset);
-  pDst->prefixLen = pSrc->prefixLen;
   pDst->ownerPgno = pSrc->ownerPgno;
   pDst->rootPgno = pSrc->rootPgno;
 

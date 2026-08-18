@@ -549,6 +549,10 @@ static void bfCacheDestroy(sqlite3_pcache *p){
   }
 
   BF_ALLOC_TRACE("cache-destroy", pCache, 0);
+  sqlite3_free(pCache->base.aDirtyPg);
+  pCache->base.aDirtyPg = 0;
+  pCache->base.nDirtyPg = 0;
+  pCache->base.nDirtyPgAlloc = 0;
 #if defined(SQLITE_BF_INSERT_BUFFERING)
   /* Release the group-commit batch.  Anything still in it is DIRTY in its
   ** mini-page, so the close-time flush has already materialised it to base. */
@@ -706,6 +710,7 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   BfMapEntry *pEntry;
   BfMiniPage *pMini;
   int rc;
+  int wasDirty;
   void *pNew;
   u32 newSize;
 
@@ -752,10 +757,14 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   }
 
   /* Try to insert into mini-page */
+  wasDirty = (pMini->flags & BF_MINI_F_DIRTY)!=0;
   rc = sqlite3BfMiniPageInsert(pMini, pKey, nKey, pVal, nVal, opType);
 
   if( rc == BF_OK ){
     pCache->nDirty++;
+    if( !wasDirty && (pMini->flags & BF_MINI_F_DIRTY)!=0 ){
+      sqlite3BfDirtyListAdd(pCache, pgno);   /* clean -> dirty transition */
+    }
     return BF_OK;
   }
 
@@ -786,6 +795,9 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
       rc = sqlite3BfMiniPageInsert(pMini, pKey, nKey, pVal, nVal, opType);
       if( rc == BF_OK ){
         pCache->nDirty++;
+        if( !wasDirty && (pMini->flags & BF_MINI_F_DIRTY)!=0 ){
+          sqlite3BfDirtyListAdd(pCache, pgno);
+        }
         return BF_OK;
       }
     }
@@ -817,6 +829,9 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
           rc = sqlite3BfMiniPageInsert(pMini, pKey, nKey, pVal, nVal, opType);
           if( rc==BF_OK ){
             pCache->nDirty++;
+            if( !wasDirty && (pMini->flags & BF_MINI_F_DIRTY)!=0 ){
+              sqlite3BfDirtyListAdd(pCache, pgno);
+            }
             return BF_OK;
           }
         }else{

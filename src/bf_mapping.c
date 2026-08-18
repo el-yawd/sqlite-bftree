@@ -237,6 +237,70 @@ int sqlite3BfMapIterate(BfCache *pCache,
 }
 
 /*
+** Dirty-list maintenance.
+**
+** The mapping table is a direct-indexed array of batches, so
+** sqlite3BfMapIterate costs O(highest pgno cached) whether one mini-page is
+** dirty or none are.  The pre-mutation flush called it on EVERY mutation and
+** the commit-time record gather on EVERY commit, which made append workloads
+** quadratic (measured: 200k appends spent 17.5s here, 132x stock).  These two
+** routines keep a short list of candidate pgnos instead.
+**
+** The list is a SUPERSET of the dirty mini-pages: entries that have since been
+** flushed are dropped lazily while iterating.  It is never a subset, because
+** sqlite3BfRecordWrite is the only way a mini-page becomes dirty and it always
+** calls sqlite3BfDirtyListAdd.  On allocation failure the list is abandoned
+** (bDirtyListOverflow) and callers fall back to the full walk, so running out
+** of memory costs speed, never correctness.
+*/
+void sqlite3BfDirtyListAdd(BfCache *pCache, u32 pgno){
+  if( pCache->bDirtyListOverflow ) return;
+  if( pCache->nDirtyPg >= pCache->nDirtyPgAlloc ){
+    int nNew = pCache->nDirtyPgAlloc ? pCache->nDirtyPgAlloc*2 : 64;
+    u32 *aNew = (u32*)sqlite3_realloc(pCache->aDirtyPg,
+                                      nNew*(int)sizeof(u32));
+    if( aNew==0 ){
+      pCache->bDirtyListOverflow = 1;   /* callers revert to the full walk */
+      return;
+    }
+    pCache->aDirtyPg = aNew;
+    pCache->nDirtyPgAlloc = nNew;
+  }
+  pCache->aDirtyPg[pCache->nDirtyPg++] = pgno;
+}
+
+int sqlite3BfDirtyListIterate(BfCache *pCache,
+    int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx){
+  int i = 0;
+#ifdef SQLITE_BF_NO_DIRTYLIST
+  return 1;                      /* ablation: force the full-map walk */
+#endif
+  if( pCache->bDirtyListOverflow ) return 1;   /* caller does the full walk */
+  while( i < pCache->nDirtyPg ){
+    u32 pgno = pCache->aDirtyPg[i];
+    BfMapEntry *pEntry = sqlite3BfMapLookup(pCache, pgno);
+    BfMiniPage *pMini = 0;
+    if( pEntry && pEntry->locType==BF_LOC_MINI ){
+      pMini = (BfMiniPage*)pEntry->pPage;
+    }
+    if( pMini==0 || (pMini->flags & BF_MINI_F_DIRTY)==0 ){
+      /* Stale: gone, or already flushed.  Drop it (order is irrelevant). */
+      pCache->aDirtyPg[i] = pCache->aDirtyPg[--pCache->nDirtyPg];
+      continue;
+    }
+    if( xCallback(pCtx, pgno, pEntry) ) return 0;
+    /* The callback may have cleaned this entry; re-test it next round rather
+    ** than assuming, so a refused flush (e.g. no write transaction) keeps it. */
+    if( (pMini->flags & BF_MINI_F_DIRTY)==0 ){
+      pCache->aDirtyPg[i] = pCache->aDirtyPg[--pCache->nDirtyPg];
+      continue;
+    }
+    i++;
+  }
+  return 0;
+}
+
+/*
 ** Count non-null entries in the mapping table.
 */
 int sqlite3BfMapCount(BfCache *pCache){

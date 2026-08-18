@@ -5647,6 +5647,24 @@ case OP_NewRowid: {           /* out2 */
       }else{
         assert( sqlite3BtreeCursorIsValid(pC->uc.pCursor) );
         v = sqlite3BtreeIntegerKey(pC->uc.pCursor);
+      }
+#ifndef SQLITE_OMIT_BF_CACHE
+      {
+        /* The largest rowid may be buffered in the BF record cache with no
+        ** base cell yet, in which case the B-tree's answer is stale and we
+        ** would hand out a duplicate.  Asking the cache is what lets
+        ** sqlite3BtreeLast skip materialising the whole table on every append
+        ** (measured: 46.7% of an append profile went into that flush). */
+        i64 bfMax = 0;
+        if( sqlite3BfBtreeMaxBufferedRowid(pC->uc.pCursor, &bfMax)
+         && (res || bfMax>v)
+        ){
+          v = bfMax;
+          res = 0;
+        }
+      }
+#endif
+      if( !res ){
         if( v>=MAX_ROWID ){
           pC->useRandomRowid = 1;
         }else{

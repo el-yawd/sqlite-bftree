@@ -62,6 +62,56 @@ Ablation switches (all default OFF, i.e. the feature is on): `SQLITE_BF_NO_MERGE
 `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,
 `SQLITE_BF_NO_MINIPAGE_COMPACT`.
 
+## Performance work: the method (measure, don't guess)
+
+Every performance change follows this loop.  It exists because guessing already
+cost us once: a "10x read-path regression" turned out to be the *write* path —
+the benchmark's temp-table load — masquerading as reads.
+
+1. **Build a workload that isolates ONE path.** Split phases and time them
+   separately (`.timer on` prints per-statement time).  If a read benchmark
+   contains inserts, it is a write benchmark.  Put helper data in a separate
+   ATTACHed database so the measured run does no writes at all.
+2. **Profile before touching code.**
+   ```bash
+   cc -O2 -g -fno-omit-frame-pointer -DSQLITE_BF_INSERT_BUFFERING ... -o sqlite3_bf_prof
+   perf record -q --call-graph fp -F 999 -o p.data -- ./sqlite3_bf_prof db < w.sql
+   perf script -i p.data | python3 bench/tools/flamegraph.py out.svg "title"
+   perf report -i p.data --stdio -g graph,0.5,caller --percent-limit 2
+   ```
+   `bench/tools/flamegraph.py` is self-contained (Brendan Gregg's scripts are not
+   installed here); it writes the SVG *and* prints a self-time table, which is
+   what you act on.  `kernel.perf_event_paranoid=2`: user-space sampling of our
+   own processes works, kernel tracing does not.  `valgrind --tool=callgrind` +
+   `callgrind_annotate` give deterministic instruction counts when sampling is
+   too noisy.
+3. **Fix the frame the data names, then RE-PROFILE.** Do not assume the fix
+   worked: our first `IsDirty` fix (early exit) looked obviously right and left
+   the function at 82% of samples, because the hot case was CLEAN mini-pages
+   that scan to the end.  The real fix was an O(1) flag.
+4. **Re-run the differential oracles** after every perf change — several of these
+   touch dirty-tracking, where a wrong answer silently loses writes.
+5. **Stop only when what remains is structural**: documented design overhead
+   (single-writer, SQLite's descent, WAL frame padding), not an accident.
+
+**Be suspicious of every regression.**  The Bf-Tree paper reports wins on *every*
+metric.  If we measure a slowdown, the null hypothesis is that OUR integration is
+wrong — not that the paper does not transfer.  Cross-check the original Rust
+implementation at **`../bf-tree/`**: `src/tree.rs`, `src/mini_page_op.rs`,
+`src/nodes/`, `src/circular_buffer/`, `src/range_scan.rs`, `src/wal/`, and their
+own harness in `benchmark/` (`bench_bftree.toml`, `bench_e2e.toml`, `run.sh`).
+Only after showing our code matches theirs is "structural difference" an honest
+conclusion.
+
+### Measured baselines (2026-08-18, 8M-row / 0.83 GiB db, warm)
+- read path (point reads, no writes): **1.14x wall / 1.30x CPU vs stock**
+- appends (200k rows, temp table): was **132x** stock -> **6.2x** after the
+  `BF_MINI_F_DIRTY` fix (17.5s -> 0.83s); remaining cost is the per-mutation
+  whole-map walk in `bfFlushTableDirty` (~29% of samples), which wants per-root
+  dirty tracking next
+- commits: **1 page frame/commit** (WAL-format floor, zero base-page writes);
+  `bf_group_commit=32` gives ~30x less WAL than stock
+
 ## Testing specialists (`.claude/agents/`)
 - **`esbmc-verifier`** — ESBMC bounded model checking of pure modules (WAL codec, mini-page,
   circular buffer, recovery idempotence).

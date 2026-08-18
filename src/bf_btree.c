@@ -263,6 +263,14 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
   if( ctx.nErrors==0 ){
     sqlite3BfMiniPageMarkClean(pMini);
     pBf->nMergeToBase += (u64)ctx.nApplied;
+    if( pMini->flags & BF_MINI_F_STALE ){
+      /* A balance moved this leaf's key range while we were replaying it, so
+      ** every record left here describes keys the leaf may no longer own.  They
+      ** are all CLEAN now, and dropping them mid-iteration would have lost
+      ** writes -- do it now that the iteration is over. */
+      pMini->flags &= ~BF_MINI_F_STALE;
+      sqlite3BfMiniPageDropClean(pMini);
+    }
   }
 
   return SQLITE_OK;
@@ -276,6 +284,7 @@ struct BfFlushAllCtx {
   BfCache *pBf;
   Btree   *pBtree;
 };
+
 
 static int bfFlushAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
   BfFlushAllCtx *ctx = (BfFlushAllCtx*)pCtx;
@@ -313,7 +322,9 @@ int sqlite3BfBtreeFlushAllDirty(Btree *p){
   ** flushed. */
   if( p->inTrans!=TRANS_WRITE ) return SQLITE_OK;
 
-  sqlite3BfMapIterate(pBf, bfFlushAllCallback, &ctx);
+  if( sqlite3BfDirtyListIterate(pBf, bfFlushAllCallback, &ctx) ){
+    sqlite3BfMapIterate(pBf, bfFlushAllCallback, &ctx);   /* list overflowed */
+  }
   pBf->bDirtyInserts = 0;  /* all buffered inserts materialised */
   return SQLITE_OK;
 }
@@ -536,7 +547,9 @@ int sqlite3BfBtreeLogAllDirty(Btree *p){
   ctx.pGroup = g;
   ctx.rc     = SQLITE_OK;
 
-  sqlite3BfMapIterate(pBf, bfLogAllCallback, &ctx);
+  if( sqlite3BfDirtyListIterate(pBf, bfLogAllCallback, &ctx) ){
+    sqlite3BfMapIterate(pBf, bfLogAllCallback, &ctx);     /* list overflowed */
+  }
   if( ctx.rc!=SQLITE_OK ) return ctx.rc;
 
   /* Group commit: hold the batch open across up to nGroup transactions.  A
@@ -573,8 +586,11 @@ static int bfFlushTableCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
 
   if( pgno<=1 || pEntry->locType!=BF_LOC_MINI ) return 0;
   pMini = (BfMiniPage*)pEntry->pPage;
-  if( !pMini || !sqlite3BfMiniPageIsDirty(pMini) ) return 0;
+  if( !pMini ) return 0;
+  /* Cheap root test BEFORE the dirty scan: other tables' mini-pages are the
+  ** common case in this iteration and rejecting them costs one compare. */
   if( pMini->rootPgno<=1 || (Pgno)pMini->rootPgno!=ctx->root ) return 0;
+  if( !sqlite3BfMiniPageIsDirty(pMini) ) return 0;
 
   bfFlushOneMiniPage(ctx->pBf, ctx->pBtree, (Pgno)pMini->rootPgno, pMini);
   ctx->nFlushed++;
@@ -593,6 +609,9 @@ static int bfFlushTableDirty(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot){
   BfFlushTableCtx ctx;
   if( !pBf || !pBtree || pgnoRoot<=1 ) return 0;
   if( pBf->bBypassActive || pBf->bMergingActive ) return 0;
+  /* Nothing buffered anywhere ⇒ nothing to materialise.  Skips a full map walk
+  ** on every mutation of a table that has no dirty records. */
+  if( !pBf->bDirtyInserts ) return 0;
   /* No write transaction ⇒ nothing can be materialised (see bfFlushOneMiniPage).
   ** Must report 0: callers treat a non-zero return as "the tree changed, redo
   ** the descent", which would spin forever against an unchanged tree. */
@@ -605,7 +624,9 @@ static int bfFlushTableDirty(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot){
   ctx.root = pgnoRoot;
   ctx.nFlushed = 0;
   pBf->bMergingActive = 1;
-  sqlite3BfMapIterate(pBf, bfFlushTableCallback, &ctx);
+  if( sqlite3BfDirtyListIterate(pBf, bfFlushTableCallback, &ctx) ){
+    sqlite3BfMapIterate(pBf, bfFlushTableCallback, &ctx); /* list overflowed */
+  }
   pBf->bMergingActive = 0;
   return ctx.nFlushed;
 }
@@ -743,6 +764,56 @@ int sqlite3BfBtreeFetchPayload(
 ** Called when BF write-buffering wants to skip the base page entirely.
 ** Only used for rowid tables with small payloads.
 */
+/*
+** Remember the largest rowid buffered for table `root`.  Feeds
+** sqlite3BfBtreeMaxBufferedRowid so OP_NewRowid does not have to materialise
+** the table just to learn the maximum key -- which, before this, made every
+** append flush the whole table (46.7% of an append profile).
+*/
+static void bfNoteMaxRowid(BfCache *pBf, u32 root, const void *pKey){
+  const u8 *p = (const u8*)pKey;
+  i64 rowid = 0;
+  int i;
+  if( root<=1 || pBf->bMaxRowidUnknown ) return;
+  for(i=0; i<8; i++){ rowid = (rowid<<8) | p[i]; }
+  for(i=0; i<pBf->nMaxRowid; i++){
+    if( pBf->aMaxRoot[i]==root ){
+      if( rowid > pBf->aMaxRowid[i] ) pBf->aMaxRowid[i] = rowid;
+      return;
+    }
+  }
+  if( pBf->nMaxRowid >= BF_MAXROWID_SLOTS ){
+    pBf->bMaxRowidUnknown = 1;    /* too many tables: revert to flushing */
+    return;
+  }
+  pBf->aMaxRoot[pBf->nMaxRowid] = root;
+  pBf->aMaxRowid[pBf->nMaxRowid] = rowid;
+  pBf->nMaxRowid++;
+}
+
+/*
+** Largest rowid this cache has buffered for the cursor's table.  Returns 1 and
+** sets *pMax when the answer is known (0 tracked rows counts as "not known",
+** so the caller keeps its base-tree answer).
+*/
+int sqlite3BfBtreeMaxBufferedRowid(BtCursor *pCur, i64 *pMax){
+  BfCache *pBf;
+  int i;
+#ifdef SQLITE_BF_NO_MAXROWID
+  return 0;                      /* ablation: force the old flush-then-look */
+#endif
+  if( !pCur || !pCur->pBt || pCur->pgnoRoot<=1 ) return 0;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf || pBf->bMaxRowidUnknown ) return 0;
+  for(i=0; i<pBf->nMaxRowid; i++){
+    if( pBf->aMaxRoot[i]==pCur->pgnoRoot ){
+      *pMax = pBf->aMaxRowid[i];
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int sqlite3BfBtreeInsertCell(
   BtCursor *pCur,
   const void *pKey,
@@ -772,6 +843,7 @@ int sqlite3BfBtreeInsertCell(
       bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
       pBf->bDirtyInserts = 1;  /* arm the pre-mutation/pre-scan flush */
       pBf->nBufferedInserts++;
+      bfNoteMaxRowid(pBf, pCur->pgnoRoot, pKey);
       return SQLITE_OK;
     }
   }
@@ -1590,6 +1662,30 @@ void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno){
     if( !sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage) ){
       pEntry->locType = BF_LOC_NULL;
       pEntry->pPage   = 0;
+    }else{
+      /* Phase 2 makes the comment above only half true: records stay DIRTY
+      ** across commits by design, so a mini-page here often IS dirty and used
+      ** to be left completely untouched -- stale CLEAN records included.  Those
+      ** are the dangerous ones: a clean record on a leaf that no longer owns
+      ** the key answers point probes with a row that may since have been
+      ** deleted (measured: a re-INSERT failing with "UNIQUE constraint failed"
+      ** after a rebalance handed the range back).  Drop the clean records and
+      ** keep the dirty ones, which are position-independent. */
+#ifndef SQLITE_BF_NO_DROPCLEAN
+      /* NOT during a flush replay: bfFlushOneMiniPage is iterating this very
+      ** mini-page by index, and applying its records to the base tree is what
+      ** triggered this balance.  Rewriting the page underneath that iteration
+      ** shifts the meta array and makes the flush skip dirty records -- i.e.
+      ** silently lose committed rows (measured before this guard went in).
+      ** The flush marks the page clean when it finishes, so the stale clean
+      ** records this leaves behind are dropped by the next ForgetPage. */
+      if( !pBf->bBypassActive ){
+        sqlite3BfMiniPageDropClean((BfMiniPage*)pEntry->pPage);
+      }else{
+        /* Defer: the flush finishes the job (see bfFlushOneMiniPage). */
+        ((BfMiniPage*)pEntry->pPage)->flags |= BF_MINI_F_STALE;
+      }
+#endif
     }
   }
 }
