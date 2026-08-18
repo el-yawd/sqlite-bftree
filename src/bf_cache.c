@@ -549,6 +549,11 @@ static void bfCacheDestroy(sqlite3_pcache *p){
   }
 
   BF_ALLOC_TRACE("cache-destroy", pCache, 0);
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Release the group-commit batch.  Anything still in it is DIRTY in its
+  ** mini-page, so the close-time flush has already materialised it to base. */
+  sqlite3BfBtreeGroupFree(&pCache->base);
+#endif
   sqlite3_free(pCache->apHash);
   sqlite3BfCircularBufferDestroy(&pCache->base.cb);
   sqlite3BfMapDestroy(&pCache->base);
@@ -764,7 +769,8 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
       ** buffered dirty writes (BFOP_INSERT/BFOP_DELETE) that have never been
       ** read back, so their REF bit is irrelevant.  Dropping them here would
       ** silently lose committed data on the next flush. */
-      rc = sqlite3BfMiniPageCopy((BfMiniPage*)pNew, newSize, pMini, 0);
+      rc = sqlite3BfMiniPageCopy((BfMiniPage*)pNew, newSize, pMini,
+                                 BF_COPY_ALL);
       if( rc != BF_OK ){
         sqlite3BfCircularBufferDealloc(&pCache->cb, pNew);
         if( rc == SQLITE_NOMEM ) return SQLITE_NOMEM;
@@ -785,8 +791,45 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     }
   }
 
-  /* Mini-page is at max size and upgrade failed — caller must use the full
-  ** base-page path for this record. */
+  /* Mini-page is at its max size class (or the ring refused a bigger block).
+  ** Before giving up on a DIRTY record, reclaim the space held by this
+  ** mini-page's pure-cache records: BFOP_CACHE duplicates a base cell and
+  ** BFOP_PHANTOM marks a confirmed-absent key, so dropping either costs at most
+  ** a later cache miss.  This matters a lot in practice — every insert's
+  ** uniqueness probe leaves a PHANTOM behind, so without compaction a leaf's
+  ** mini-page fills with clean junk and every subsequent buffered insert falls
+  ** back to a base-page write (which then drags the whole table's dirty
+  ** mini-pages to base with it). */
+#if !defined(SQLITE_BF_NO_MINIPAGE_COMPACT)
+  if( opType==BFOP_INSERT || opType==BFOP_DELETE ){
+    u16 curSize = pMini->nodeSize;
+    if( sqlite3BfMiniPageDirtyCount(pMini) < sqlite3BfMiniPageCount(pMini) ){
+      pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, curSize);
+      if( pNew ){
+        sqlite3BfCircularBufferMarkReady(pNew);
+        rc = sqlite3BfMiniPageCopy((BfMiniPage*)pNew, curSize, pMini,
+                                   BF_COPY_DIRTY);
+        if( rc==BF_OK ){
+          sqlite3BfCircularBufferDealloc(&pCache->cb, pMini);
+          pEntry->pPage = pNew;
+          pMini = (BfMiniPage*)pNew;
+          pCache->nCompactions++;
+          rc = sqlite3BfMiniPageInsert(pMini, pKey, nKey, pVal, nVal, opType);
+          if( rc==BF_OK ){
+            pCache->nDirty++;
+            return BF_OK;
+          }
+        }else{
+          /* Compaction failed: keep the original mini-page intact. */
+          sqlite3BfCircularBufferDealloc(&pCache->cb, pNew);
+          if( rc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+        }
+      }
+    }
+  }
+#endif /* !SQLITE_BF_NO_MINIPAGE_COMPACT */
+
+  /* Still no room — caller must use the full base-page path for this record. */
   return BF_FULL;
 }
 

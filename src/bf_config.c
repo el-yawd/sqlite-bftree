@@ -34,14 +34,24 @@ typedef struct BfConfig {
   u64 nBufferSize;            /* Circular buffer size in bytes */
   int nPromotionRate;         /* Read promotion rate (0-100) */
   double copyOnAccessRatio;   /* Copy-on-access threshold (0.0-1.0) */
+  int nGroupCommit;           /* Transactions per record-frame group (0/1=off) */
 } BfConfig;
 
 static BfConfig bfConfig = {
   1,                          /* Enabled by default */
   BF_DEFAULT_BUFFER_SIZE,     /* 32 MB default */
   BF_DEFAULT_PROMOTION_RATE,  /* 1% default */
-  BF_DEFAULT_COPY_ON_ACCESS   /* 10% copy-on-access region */
+  BF_DEFAULT_COPY_ON_ACCESS,  /* 10% copy-on-access region */
+  0                           /* Group commit off: one flush per commit */
 };
+
+/*
+** Number of transactions a record-frame group may span (Phase 2 group commit).
+** 0 or 1 means every commit writes its own record frame(s) immediately.
+*/
+int sqlite3BfGroupCommitTxns(void){
+  return bfConfig.nGroupCommit;
+}
 
 /*
 ** Handle SQLITE_CONFIG_BFCACHE configuration.
@@ -320,10 +330,11 @@ void sqlite3PragmaBfCacheStats(
     }
 
     {
-      u64 nBufIns = 0, nFallback = 0;
+      u64 nBufIns = 0, nFallback = 0, nRefused = 0, nCompact = 0;
       if( pBt ){
-        extern void sqlite3BfBtreeInsertStats(Btree*, u64*, u64*);
-        sqlite3BfBtreeInsertStats(pBt, &nBufIns, &nFallback);
+        extern void sqlite3BfBtreeInsertStats(Btree*, u64*, u64*, u64*, u64*);
+        sqlite3BfBtreeInsertStats(pBt, &nBufIns, &nFallback, &nRefused,
+                                  &nCompact);
       }
       sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "buffered_inserts", P4_STATIC);
       sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
@@ -333,6 +344,19 @@ void sqlite3PragmaBfCacheStats(
       sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "insert_fallbacks", P4_STATIC);
       sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
                             (const u8*)&nFallback, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      /* Subset of insert_fallbacks where BF itself refused the record; the
+      ** remainder never reached BF (excluded by the buffering gate). */
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "insert_refused", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nRefused, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "minipage_compactions",
+                        P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nCompact, P4_INT64);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
     }
 
@@ -360,6 +384,62 @@ void sqlite3PragmaBfCacheStats(
                             (const u8*)&nCommits, P4_INT64);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
     }
+
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+    {
+      /* Group commit: batches handed to the WAL, and commits that wrote
+      ** nothing because their records rode a later group's frame. */
+      u64 nStaged = 0, nDeferred = 0;
+      int nPending = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreeGroupStats(Btree*, u64*, u64*, int*);
+        sqlite3BfBtreeGroupStats(pBt, &nStaged, &nDeferred, &nPending);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "group_batches", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nStaged, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "group_deferred", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nDeferred, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+#endif
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_group_commit
+**
+** PRAGMA bf_group_commit;       -- Returns the current group size (0 = off)
+** PRAGMA bf_group_commit = N;   -- Batch up to N transactions' record frames
+**
+** With N>1 a commit appends its records to an OPEN record batch and writes
+** nothing; the batch is written by the N-th transaction's commit (or earlier if
+** it fills, or if a base-page flush forces it out).  That is the paper-faithful
+** durability trade: COMMIT returns before the records reach the WAL, so a crash
+** loses at most one group.  N<=1 keeps strict per-commit record logging.
+*/
+void sqlite3PragmaBfGroupCommit(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  UNUSED_PARAMETER(zDb);
+
+  if( zValue == 0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nGroupCommit, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_group_commit", SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    int n = sqlite3Atoi(zValue);
+    if( n < 0 ) n = 0;
+    if( n > BF_MAX_GROUP_COMMIT ) n = BF_MAX_GROUP_COMMIT;
+    bfConfig.nGroupCommit = n;
   }
 }
 

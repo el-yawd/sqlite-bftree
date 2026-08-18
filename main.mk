@@ -720,8 +720,17 @@ SRC += \
   $(TOP)/ext/misc/stmt.c
 
 # BF-Tree record cache (v2): leaf modules + cache lifecycle, config/pragma,
-# and btree hooks.  Whole-file guarded by SQLITE_OMIT_BF_CACHE.  Phase 1 =
-# read-cache + write-through (insert-buffering OFF by default).
+# and btree hooks.  Whole-file guarded by SQLITE_OMIT_BF_CACHE.
+#
+# Phase 2 is ON by default: SQLITE_BF_INSERT_BUFFERING turns on write-back
+# insert/update/delete buffering plus the record-granular physiological WAL
+# (records are logged at commit and materialised to base lazily).  Build with
+# -DSQLITE_OMIT_BF_CACHE for a stock SQLite, or override OPT_FEATURE_FLAGS to
+# drop just the buffering and keep the Phase-1 read cache.  Ablation switches:
+# SQLITE_BF_NO_MERGE_SCAN, SQLITE_BF_NO_WRITEBACK_DELETE,
+# SQLITE_BF_NO_DESCENT_SHORTCUT, SQLITE_BF_NO_MINIPAGE_COMPACT.
+OPT_FEATURE_FLAGS += -DSQLITE_BF_INSERT_BUFFERING
+
 SRC += \
   $(TOP)/src/bf_cache.h \
   $(TOP)/src/bf_wal.h \

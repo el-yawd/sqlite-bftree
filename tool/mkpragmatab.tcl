@@ -422,6 +422,10 @@ set pragma_def {
   NAME: bf_promotion_rate
   TYPE: BF_PROMOTION_RATE
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
+  NAME: bf_group_commit
+  TYPE: BF_GROUP_COMMIT
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
 }
 
 # Open the output file

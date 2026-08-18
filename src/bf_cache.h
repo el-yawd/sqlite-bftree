@@ -53,6 +53,11 @@ typedef struct BfFreeList BfFreeList;
 #define BF_DEFAULT_BUFFER_SIZE    (8*1024*1024)   /* 8 MB circular buffer */
 #define BF_DEFAULT_COPY_ON_ACCESS 0.1             /* 10% copy-on-access region */
 #define BF_DEFAULT_PROMOTION_RATE 5               /* 5% read promotion rate */
+/* Upper bound on PRAGMA bf_group_commit: how many transactions may share one
+** open record batch before it is forced out to the WAL.  A crash loses at most
+** this many committed transactions, so keep it small enough to stay a
+** defensible durability trade. */
+#define BF_MAX_GROUP_COMMIT       1024
 
 /*
 ** Operation types for records in a mini-page.
@@ -264,6 +269,11 @@ struct BfCache {
   ** Used during merge flush to prevent re-entrant BF writes. */
   int bBypassActive;
 
+  /* Group commit (Phase 2): the open cross-transaction record batch, or NULL.
+  ** Opaque here (BfGroup lives in bf_btree.c); freed by
+  ** sqlite3BfBtreeGroupFree at cache teardown. */
+  void *pGroupCommit;
+
   /* Back-pointer to the owning BtShared (set lazily on first btree access).
   ** Typed as void* to avoid exposing btreeInt.h here. */
   void *pBtShared;
@@ -299,6 +309,12 @@ struct BfCache {
   u64 nMergeTombstones;     /* Base cells suppressed by a tombstone during merge */
   u64 nBufferedInserts;     /* Inserts absorbed by a mini-page (no base write) */
   u64 nInsertFallback;      /* Inserts that took the base-page write path anyway */
+  u64 nCompactions;         /* Mini-pages compacted (clean records dropped to
+                            ** make room for a dirty record) */
+  u64 nInsertRefused;       /* Subset of the above: the mini-page REFUSED the
+                            ** record (full at max size class / no usable leaf);
+                            ** the rest were excluded by the buffering gate in
+                            ** sqlite3BtreeInsert before BF was even asked */
 };
 
 /*
@@ -413,8 +429,12 @@ SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageClearRefs(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini);
+/* copyMode values for sqlite3BfMiniPageCopy. */
+#define BF_COPY_ALL        0   /* every record (size-class upgrade) */
+#define BF_COPY_REFERENCED 1   /* only records with the REF bit (eviction) */
+#define BF_COPY_DIRTY      2   /* only BFOP_INSERT/BFOP_DELETE (compaction) */
 SQLITE_PRIVATE int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
-    BfMiniPage *pSrc, int copyOnlyReferenced);
+    BfMiniPage *pSrc, int copyMode);
 SQLITE_PRIVATE int sqlite3BfMiniPageIterate(BfMiniPage *pMini,
     int (*xCallback)(void*, const u8*, int, const u8*, int, u8), void *pCtx);
 /* Number of records (any op type) in the sorted meta array. */
@@ -502,6 +522,12 @@ SQLITE_PRIVATE int sqlite3BfBtreeMergePrevInsert(BtCursor *pCur, Pgno leaf,
     int *pIx, i64 *pRowid, void *pBuf, int nCap, int *pnVal);
 /* Write-amp accounting: an insert took the base-page path (not buffered). */
 SQLITE_PRIVATE void sqlite3BfBtreeNoteInsertFallback(BtCursor *pCur);
+/* Group commit (Phase 2): force the open cross-transaction record batch into
+** the current transaction's WAL frame stream; free it at cache teardown. */
+SQLITE_PRIVATE void sqlite3BfBtreeGroupStagePending(Btree *p);
+SQLITE_PRIVATE void sqlite3BfBtreeGroupFree(BfCache *pBf);
+/* Transactions per record-frame group (PRAGMA bf_group_commit; 0/1 = off). */
+SQLITE_PRIVATE int sqlite3BfGroupCommitTxns(void);
 /* Merge-scan (Stage 2.2): flush table + drop merge state, revert to plain. */
 SQLITE_PRIVATE int sqlite3BfBtreeMergeBail(BtCursor *pCur);
 #if !defined(SQLITE_BF_NO_WRITEBACK_DELETE)

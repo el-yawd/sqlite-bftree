@@ -235,6 +235,13 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
   ** "loses them". */
   if( pBtree->inTrans!=TRANS_WRITE ) return SQLITE_OK;
 
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+  /* Group commit ordering invariant: get any pending record batch into THIS
+  ** transaction's frame stream before writing base pages, so replay sees the
+  ** older record frame first and the newer page image last. */
+  sqlite3BfBtreeGroupStagePending(pBtree);
+#endif
+
   memset(&ctx, 0, sizeof(ctx));
   memset(&tmpCur, 0, (size_t)sqlite3BtreeCursorSize());
 
@@ -329,41 +336,142 @@ int sqlite3BfBtreeFlushAllDirty(Btree *p){
 ** calls sqlite3BfBtreeClearCache, discarding the marks — so a mark can never
 ** outlive an uncommitted transaction.
 ** ----------------------------------------------------------------------- */
-typedef struct BfLogAllCtx BfLogAllCtx;
-struct BfLogAllCtx {
-  Pager      *pPager;   /* stage target (WAL) */
-  u8         *aBuf;     /* batch scratch buffer, szPage bytes */
+/*
+** Group commit (Phase 2).  The open record batch lives on the BfCache, not on
+** the stack of one commit, so consecutive transactions can pack their records
+** into the SAME record frame.  With PRAGMA bf_group_commit=N a commit appends
+** its records and returns without writing anything (the pager's
+** "no page dirtied" early-out then makes the commit a genuine zero-byte
+** operation); the N-th transaction stages the batch and its commit writes one
+** record frame plus the single page-1 commit frame for the whole group.
+**
+** Durability trade: COMMIT returns before the records reach the WAL, so a crash
+** loses at most the open group.  That is the paper-faithful setting; N<=1 keeps
+** strict per-commit record logging.  Nothing is ever LOST to a clean shutdown:
+** the records stay DIRTY in the mini-page, so if the batch is never written the
+** close/checkpoint flush still materialises them into base pages.
+**
+** Ordering invariant: the open batch MUST be staged before any base-page
+** materialisation of the same records (bfFlushOneMiniPage), because staged
+** record frames are emitted AHEAD of the page images in the same WAL commit —
+** replay then applies the older record first and the newer page image last.
+** Staging late (after a materialisation) would replay a stale record OVER the
+** newer base page.
+*/
+typedef struct BfGroup BfGroup;
+struct BfGroup {
+  u8         *aBuf;     /* batch scratch buffer, szPage bytes (owned) */
   int         szPage;   /* record-frame payload size */
   BfWalBatch  batch;    /* current open (unstaged) batch */
   int         nOpen;    /* records appended to the current batch */
+  int         nTxn;     /* transactions merged into the current batch */
+  u64         nStaged;  /* stats: batches handed to the WAL */
+  u64         nDeferred;/* stats: commits that wrote nothing (grouped) */
+};
+
+typedef struct BfLogAllCtx BfLogAllCtx;
+struct BfLogAllCtx {
+  Pager      *pPager;   /* stage target (WAL) */
+  BfGroup    *pGroup;   /* the cache's open batch */
   int         rc;       /* first error encountered, sticky */
 };
 
-/* Finish and stage the current batch (if non-empty), then re-init it empty. */
-static void bfLogFlushBatch(BfLogAllCtx *ctx){
-  if( ctx->rc!=SQLITE_OK || ctx->nOpen==0 ) return;
-  sqlite3BfWalBatchFinish(&ctx->batch);
-  ctx->rc = sqlite3PagerBfStage(ctx->pPager, ctx->aBuf, ctx->szPage);
-  ctx->nOpen = 0;
-  sqlite3BfWalBatchInit(&ctx->batch, ctx->aBuf, ctx->szPage);
+/* The cache's open batch, allocated on first use.  NULL only on OOM. */
+static BfGroup *bfGroupGet(BfCache *pBf, int szPage){
+  BfGroup *g = (BfGroup*)pBf->pGroupCommit;
+  if( g==0 ){
+    if( szPage<=0 ) return 0;
+    g = (BfGroup*)sqlite3_malloc(sizeof(*g));
+    if( g==0 ) return 0;
+    memset(g, 0, sizeof(*g));
+    g->aBuf = (u8*)sqlite3_malloc(szPage);
+    if( g->aBuf==0 ){ sqlite3_free(g); return 0; }
+    g->szPage = szPage;
+    sqlite3BfWalBatchInit(&g->batch, g->aBuf, g->szPage);
+    pBf->pGroupCommit = (void*)g;
+  }
+  return g;
+}
+
+/* Finish and stage the open batch (if non-empty), then re-open it empty. */
+static void bfGroupStage(BfGroup *g, Pager *pPager, int *pRc){
+  if( *pRc!=SQLITE_OK || g->nOpen==0 ){
+    g->nTxn = 0;
+    return;
+  }
+  sqlite3BfWalBatchFinish(&g->batch);
+  *pRc = sqlite3PagerBfStage(pPager, g->aBuf, g->szPage);
+  g->nOpen = 0;
+  g->nTxn = 0;
+  g->nStaged++;
+  sqlite3BfWalBatchInit(&g->batch, g->aBuf, g->szPage);
 }
 
 /* Append one record; on a full batch, stage it and retry into a fresh one. */
 static void bfLogAppendRec(BfLogAllCtx *ctx, const BfWalRec *pRec){
+  BfGroup *g = ctx->pGroup;
   int wrc;
   if( ctx->rc!=SQLITE_OK ) return;
-  wrc = sqlite3BfWalBatchAppend(&ctx->batch, pRec);
+  wrc = sqlite3BfWalBatchAppend(&g->batch, pRec);
   if( wrc==BFWAL_FULL ){
-    bfLogFlushBatch(ctx);                            /* stage what we have */
+    bfGroupStage(g, ctx->pPager, &ctx->rc);          /* stage what we have */
     if( ctx->rc!=SQLITE_OK ) return;
-    wrc = sqlite3BfWalBatchAppend(&ctx->batch, pRec);/* retry into fresh batch */
+    wrc = sqlite3BfWalBatchAppend(&g->batch, pRec);  /* retry into fresh batch */
   }
   if( wrc==BFWAL_OK ){
-    ctx->nOpen++;
+    g->nOpen++;
   }else{
     /* A single record that will not fit an empty page-sized batch, or NOMEM. */
     ctx->rc = (wrc==BFWAL_NOMEM) ? SQLITE_NOMEM_BKPT : SQLITE_CORRUPT_BKPT;
   }
+}
+
+/*
+** Stage the cache's open record batch, if any, so its frames are written by the
+** WAL commit of the transaction that is running RIGHT NOW.  Called before any
+** base-page materialisation (see the ordering invariant above) and whenever a
+** caller needs the group forced out.  No-op when nothing is pending.
+*/
+void sqlite3BfBtreeGroupStagePending(Btree *p){
+  BfCache *pBf;
+  BfGroup *g;
+  int rc = SQLITE_OK;
+  if( !p || !p->pBt ) return;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( !pBf ) return;
+  g = (BfGroup*)pBf->pGroupCommit;
+  if( g==0 || g->nOpen==0 ) return;
+  bfGroupStage(g, p->pBt->pPager, &rc);
+  /* A staging failure here cannot fail the caller (flush paths return void),
+  ** but it is not a correctness problem: the records are still DIRTY, so the
+  ** materialisation about to run writes them to base pages instead. */
+}
+
+/*
+** Release the open batch (cache teardown).  Any records still in it are dirty
+** in the mini-pages, so the close-time flush has already materialised them.
+*/
+void sqlite3BfBtreeGroupFree(BfCache *pBf){
+  BfGroup *g;
+  if( !pBf || !pBf->pGroupCommit ) return;
+  g = (BfGroup*)pBf->pGroupCommit;
+  sqlite3_free(g->aBuf);
+  sqlite3_free(g);
+  pBf->pGroupCommit = 0;
+}
+
+/*
+** Group-commit statistics for PRAGMA bf_cache_stats.
+*/
+void sqlite3BfBtreeGroupStats(Btree *p, u64 *pStaged, u64 *pDeferred,
+                              int *pPending){
+  BfCache *pBf = 0;
+  BfGroup *g = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pBf ) g = (BfGroup*)pBf->pGroupCommit;
+  if( pStaged )   *pStaged   = g ? g->nStaged   : 0;
+  if( pDeferred ) *pDeferred = g ? g->nDeferred : 0;
+  if( pPending )  *pPending  = g ? g->nTxn      : 0;
 }
 
 static int bfLogAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
@@ -412,25 +520,36 @@ static int bfLogAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
 int sqlite3BfBtreeLogAllDirty(Btree *p){
   BfCache *pBf;
   BfLogAllCtx ctx;
+  BfGroup *g;
+  int nGroup;
 
   if( !p || !p->pBt ) return SQLITE_OK;
   pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
   if( !pBf ) return SQLITE_OK;
   if( !pBf->bDirtyInserts ) return SQLITE_OK;    /* nothing buffered to log */
 
+  g = bfGroupGet(pBf, pBf->szPage);
+  if( !g ) return SQLITE_NOMEM_BKPT;
+
   memset(&ctx, 0, sizeof(ctx));
   ctx.pPager = p->pBt->pPager;
-  ctx.szPage = pBf->szPage;
-  ctx.aBuf   = (u8*)sqlite3_malloc(ctx.szPage);
-  if( !ctx.aBuf ) return SQLITE_NOMEM_BKPT;
+  ctx.pGroup = g;
   ctx.rc     = SQLITE_OK;
-  ctx.nOpen  = 0;
-  sqlite3BfWalBatchInit(&ctx.batch, ctx.aBuf, ctx.szPage);
 
   sqlite3BfMapIterate(pBf, bfLogAllCallback, &ctx);
-  bfLogFlushBatch(&ctx);                          /* stage the final batch */
+  if( ctx.rc!=SQLITE_OK ) return ctx.rc;
 
-  sqlite3_free(ctx.aBuf);
+  /* Group commit: hold the batch open across up to nGroup transactions.  A
+  ** deferred commit stages nothing, so sqlite3PagerCommitPhaseOne sees no
+  ** staged payload and no dirty page and writes zero bytes for it. */
+  nGroup = sqlite3BfGroupCommitTxns();
+  g->nTxn++;
+  if( nGroup<=1 || g->nTxn>=nGroup ){
+    bfGroupStage(g, ctx.pPager, &ctx.rc);
+  }else{
+    g->nDeferred++;
+  }
+
   /* bDirtyInserts stays set: the records are logged but still not in base, so
   ** pre-mutation flush + checkpoint/eviction flush must still run for them. */
   return ctx.rc;
@@ -640,14 +759,14 @@ int sqlite3BfBtreeInsertCell(
   pBf = btreeGetBfCache(pBt);
   if( !pBf ) return SQLITE_NOTFOUND;
 
-  if( nData>BF_MAX_MINI_PAGE || nKey!=8 ) return SQLITE_FULL;
+  if( nData>BF_MAX_MINI_PAGE || nKey!=8 ){ pBf->nInsertRefused++; return SQLITE_FULL; }
 
   /* Per-leaf keying (Phase 1): buffer the insert into the mini-page of the
   ** leaf the cursor has descended to, not the table root.  If the cursor is
   ** not parked on a real leaf, refuse so the caller does a base write. */
   {
     u32 leaf = bfCursorLeafPgno(pCur);
-    if( leaf==0 ) return SQLITE_FULL;
+    if( leaf==0 ){ pBf->nInsertRefused++; return SQLITE_FULL; }
     rc = sqlite3BfRecordWrite(pBf, leaf, pKey, nKey, pData, nData, BFOP_INSERT);
     if( rc==BF_OK ){
       bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
@@ -657,6 +776,7 @@ int sqlite3BfBtreeInsertCell(
     }
   }
   if( rc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+  pBf->nInsertRefused++;
 
   /* The mini-page is full and could not be upgraded (at max size class), or
   ** the circular buffer is out of memory.  We must NOT evict this table's
@@ -1548,11 +1668,14 @@ void sqlite3BfBtreeNoteInsertFallback(BtCursor *pCur){
 /*
 ** Insert-path statistics (Phase 2) for PRAGMA bf_cache_stats.
 */
-void sqlite3BfBtreeInsertStats(Btree *p, u64 *pBuffered, u64 *pFallback){
+void sqlite3BfBtreeInsertStats(Btree *p, u64 *pBuffered, u64 *pFallback,
+                               u64 *pRefused, u64 *pCompactions){
   BfCache *pBf = 0;
   if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
-  if( pBuffered ) *pBuffered = pBf ? pBf->nBufferedInserts : 0;
-  if( pFallback ) *pFallback = pBf ? pBf->nInsertFallback  : 0;
+  if( pBuffered )    *pBuffered    = pBf ? pBf->nBufferedInserts : 0;
+  if( pFallback )    *pFallback    = pBf ? pBf->nInsertFallback  : 0;
+  if( pRefused )     *pRefused     = pBf ? pBf->nInsertRefused   : 0;
+  if( pCompactions ) *pCompactions = pBf ? pBf->nCompactions     : 0;
 }
 
 /*

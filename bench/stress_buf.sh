@@ -51,6 +51,13 @@ for seed in $SEEDS; do
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
         python3 ./gen_rev_stress.py "$seed" 400 >> "$b.sql"
       fi
+      # Optional: exercise group commit (BF_GROUP=N sh stress_buf.sh).  Stock
+      # ignores the unknown pragma, so both sides still run the same script.
+      if [ -n "$BF_GROUP" ]; then
+        printf 'PRAGMA bf_group_commit=%s;\n' "$BF_GROUP" > "$b.sql.tmp"
+        cat "$b.sql" >> "$b.sql.tmp"
+        mv "$b.sql.tmp" "$b.sql"
+      fi
       rm -f "$b.bf.db" "$b.st.db"
       "$BUF"   "$b.bf.db" < "$b.sql" > "$b.bf.out" 2>&1 || true
       "$STOCK" "$b.st.db" < "$b.sql" > "$b.st.out" 2>&1 || true

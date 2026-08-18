@@ -35,6 +35,10 @@ def main():
     w("PRAGMA journal_mode=wal;")
     w("PRAGMA synchronous=NORMAL;")
     w("PRAGMA wal_autocheckpoint=0;")
+    # Group commit size, if requested (stock ignores the unknown pragma).
+    import os
+    if os.environ.get("BF_GROUP"):
+        w("PRAGMA bf_group_commit=%d;" % int(os.environ["BF_GROUP"]))
     w("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
     # Seed: rowids spaced 1000 apart so the measured inserts fall in the gaps.
     w("INSERT INTO t SELECT value*1000, hex(randomblob(32)) "

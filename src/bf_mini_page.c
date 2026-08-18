@@ -647,10 +647,17 @@ void sqlite3BfMiniPageMarkLoggedAt(BfMiniPage *pMini, int ix){
 
 /*
 ** Copy a mini-page to a new location with potentially different size.
-** Used for upgrading mini-page size class.
+** Used for upgrading mini-page size class (BF_COPY_ALL), for the eviction
+** sweep (BF_COPY_REFERENCED), and to reclaim space inside a full mini-page by
+** dropping its pure-cache records (BF_COPY_DIRTY).
+**
+** BF_COPY_DIRTY keeps only BFOP_INSERT/BFOP_DELETE.  Dropping a BFOP_CACHE
+** (duplicate of a base cell) or a BFOP_PHANTOM (confirmed-absent key) costs at
+** most a later cache miss, never correctness — but dropping a dirty record
+** would lose committed data, so those are always carried over.
 */
 int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
-    BfMiniPage *pSrc, int copyOnlyReferenced){
+    BfMiniPage *pSrc, int copyMode){
   BfKVMeta *aSrcMeta = bfMiniPageMeta(pSrc);
   int i;
   u8 *pKey, *pVal;
@@ -663,8 +670,12 @@ int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
   pDst->rootPgno = pSrc->rootPgno;
 
   for(i = 0; i < pSrc->metaCount; i++){
-    if( copyOnlyReferenced && !BF_KV_IS_REF(&aSrcMeta[i]) ){
+    if( copyMode==BF_COPY_REFERENCED && !BF_KV_IS_REF(&aSrcMeta[i]) ){
       continue;
+    }
+    if( copyMode==BF_COPY_DIRTY ){
+      u8 op = BF_KV_OP_TYPE(&aSrcMeta[i]);
+      if( op!=BFOP_INSERT && op!=BFOP_DELETE ) continue;
     }
 
     pKey = bfGetKeyPtr(pSrc, &aSrcMeta[i]);

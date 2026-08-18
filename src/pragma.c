@@ -912,6 +912,11 @@ void sqlite3Pragma(
     sqlite3PragmaBfPromotionRate(pParse, zDb, zRight);
     break;
   }
+  case PragTyp_BF_GROUP_COMMIT: {
+    extern void sqlite3PragmaBfGroupCommit(Parse*, const char*, const char*);
+    sqlite3PragmaBfGroupCommit(pParse, zDb, zRight);
+    break;
+  }
 #endif
 
   /*
