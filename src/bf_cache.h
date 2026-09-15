@@ -54,7 +54,26 @@ typedef struct BfFreeList BfFreeList;
 # define BF_DEFAULT_BUFFER_SIZE   (8*1024*1024)   /* 8 MB circular buffer */
 #endif
 #define BF_DEFAULT_COPY_ON_ACCESS 0.1             /* 10% copy-on-access region */
-#define BF_DEFAULT_PROMOTION_RATE 5               /* 5% read promotion rate */
+/* Percent of read misses that copy the record into the cache.
+**
+** 5 was far too low.  The record cache's whole advantage on skewed point reads
+** is holding the hot set, and at 5% it never gets there: a 60M-row zipf-0.99
+** read workload cached 48k records and ran at PARITY with stock.  At 30 -- the
+** rate ../bf-tree uses for its storage benchmark (benchmark/bench_bftree.toml;
+** it uses 100 for the in-memory one) -- the same workload caches 256k records,
+** reads 21% fewer bytes, and beats stock by 1.15x.  Measured 2026-09-15,
+** 120 s warmup so the ring actually saturates:
+**
+**    rate   ops/s    cached   rec hit%   rss
+**      5    10,841    48,321    48.3%   164 MiB
+**     30    12,476   255,502    55.0%   238 MiB
+**    100    13,169   509,654    52.4%   305 MiB
+**
+** 100 is marginally faster still but spends 67 MiB more of the budget on
+** records for it, and the hit rate does not improve -- at 100 every one-off key
+** is promoted too.  30 keeps most of the win.  PRAGMA bf_promotion_rate tunes
+** it per connection. */
+#define BF_DEFAULT_PROMOTION_RATE 30              /* 30% read promotion rate */
 /* Upper bound on PRAGMA bf_group_commit: how many transactions may share one
 ** open record batch before it is forced out to the WAL.  A crash loses at most
 ** this many committed transactions, so keep it small enough to stay a

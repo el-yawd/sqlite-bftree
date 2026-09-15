@@ -1,0 +1,45 @@
+{
+  "name": "autockpt_reads",
+  "_comment": [
+    "What does auto-checkpoint do to READS?  The first campaign answered this",
+    "only for a 95/5 mix, where both engines lost throughput -- stock more than",
+    "BF (-15% vs -10%), which suggests the cost is checkpoint I/O competing with",
+    "reads rather than anything BF does wrong.  This isolates the axis:",
+    "",
+    "  pure_read       read=100: nothing is ever written, so there is nothing to",
+    "                  checkpoint and the setting should not matter at all.  If it",
+    "                  does, something is wrong beyond I/O contention.",
+    "  read_mostly     read=95,insert=5 on the 6.8 GB db: the case that lost 10%.",
+    "  read_warm       read=100 on a db that fits: isolates CPU-side effects from",
+    "                  I/O contention entirely."
+  ],
+  "datasets": {
+    "big":  { "records": 60000000, "value_len": 100, "key_spacing": 16 },
+    "v100": { "records": 4000000,  "value_len": 100, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "big",
+    "suts": ["stock", "bf"],
+    "repeats": 3,
+    "seconds": 20,
+    "warmup_seconds": 5,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "256M",
+    "memmax": "1G",
+    "bf_page_cache_floor": "8M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true
+  },
+  "experiments": [
+    { "name": "pure_read",  "workload": "read=100",
+      "axes": { "autocheckpoint": [0, 1000] } },
+    { "name": "read_mostly", "workload": "read=95,insert=5",
+      "axes": { "autocheckpoint": [0, 1000] } },
+    { "name": "read_warm",  "dataset": "v100", "workload": "read=100",
+      "memmax": "1G", "promotion": 100,
+      "axes": { "autocheckpoint": [0, 1000] } }
+  ]
+}

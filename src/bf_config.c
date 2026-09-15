@@ -40,7 +40,7 @@ typedef struct BfConfig {
 static BfConfig bfConfig = {
   1,                          /* Enabled by default */
   BF_DEFAULT_BUFFER_SIZE,     /* 32 MB default */
-  BF_DEFAULT_PROMOTION_RATE,  /* 1% default */
+  BF_DEFAULT_PROMOTION_RATE,  /* see bf_cache.h for why 30 */
   BF_DEFAULT_COPY_ON_ACCESS,  /* 10% copy-on-access region */
   0                           /* Group commit off: one flush per commit */
 };
