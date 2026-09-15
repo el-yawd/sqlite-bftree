@@ -1,0 +1,39 @@
+{
+  "name": "fixes_smoke",
+  "_comment": [
+    "3-minute proof that the A/B plumbing works before committing 1.5 h to",
+    "configs/fixes.json: that bfbench_bf_pre exists and runs, that both BF SUTs",
+    "report the gauge counters, and that report.py emits the bf/bf_pre ratio",
+    "block. NOT a result -- the 250 MB dataset fits inside the cap, so it",
+    "measures a warm cache, and 1 repeat has no spread to report.",
+    "The one thing it can genuinely show is `buffered%` at v200, which is",
+    "capacity-independent."
+  ],
+  "datasets": {
+    "small": { "records": 2000000, "value_len": 100, "key_spacing": 16 },
+    "v200":  { "records": 4000000, "value_len": 200, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "small",
+    "suts": ["stock", "bf_pre", "bf"],
+    "repeats": 1,
+    "seconds": 4,
+    "warmup_seconds": 1,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "64M",
+    "memmax": "384M",
+    "bf_page_cache_floor": "8M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true
+  },
+  "experiments": [
+    { "name": "cache_size", "workload": "read=100", "memmax": "auto",
+      "axes": { "budget_bytes": ["16M", "64M"] } },
+    { "name": "record_size", "workload": "insert=100", "autocheckpoint": 0,
+      "axes": { "record_size": [ { "label": "v100", "dataset": "small" },
+                                 { "label": "v200", "dataset": "v200" } ] } }
+  ]
+}

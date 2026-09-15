@@ -1,0 +1,208 @@
+{
+  "name": "full",
+  "strict": true,
+  "_comment": [
+    "The campaign that decides whether the fork is done. ~7 GiB dataset on an",
+    "11 GiB box, capped by cgroup so the working set is several times the",
+    "memory the engine is allowed and the OS page cache cannot hide the",
+    "difference. Budget is the engine's share of that cap: stock spends it all",
+    "on pages, BF splits it between pages and records at bf_page_cache_floor",
+    "-- which page_cache_floor now sweeps instead of assuming.",
+    "",
+    "Write-heavy experiments run 30s instead of 20s (and warm up 8s): at",
+    "20s x 3 every one of them produced cells with >15% run-to-run spread.",
+    "A longer window straddles more WAL-checkpoint cycles, which is where",
+    "that variance came from; repeats went 3 -> 5 for every experiment.",
+    "",
+    "Expect roughly 4-5 h including the one-time dataset load. Read-only",
+    "experiments reuse the database copy; write experiments each start from a",
+    "fresh copy of the pristine template (~10 s each).",
+    "",
+    "Each experiment maps to a specific claim:",
+    "  point_read     paper's 2x point-read win, at four cache sizes",
+    "  page_cache_floor  how BF should split its budget between pages/records",
+    "  skew           does the win depend on skew? (paper sweeps this)",
+    "  scan           paper's 2.5x scan win, at three scan lengths",
+    "  negative_read  phantom caching (paper 5.6)",
+    "  update/insert  paper's 6x write win",
+    "  workload_mix   the read/update sweep the paper reports",
+    "  ycsb_*         standard mixes, so the numbers are comparable outside",
+    "  durability_*   OUR addition: the record-WAL trade-off across",
+    "                 synchronous levels and group-commit sizes",
+    "  write_amp      bytes on disk per commit, autocheckpoint off",
+    "  overhead       bf_off vs stock: cost of the fork with the feature off"
+  ],
+  "datasets": {
+    "big": { "records": 60000000, "value_len": 100, "key_spacing": 16 },
+    "v32":  { "records": 4000000, "value_len": 32,  "key_spacing": 16 },
+    "v64":  { "records": 4000000, "value_len": 64,  "key_spacing": 16 },
+    "v100": { "records": 4000000, "value_len": 100, "key_spacing": 16 },
+    "v200": { "records": 4000000, "value_len": 200, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "big",
+    "suts": ["stock", "bf"],
+    "repeats": 5,
+    "seconds": 20,
+    "warmup_seconds": 5,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "256M",
+    "memmax": "1G",
+    "bf_page_cache_floor": "8M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "scan_len": 32,
+    "drop_cache": true
+  },
+  "experiments": [
+    {
+      "name": "point_read",
+      "_why": [
+        "memmax is \"auto\" (2x budget + 256M) rather than a fixed 1G. Under a",
+        "fixed cap the 512M budget owned half the cgroup and squeezed out the",
+        "OS page cache, so BOTH SUTs got slower as the budget grew -- the",
+        "2026-08-25 table falls from ~28k ops/s at 64M to ~21k at 512M. That",
+        "is a cgroup effect, not a cache-size effect, and it confounds the",
+        "axis. Scaling the cap keeps the engine at a constant fraction of",
+        "available memory so the axis varies cache size and nothing else."
+      ],
+      "workload": "read=100",
+      "memmax": "auto",
+      "axes": { "budget_bytes": ["64M", "128M", "256M", "512M"] }
+    },
+    {
+      "name": "page_cache_floor",
+      "_why": [
+        "The axis that could not be measured before the bf_cache.c page-hash",
+        "fix. BF's pcache2 hash was pinned at 256 buckets for the life of the",
+        "cache, so a BF build with a real page cache walked ~nMax/256-long",
+        "chains and ran ~13x slower than pcache1 (measured: 43k vs 486k ops/s",
+        "at a 256M page cache). Every BF run was therefore held at the 8M",
+        "floor, which meant \"equal memory budget\" really compared stock's",
+        "tuned page cache against BF's record cache backed by almost no page",
+        "cache. Now the split itself is a variable.",
+        "",
+        "stock ignores the floor and spends the whole budget on pages, so its",
+        "four rows are four independent measurements of one configuration --",
+        "a free estimate of the noise floor."
+      ],
+      "workload": "read=100",
+      "memmax": "auto",
+      "axes": {
+        "bf_page_cache_floor": ["8M", "32M", "64M", "128M"]
+      }
+    },
+    {
+      "name": "skew",
+      "workload": "read=100",
+      "axes": {
+        "skew": [
+          { "label": "uniform",   "dist": "uniform" },
+          { "label": "zipf0.6",   "dist": "zipf", "theta": 0.6 },
+          { "label": "zipf0.9",   "dist": "zipf", "theta": 0.9 },
+          { "label": "zipf0.99",  "dist": "zipf", "theta": 0.99 }
+        ]
+      }
+    },
+    {
+      "name": "scan",
+      "workload": "scan=100",
+      "axes": { "scan_len": [8, 32, 128] }
+    },
+    {
+      "name": "negative_read",
+      "workload": "negative_read=100"
+    },
+    {
+      "name": "update",
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "workload": "update=100"
+    },
+    {
+      "name": "insert",
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "workload": "insert=100"
+    },
+    {
+      "name": "workload_mix",
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "axes": {
+        "mix": [
+          { "label": "r100u0",  "workload": "read=100" },
+          { "label": "r80u20",  "workload": "read=80,update=20" },
+          { "label": "r50u50",  "workload": "read=50,update=50" },
+          { "label": "r20u80",  "workload": "read=20,update=80" },
+          { "label": "r0u100",  "workload": "update=100" }
+        ]
+      }
+    },
+    { "name": "ycsb_a", "workload": "read=50,update=50" },
+    { "name": "ycsb_b", "workload": "read=95,update=5" },
+    { "name": "ycsb_d", "workload": "read=95,insert=5", "dist": "latest",
+      "seconds": 30, "warmup_seconds": 8 },
+    { "name": "ycsb_e", "workload": "scan=95,insert=5" },
+    { "name": "ycsb_f", "workload": "read=50,rmw=50" },
+    {
+      "name": "durability_bf",
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "workload": "update=100",
+      "suts": ["bf"],
+      "autocheckpoint": 0,
+      "axes": {
+        "synchronous": ["off", "normal", "full"],
+        "group_commit": [0, 8, 32]
+      }
+    },
+    {
+      "name": "durability_stock",
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "workload": "update=100",
+      "suts": ["stock"],
+      "autocheckpoint": 0,
+      "axes": { "synchronous": ["off", "normal", "full"] }
+    },
+    {
+      "name": "record_size",
+      "_why": [
+        "Write-back insert refuses records above roughly 64-96 bytes and falls",
+        "back to the base-page path, so the write win is size-dependent. The",
+        "old wal_write_amp.sh used 64-byte payloads, i.e. exactly the size where",
+        "buffering always succeeds. This makes record size a measured axis",
+        "instead of a hidden assumption. Needs its own datasets: value_len is a",
+        "property of the loaded table, not of the run."
+      ],
+      "workload": "insert=100",
+      "autocheckpoint": 0,
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "axes": {
+        "record_size": [
+          { "label": "v32",  "dataset": "v32" },
+          { "label": "v64",  "dataset": "v64" },
+          { "label": "v100", "dataset": "v100" },
+          { "label": "v200", "dataset": "v200" }
+        ]
+      }
+    },
+    {
+      "name": "write_amp",
+      "workload": "insert=100",
+      "autocheckpoint": 0,
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "repeats": 7
+    },
+    {
+      "name": "overhead",
+      "workload": "read=100",
+      "suts": ["stock", "bf_off"]
+    }
+  ]
+}

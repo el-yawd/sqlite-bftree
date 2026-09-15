@@ -1,0 +1,41 @@
+{
+  "name": "smoke",
+  "_comment": [
+    "Fast sanity pass (~6 min, 250 MB dataset). Not a result: the dataset is",
+    "small enough to fit in the cap, so it proves the harness works end to end",
+    "-- every op type runs, no read errors, counters move -- not that BF wins.",
+    "Run this after any code change; run full.json for numbers."
+  ],
+  "datasets": {
+    "small": { "records": 2000000, "value_len": 100, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "small",
+    "suts": ["stock", "bf"],
+    "repeats": 1,
+    "seconds": 4,
+    "warmup_seconds": 1,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "32M",
+    "memmax": "384M",
+    "bf_page_cache_floor": "8M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true
+  },
+  "experiments": [
+    { "name": "point_read",    "workload": "read=100" },
+    { "name": "negative_read", "workload": "negative_read=100" },
+    { "name": "scan",          "workload": "scan=100", "scan_len": 32 },
+    { "name": "update",        "workload": "update=100" },
+    { "name": "insert",        "workload": "insert=100" },
+    { "name": "ycsb_a",        "workload": "read=50,update=50" },
+    { "name": "ycsb_f",        "workload": "read=50,rmw=50" },
+    { "name": "ycsb_e",        "workload": "scan=95,insert=5", "scan_len": 32 },
+    { "name": "group_commit",  "workload": "update=100",
+      "autocheckpoint": 0,
+      "axes": { "group_commit": [0, 32] } }
+  ]
+}

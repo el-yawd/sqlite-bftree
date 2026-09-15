@@ -1,0 +1,234 @@
+{
+  "name": "fixes",
+  "_comment": [
+    "A/B of the 2026-09-07 record-cache fixes, as an in-campaign comparison.",
+    "",
+    "Three SUTs, ONE amalgamation each, same driver, same flags:",
+    "  stock   upstream SQLite (-DSQLITE_OMIT_BF_CACHE)",
+    "  bf_pre  BF built from src/ at the revision passed to",
+    "          `build_suts.sh --pre REV` -- i.e. BEFORE the fixes",
+    "  bf      BF built from the current working tree -- AFTER them",
+    "",
+    "Why bf_pre exists at all: identical code measured in three separate",
+    "campaigns reported 9913 / 11652 / 8102 ops/s (23% spread), so a",
+    "before/after read off two results directories is not evidence. The",
+    "'before' has to run interleaved with the 'after', under the same cgroup,",
+    "the same page-cache state and the same governor.",
+    "",
+    "This config is deliberately NOT strict: the fixes are uncommitted, so the",
+    "tree is dirty by construction, and the governor is powersave unless you",
+    "run the sudo line in the README. Both are recorded in the manifest and",
+    "printed as caveats. Wall-clock ratios here are therefore weaker evidence",
+    "than the counters (ring MiB, buffered%, evictions, frames/commit), which",
+    "are governor-independent.",
+    "",
+    "Each experiment names the fix it interrogates. ~110 runs, budget ~1.5 h.",
+    "",
+    "Two reading rules for the bf_pre rows (README section 10):",
+    "  - counters newer than the pre revision come back absent, not zero, and its",
+    "    `rec hit%` is the old conflated page+record counter -- not comparable;",
+    "  - bf_pre ignores the ring resize, so its ring is 8 MiB whatever the budget",
+    "    says and it runs UNDER budget. Under a cgroup that also caps the page",
+    "    cache, the engine holding less anon memory gets more file cache for free,",
+    "    which flatters it. That is why every experiment below names a counter to",
+    "    read before the wall clock."
+  ],
+  "datasets": {
+    "big": {
+      "records": 60000000,
+      "value_len": 100,
+      "key_spacing": 16
+    },
+    "v32": {
+      "records": 4000000,
+      "value_len": 32,
+      "key_spacing": 16
+    },
+    "v64": {
+      "records": 4000000,
+      "value_len": 64,
+      "key_spacing": 16
+    },
+    "v100": {
+      "records": 4000000,
+      "value_len": 100,
+      "key_spacing": 16
+    },
+    "v200": {
+      "records": 4000000,
+      "value_len": 200,
+      "key_spacing": 16
+    }
+  },
+  "defaults": {
+    "dataset": "big",
+    "suts": [
+      "stock",
+      "bf_pre",
+      "bf"
+    ],
+    "repeats": 3,
+    "seconds": 20,
+    "warmup_seconds": 5,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "256M",
+    "memmax": "1G",
+    "bf_page_cache_floor": "8M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "scan_len": 32,
+    "drop_cache": true
+  },
+  "experiments": [
+    {
+      "name": "cache_size",
+      "_tests": [
+        "FIX 3 -- PRAGMA bf_cache_size never took effect: the cache is",
+        "built during the schema load, always before the BF pragmas can",
+        "run, so the ring stayed at its 8 MiB default for every run ever",
+        "measured. Isolated on a fully-cached 2M-row zipf read the fix",
+        "was worth +42% (209,906 -> 298,777 ops/s).",
+        "The prediction this experiment can falsify: bf_pre is FLAT",
+        "across the axis (its ring is 8 MiB at every budget) while bf",
+        "scales with it. Read `ring MiB` in the detail table first -- if",
+        "bf_pre is not flat at 8, the diagnosis was wrong.",
+        "memmax is auto (2x budget + 256M): a fixed cap turns a cache-size",
+        "axis into a page-cache-eviction axis."
+      ],
+      "workload": "read=100",
+      "memmax": "auto",
+      "axes": {
+        "budget_bytes": [
+          "64M",
+          "256M",
+          "512M"
+        ]
+      }
+    },
+    {
+      "name": "promotion",
+      "_tests": [
+        "THE OPEN PROBLEM. Read-path promotion costs ~20% at the real",
+        "256 MiB ring (it was 20.1% -> 3.8% after the size-class fix ->",
+        "20.1% again once the ring became real). Suspected cause is in",
+        "sqlite3BfCircularBufferAlloc: freed blocks return to a size-class",
+        "free list but do NOT return logical ring space, so the ring holds",
+        "~3.8 KiB per ~130 B record and every upgrade burns space until",
+        "the head sweeps past. `cached recs` and `evictions` at",
+        "promotion=100 are the columns to read; ops/s is downstream of them."
+      ],
+      "workload": "read=100",
+      "suts": [
+        "bf_pre",
+        "bf"
+      ],
+      "axes": {
+        "promotion": [
+          0,
+          100
+        ]
+      }
+    },
+    {
+      "name": "scan",
+      "_tests": [
+        "Fixes 1+2 change how many records a mini-page holds, so a scan",
+        "that merges buffered records with base pages should see it. Also",
+        "the paper's ~2.5x scan claim, for reference."
+      ],
+      "workload": "scan=100",
+      "scan_len": 32
+    },
+    {
+      "name": "negative_read",
+      "_tests": [
+        "Recorded as ~4.5x SLOWER than stock while reading 5x fewer bytes",
+        "-- a CPU-bound path, the opposite of the paper's 5.6 phantom-cache",
+        "claim. Included to find out whether the size-class fixes moved it",
+        "at all; if the ratio is unchanged, the cause is elsewhere and this",
+        "stops being attributable to mini-page sizing."
+      ],
+      "workload": "negative_read=100"
+    },
+    {
+      "name": "record_size",
+      "_tests": [
+        "FIX 2 -- the documented '64-96 byte cliff'. sqlite3BfRecordWrite",
+        "upgraded one size class per write, so a mini-page starting at 64 B",
+        "reached only 128 B, whose usable payload is 128-24(hdr)-8(meta) =",
+        "96 bytes; anything larger fell back to the base-page path (100%",
+        "buffered at 64 B, 31% at 96 B, 14% at 200 B). Fixed by",
+        "sqlite3BfMiniPageSizeClassFor(), which picks the smallest class",
+        "holding the live records plus the incoming one, so one upgrade",
+        "always suffices.",
+        "Read `buffered%`: bf_pre should collapse from ~100 at v32/v64 to",
+        "~14 at v200, bf should stay high. This is the clearest single",
+        "before/after in the whole config. value_len is a property of the",
+        "loaded table, so each point needs its own dataset."
+      ],
+      "workload": "insert=100",
+      "autocheckpoint": 0,
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "axes": {
+        "record_size": [
+          {
+            "label": "v32",
+            "dataset": "v32"
+          },
+          {
+            "label": "v64",
+            "dataset": "v64"
+          },
+          {
+            "label": "v100",
+            "dataset": "v100"
+          },
+          {
+            "label": "v200",
+            "dataset": "v200"
+          }
+        ]
+      }
+    },
+    {
+      "name": "update",
+      "_tests": [
+        "UPDATE was measured never to buffer at all (wal_record_frames=0,",
+        "buffered_inserts=0) and to take the page-image path instead. The",
+        "size-class fixes plausibly change that, since refusing a record",
+        "for want of space was one of the reasons. `rec frames/commit` > 0",
+        "for bf and = 0 for bf_pre would be the signal.",
+        "On v100, not big: write runs copy the database per run, and a",
+        "6.8 GB copy per repeat dominates a 30 s measurement."
+      ],
+      "workload": "update=100",
+      "dataset": "v100",
+      "autocheckpoint": 0,
+      "seconds": 30,
+      "warmup_seconds": 8
+    },
+    {
+      "name": "write_amp",
+      "_tests": [
+        "The Phase-2 commit claim -- 1 page frame per commit, ~30x less",
+        "WAL than stock with group commit -- at a 100 B record rather than",
+        "the 64 B payload wal_write_amp.sh used, which was exactly the size",
+        "where buffering always succeeded. Read `WAL B/commit stock/bf`."
+      ],
+      "workload": "insert=100",
+      "dataset": "v100",
+      "autocheckpoint": 0,
+      "seconds": 30,
+      "warmup_seconds": 8,
+      "axes": {
+        "group_commit": [
+          0,
+          32
+        ]
+      }
+    }
+  ]
+}

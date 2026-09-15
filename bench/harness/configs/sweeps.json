@@ -1,0 +1,83 @@
+{
+  "name": "sweeps",
+  "_comment": [
+    "Opt-in tuning and ablation sweeps, separate from full.json because they",
+    "answer 'which part of our implementation earns the result' rather than",
+    "'does the fork beat stock'. Run after full.json has produced a headline",
+    "worth explaining -- roughly 1 h.",
+    "",
+    "  promotion      paper sweeps read_promotion_rate 1..100; ours defaults to",
+    "                 a low rate, and the right value is a measured choice",
+    "  ablation_read  which read-path feature carries the read result",
+    "  ablation_write which write-path feature carries the write result",
+    "  group_commit   the group size / durability trade-off in isolation",
+    "  cache_scaling  budget and cgroup cap scaled together, i.e. what happens",
+    "                 as the whole machine gets bigger rather than just the",
+    "                 engine's share of a fixed machine"
+  ],
+  "datasets": {
+    "big": { "records": 60000000, "value_len": 100, "key_spacing": 16 },
+    "v64": { "records": 4000000, "value_len": 64, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "big",
+    "suts": ["bf"],
+    "repeats": 3,
+    "seconds": 20,
+    "warmup_seconds": 5,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "256M",
+    "memmax": "1G",
+    "bf_page_cache_floor": "8M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "scan_len": 32,
+    "drop_cache": true
+  },
+  "experiments": [
+    {
+      "name": "promotion",
+      "workload": "read=100",
+      "axes": { "promotion": [1, 5, 10, 30, 60, 100] }
+    },
+    {
+      "name": "ablation_read",
+      "workload": "read=100",
+      "suts": ["bf", "bf_ro", "bf_noshortcut", "bf_off", "stock"]
+    },
+    {
+      "name": "ablation_scan",
+      "workload": "scan=100",
+      "suts": ["bf", "bf_nomerge", "bf_off", "stock"]
+    },
+    {
+      "name": "ablation_write",
+      "workload": "read=50,update=50",
+      "suts": ["bf", "bf_nowbdel", "bf_nocompact", "bf_ro", "stock"]
+    },
+    {
+      "name": "group_commit",
+      "workload": "insert=100",
+      "dataset": "v64",
+      "autocheckpoint": 0,
+      "seconds": 15,
+      "suts": ["bf", "stock"],
+      "axes": { "group_commit": [0, 2, 8, 32, 128] }
+    },
+    {
+      "name": "cache_scaling",
+      "workload": "read=100",
+      "suts": ["bf", "stock"],
+      "axes": {
+        "scale": [
+          { "label": "cap512M", "memmax": "512M", "budget_bytes": "128M" },
+          { "label": "cap1G",   "memmax": "1G",   "budget_bytes": "256M" },
+          { "label": "cap2G",   "memmax": "2G",   "budget_bytes": "512M" },
+          { "label": "cap4G",   "memmax": "4G",   "budget_bytes": "1G" }
+        ]
+      }
+    }
+  ]
+}

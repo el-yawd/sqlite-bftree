@@ -1,0 +1,20 @@
+{
+  "name": "promo_check",
+  "_comment": ["Does read-path promotion help or hurt on a larger-than-memory",
+               "read workload? Repeats + median + spread, because single runs",
+               "of this workload disagreed by 5x."],
+  "datasets": { "big": { "records": 60000000, "value_len": 100, "key_spacing": 16 } },
+  "defaults": {
+    "dataset": "big", "suts": ["bf"], "repeats": 3,
+    "seconds": 20, "warmup_seconds": 5,
+    "dist": "zipf", "theta": 0.9,
+    "budget_bytes": "256M", "memmax": "1G", "bf_page_cache_floor": "8M",
+    "synchronous": "normal", "journal": "wal", "ops_per_txn": 1,
+    "drop_cache": true
+  },
+  "experiments": [
+    { "name": "promotion", "workload": "read=100",
+      "axes": { "promotion": [0, 5, 100] } },
+    { "name": "baseline", "workload": "read=100", "suts": ["stock"] }
+  ]
+}
