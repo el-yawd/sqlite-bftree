@@ -269,6 +269,70 @@ void sqlite3BfDirtyListAdd(BfCache *pCache, u32 pgno){
   pCache->aDirtyPg[pCache->nDirtyPg++] = pgno;
 }
 
+/*
+** The unlogged-page list.  Same shape and same contract as the dirty list
+** above, answering the other question: which pages did THIS transaction dirty?
+**
+** The dirty list cannot answer it.  A mini-page stays dirty until its records
+** reach the base page, so the dirty list holds every mini-page written since
+** the last flush, and a commit that logged only one row still walked all of
+** them -- measured at 24.9% of cycles on a one-row-per-transaction insert
+** workload, and quadratic over a run.  Entries here are dropped as soon as the
+** page has nothing unlogged left, which for a normal commit is immediately.
+*/
+void sqlite3BfUnlogListAdd(BfCache *pCache, u32 pgno){
+  if( pCache->bUnlogOverflow ) return;
+  if( pCache->nUnlogPg >= pCache->nUnlogPgAlloc ){
+    int nNew = pCache->nUnlogPgAlloc ? pCache->nUnlogPgAlloc*2 : 64;
+    u32 *aNew = (u32*)sqlite3_realloc(pCache->aUnlogPg,
+                                      nNew*(int)sizeof(u32));
+    if( aNew==0 ){
+      pCache->bUnlogOverflow = 1;   /* commit reverts to the dirty list */
+      return;
+    }
+    pCache->aUnlogPg = aNew;
+    pCache->nUnlogPgAlloc = nNew;
+  }
+  pCache->aUnlogPg[pCache->nUnlogPg++] = pgno;
+}
+
+int sqlite3BfUnlogListIterate(BfCache *pCache,
+    int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx){
+  int i = 0;
+#ifdef SQLITE_BF_NO_UNLOGLIST
+  return 1;                      /* ablation: force the dirty-list walk */
+#endif
+  if( pCache->bUnlogOverflow ) return 1;   /* caller falls back */
+  while( i < pCache->nUnlogPg ){
+    u32 pgno = pCache->aUnlogPg[i];
+    BfMapEntry *pEntry = sqlite3BfMapLookup(pCache, pgno);
+    BfMiniPage *pMini = 0;
+    if( pEntry && pEntry->locType==BF_LOC_MINI ){
+      pMini = (BfMiniPage*)pEntry->pPage;
+    }
+    if( pMini==0 || (pMini->flags & BF_MINI_F_UNLOGGED)==0 ){
+      /* Gone, or everything on it is logged.  Drop it; order is irrelevant. */
+      pCache->aUnlogPg[i] = pCache->aUnlogPg[--pCache->nUnlogPg];
+      continue;
+    }
+    if( xCallback(pCtx, pgno, pEntry) ) return 0;
+    /* Re-test rather than assume the callback got through the whole page: a
+    ** gather that stopped early (out of space, I/O error) must keep the entry,
+    ** or its records would never be logged. */
+    if( (pMini->flags & BF_MINI_F_UNLOGGED)==0 ){
+      pCache->aUnlogPg[i] = pCache->aUnlogPg[--pCache->nUnlogPg];
+      continue;
+    }
+    i++;
+  }
+  return 0;
+}
+
+void sqlite3BfUnlogListReset(BfCache *pCache){
+  pCache->nUnlogPg = 0;
+  pCache->bUnlogOverflow = 0;
+}
+
 int sqlite3BfDirtyListIterate(BfCache *pCache,
     int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx){
   int i = 0;

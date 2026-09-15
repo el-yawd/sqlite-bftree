@@ -207,6 +207,18 @@ struct BfKVMeta {
 ** right then (rewriting the page mid-iteration loses dirty records).  The
 ** flush drops them when it finishes. */
 #define BF_MINI_F_STALE  0x0002
+/* BF_MINI_F_UNLOGGED is the same kind of conservative hint as BF_MINI_F_DIRTY,
+** for the other question a commit asks: does this mini-page hold a dirty record
+** that is not in the WAL yet?  Set wherever a fresh mutation lands (which is
+** exactly where BF_KV_SET_LOGGED(...,0) is written), cleared by the commit-time
+** gather once it has walked the whole page.  Flag clear => nothing to log.
+**
+** It exists so a commit can visit the pages THIS transaction touched instead of
+** every dirty mini-page in the cache.  The dirty list cannot answer that: a
+** mini-page stays dirty until it is flushed to its base page, so with one row
+** per transaction the commit-time walk grew with the whole accumulated dirty
+** set -- 24.9% of cycles on an insert workload, and O(N^2) over N commits. */
+#define BF_MINI_F_UNLOGGED 0x0004
 
 struct BfMiniPage {
   u16 nodeSize;             /* Total size of this mini-page */
@@ -324,6 +336,16 @@ struct BfCache {
   int nDirtyPg;             /* entries in use */
   int nDirtyPgAlloc;        /* allocated slots */
   int bDirtyListOverflow;   /* 1 => list unusable, fall back to full walk */
+
+  /* Pages holding dirty-but-unlogged records, i.e. what THIS transaction has
+  ** to log at commit.  Same conservative contract as aDirtyPg above: entries
+  ** may be stale or duplicated (revisiting a page whose records are all logged
+  ** is a no-op), and on allocation failure bUnlogOverflow falls the commit back
+  ** to the dirty list, which in turn falls back to the full map walk. */
+  u32 *aUnlogPg;            /* pgnos that may have unlogged dirty records */
+  int nUnlogPg;             /* entries in use */
+  int nUnlogPgAlloc;        /* allocated slots */
+  int bUnlogOverflow;       /* 1 => list unusable, fall back to aDirtyPg */
 
   /* Group commit (Phase 2): the open cross-transaction record batch, or NULL.
   ** Opaque here (BfGroup lives in bf_btree.c); freed by
@@ -583,6 +605,13 @@ SQLITE_PRIVATE int sqlite3BfBtreeCanMergeScan(BtCursor *pCur);
 SQLITE_PRIVATE void sqlite3BfDirtyListAdd(BfCache *pCache, u32 pgno);
 /* Iterate only the mini-pages that may be dirty, dropping stale entries.
 ** Returns 1 if the caller must fall back to sqlite3BfMapIterate (overflow). */
+/* The unlogged-page list: add a pgno, walk it (returns non-zero if the caller
+** must fall back to the dirty list), and drop every entry.  See BfCache. */
+SQLITE_PRIVATE void sqlite3BfUnlogListAdd(BfCache *pCache, u32 pgno);
+SQLITE_PRIVATE int sqlite3BfUnlogListIterate(BfCache *pCache,
+    int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx);
+SQLITE_PRIVATE void sqlite3BfUnlogListReset(BfCache *pCache);
+
 SQLITE_PRIVATE int sqlite3BfDirtyListIterate(BfCache *pCache,
     int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx);
 #if defined(SQLITE_BF_INSERT_BUFFERING)

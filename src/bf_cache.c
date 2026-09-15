@@ -103,6 +103,7 @@ struct BfCacheInt {
   /* Hash table for page lookup */
   BfPage **apHash;               /* Hash table */
   int nHash;                     /* Hash table size */
+  unsigned int iMaxKey;          /* Largest pgno currently in apHash */
 
   /* LRU list for unpinned pages */
   BfPage lru;                    /* LRU list anchor */
@@ -321,6 +322,7 @@ static void bfCacheAddToHash(BfCacheInt *pCache, BfPage *pPage){
   int h = pPage->pgno % pCache->nHash;
   pPage->pNext = pCache->apHash[h];
   pCache->apHash[h] = pPage;
+  if( pPage->pgno > pCache->iMaxKey ) pCache->iMaxKey = pPage->pgno;
 }
 
 /*
@@ -531,24 +533,59 @@ static void bfCacheRekey(
   hNew = iNew % pCache->nHash;
   pPage->pNext = pCache->apHash[hNew];
   pCache->apHash[hNew] = pPage;
+  if( iNew > pCache->iMaxKey ) pCache->iMaxKey = iNew;
 }
 
 /*
-** Truncate the cache - remove all pages with pgno > iLimit.
+** Truncate the cache - remove all pages with pgno >= iLimit.
+**
+** pager_end_transaction() calls xTruncate on EVERY commit, so the cost of this
+** function is paid once per transaction whether or not the database actually
+** shrank.  Sweeping the whole hash table here was measured at 50% of all
+** cycles on an insert workload, and it made throughput fall 24x as the page
+** cache grew from 8 MiB to 128 MiB (36,153 -> 1,512 ops/s with the database on
+** tmpfs, i.e. with I/O removed); stock does not have that shape.
+**
+** So do what pcache1TruncateUnsafe() does upstream, for the same reason:
+**
+**   - if iLimit is above every page we hold, there is nothing to remove;
+**   - if we are only shaving the last few pages off the end, visit just the
+**     buckets that can hold a pgno in [iLimit, iMaxKey] -- at most
+**     (iMaxKey-iLimit+1) of them -- instead of all nHash;
+**   - only when many pages are being dropped is the full sweep worth it.
+**
+** iMaxKey is maintained by bfCacheAddToHash()/bfCacheRekey() and is an upper
+** bound, never an exact maximum: after a truncation it is lowered to
+** iLimit-1, and it is not raised again until a page above it is cached.  An
+** upper bound is all the range test needs, and being conservative here can
+** only cost an unnecessary full sweep, never a missed page.
 */
 static void bfCacheTruncate(sqlite3_pcache *p, unsigned int iLimit){
   BfCacheInt *pCache = (BfCacheInt*)p;
-  int i;
   BfPage *pPage, *pNext;
+  unsigned int h, iStop;
 
-  for(i = 0; i < pCache->nHash; i++){
-    for(pPage = pCache->apHash[i]; pPage; pPage = pNext){
+  if( pCache->nHash==0 ) return;
+  if( iLimit > pCache->iMaxKey ) return;      /* nothing at or above iLimit */
+
+  if( (unsigned int)(pCache->iMaxKey - iLimit) < (unsigned int)pCache->nHash ){
+    h = iLimit % (unsigned int)pCache->nHash;
+    iStop = pCache->iMaxKey % (unsigned int)pCache->nHash;
+  }else{
+    h = 0;
+    iStop = (unsigned int)pCache->nHash - 1;
+  }
+  for(;;){
+    for(pPage = pCache->apHash[h]; pPage; pPage = pNext){
       pNext = pPage->pNext;
       if( pPage->pgno >= iLimit ){
         bfCacheRemoveFromHash(pCache, pPage, 1);
       }
     }
+    if( h==iStop ) break;
+    h = (h + 1) % (unsigned int)pCache->nHash;
   }
+  pCache->iMaxKey = iLimit ? iLimit - 1 : 0;
 }
 
 /*
@@ -572,6 +609,11 @@ static void bfCacheDestroy(sqlite3_pcache *p){
   pCache->base.aDirtyPg = 0;
   pCache->base.nDirtyPg = 0;
   pCache->base.nDirtyPgAlloc = 0;
+  sqlite3_free(pCache->base.aUnlogPg);
+  pCache->base.aUnlogPg = 0;
+  pCache->base.nUnlogPg = 0;
+  pCache->base.nUnlogPgAlloc = 0;
+  pCache->base.bUnlogOverflow = 0;
 #if defined(SQLITE_BF_INSERT_BUFFERING)
   /* Release the group-commit batch.  Anything still in it is DIRTY in its
   ** mini-page, so the close-time flush has already materialised it to base. */
@@ -730,6 +772,7 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   BfMiniPage *pMini;
   int rc;
   int wasDirty;
+  int wasUnlogged;
   void *pNew;
   u32 newSize;
 
@@ -777,12 +820,16 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
 
   /* Try to insert into mini-page */
   wasDirty = (pMini->flags & BF_MINI_F_DIRTY)!=0;
+  wasUnlogged = (pMini->flags & BF_MINI_F_UNLOGGED)!=0;
   rc = sqlite3BfMiniPageInsert(pMini, pKey, nKey, pVal, nVal, opType);
 
   if( rc == BF_OK ){
     pCache->nDirty++;
     if( !wasDirty && (pMini->flags & BF_MINI_F_DIRTY)!=0 ){
       sqlite3BfDirtyListAdd(pCache, pgno);   /* clean -> dirty transition */
+    }
+    if( !wasUnlogged && (pMini->flags & BF_MINI_F_UNLOGGED)!=0 ){
+      sqlite3BfUnlogListAdd(pCache, pgno);   /* now has something to log */
     }
     return BF_OK;
   }
@@ -821,6 +868,9 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
         if( !wasDirty && (pMini->flags & BF_MINI_F_DIRTY)!=0 ){
           sqlite3BfDirtyListAdd(pCache, pgno);
         }
+        if( !wasUnlogged && (pMini->flags & BF_MINI_F_UNLOGGED)!=0 ){
+          sqlite3BfUnlogListAdd(pCache, pgno);
+        }
         return BF_OK;
       }
     }
@@ -854,6 +904,9 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
             pCache->nDirty++;
             if( !wasDirty && (pMini->flags & BF_MINI_F_DIRTY)!=0 ){
               sqlite3BfDirtyListAdd(pCache, pgno);
+            }
+            if( !wasUnlogged && (pMini->flags & BF_MINI_F_UNLOGGED)!=0 ){
+              sqlite3BfUnlogListAdd(pCache, pgno);
             }
             return BF_OK;
           }

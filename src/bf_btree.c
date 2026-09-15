@@ -512,9 +512,14 @@ static int bfLogAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
     rec.nVal = (op==BFOP_DELETE) ? 0 : (u32)nVal;
     rec.pVal = (op==BFOP_DELETE) ? 0 : pVal;
     bfLogAppendRec(ctx, &rec);
-    if( ctx->rc!=SQLITE_OK ) return 0;
+    if( ctx->rc!=SQLITE_OK ) return 0;               /* stop: flag stays set */
     sqlite3BfMiniPageMarkLoggedAt(pMini, i);         /* safe: see header note */
   }
+  /* The loop ran to the end, so every dirty record on this page is now in a
+  ** record batch.  Only here is it safe to clear the hint -- an early return
+  ** above leaves it set, which keeps the page on the unlogged list and gets it
+  ** retried on the next commit rather than silently dropped. */
+  pMini->flags &= ~BF_MINI_F_UNLOGGED;
   return 0;
 }
 
@@ -547,8 +552,15 @@ int sqlite3BfBtreeLogAllDirty(Btree *p){
   ctx.pGroup = g;
   ctx.rc     = SQLITE_OK;
 
-  if( sqlite3BfDirtyListIterate(pBf, bfLogAllCallback, &ctx) ){
-    sqlite3BfMapIterate(pBf, bfLogAllCallback, &ctx);     /* list overflowed */
+  /* Three tiers, narrowest first.  The unlogged list holds what THIS
+  ** transaction dirtied; the dirty list holds every mini-page not yet in its
+  ** base page (which a one-row commit has no business walking -- it was 24.9%
+  ** of cycles and quadratic over a run); the map walk is the last resort.
+  ** Each tier falls through only when its list could not be allocated. */
+  if( sqlite3BfUnlogListIterate(pBf, bfLogAllCallback, &ctx) ){
+    if( sqlite3BfDirtyListIterate(pBf, bfLogAllCallback, &ctx) ){
+      sqlite3BfMapIterate(pBf, bfLogAllCallback, &ctx);   /* both overflowed */
+    }
   }
   if( ctx.rc!=SQLITE_OK ) return ctx.rc;
 
@@ -709,6 +721,7 @@ int sqlite3BfBtreeResizeCache(Btree *p, u64 newCapacity){
   ** ring we are about to free. */
   sqlite3BfMapIterate(pBf, bfClearOneEntry, NULL);
   pBf->bDirtyInserts = 0;
+  sqlite3BfUnlogListReset(pBf);       /* same reason as the mappings above */
   sqlite3BfCircularBufferDestroy(&pBf->cb);
   return sqlite3BfCircularBufferInit(&pBf->cb, newCapacity);
 }
@@ -720,6 +733,7 @@ void sqlite3BfBtreeClearCache(Btree *p){
   if( !pBf ) return;
   sqlite3BfMapIterate(pBf, bfClearOneEntry, NULL);
   pBf->bDirtyInserts = 0;  /* rolled-back inserts discarded */
+  sqlite3BfUnlogListReset(pBf);   /* the pages it named no longer exist */
 }
 
 /* -------------------------------------------------------------------------

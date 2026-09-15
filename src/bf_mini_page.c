@@ -295,7 +295,7 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
       BF_KV_SET_OP_TYPE(pNewMeta, opType);
       BF_KV_SET_REF(pNewMeta, 1);
       if( opType==BFOP_INSERT || opType==BFOP_DELETE ){
-        pMini->flags |= BF_MINI_F_DIRTY;
+        pMini->flags |= BF_MINI_F_DIRTY | BF_MINI_F_UNLOGGED;
       }
       BF_KV_SET_LOGGED(pNewMeta, 0);  /* fresh mutation: not yet in the WAL */
       return BF_OK;
@@ -388,7 +388,7 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
   BF_KV_SET_REF(pNewMeta, 1);
   BF_KV_SET_LOGGED(pNewMeta, 0);  /* brand-new record: not yet in the WAL */
   if( opType==BFOP_INSERT || opType==BFOP_DELETE ){
-    pMini->flags |= BF_MINI_F_DIRTY;
+    pMini->flags |= BF_MINI_F_DIRTY | BF_MINI_F_UNLOGGED;
   }
 
   /* Set preview bytes */
@@ -540,7 +540,10 @@ void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini){
   int i;
   u8 opType;
 
-  pMini->flags &= ~BF_MINI_F_DIRTY;   /* every dirty record becomes clean below */
+  /* Every dirty record becomes clean below, so neither hint applies any more:
+  ** the records are in the base page, which is what the WAL would have been
+  ** protecting them for. */
+  pMini->flags &= ~(BF_MINI_F_DIRTY | BF_MINI_F_UNLOGGED);
 
   for(i = 0; i < pMini->metaCount; i++){
     opType = BF_KV_OP_TYPE(&aMeta[i]);
@@ -793,6 +796,34 @@ int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
 
     int rc = sqlite3BfMiniPageInsert(pDst, pKey, nKey, pVal, nVal, opType);
     if( rc != BF_OK ) return rc;
+
+    /* Carry the WAL-logged bit across.  Insert clears it, because from its
+    ** point of view every record it writes is a fresh mutation -- but this one
+    ** is a copy of a record that may already be in the WAL, and re-clearing it
+    ** makes the next commit log it a second time.  Every size upgrade and every
+    ** compaction goes through here, so on a workload that upgrades (which is
+    ** any workload with rows past the smallest size class) that is a standing
+    ** source of WAL write amplification. */
+    if( BF_KV_IS_LOGGED(&aSrcMeta[i]) ){
+      int found = 0;
+      int idx = bfBinarySearch(pDst, pKey, nKey, &found);
+      if( found ) sqlite3BfMiniPageMarkLoggedAt(pDst, idx);
+    }
+  }
+
+  /* Re-derive the page-level hint: a copy holds unlogged records only if one of
+  ** the records it actually copied is unlogged. */
+  {
+    BfKVMeta *aDstMeta = bfMiniPageMeta(pDst);
+    int j, n = pDst->metaCount;
+    pDst->flags &= ~BF_MINI_F_UNLOGGED;
+    for(j=0; j<n; j++){
+      u8 op = BF_KV_OP_TYPE(&aDstMeta[j]);
+      if( (op==BFOP_INSERT || op==BFOP_DELETE) && !BF_KV_IS_LOGGED(&aDstMeta[j]) ){
+        pDst->flags |= BF_MINI_F_UNLOGGED;
+        break;
+      }
+    }
   }
 
   return BF_OK;
