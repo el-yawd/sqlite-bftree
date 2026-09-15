@@ -191,7 +191,10 @@
             "dataset": "v200"
           }
         ]
-      }
+      },
+      "_why": [
+        "autocheckpoint stays pinned to 0: this experiment measures WAL emission itself (what share of inserts stay buffered / the record-WAL trade-off), and a mid-run checkpoint materialises records and muddies exactly that."
+      ]
     },
     {
       "name": "update",
@@ -206,9 +209,11 @@
       ],
       "workload": "update=100",
       "dataset": "v100",
-      "autocheckpoint": 0,
       "seconds": 30,
-      "warmup_seconds": 8
+      "warmup_seconds": 8,
+      "_why": [
+        "autocheckpoint is no longer pinned to 0 here.  This experiment compares against stock, and stock checkpoints every 1000 frames; pinning BF to 0 compared a growing WAL against a checkpointed one.  Both engines now run the same policy."
+      ]
     },
     {
       "name": "write_amp",
@@ -220,15 +225,17 @@
       ],
       "workload": "insert=100",
       "dataset": "v100",
-      "autocheckpoint": 0,
       "seconds": 30,
       "warmup_seconds": 8,
       "axes": {
-        "group_commit": [
+        "autocheckpoint": [
           0,
-          32
+          1000
         ]
-      }
+      },
+      "_why": [
+        "Bytes on disk per commit means two different things now, so measure both: at 0 it is the WAL bytes a commit emits (the record-granular WAL claim), at 1000 it also includes the materialisation those records eventually cause.  Reporting only one of them would be picking the flattering half."
+      ]
     }
   ]
 }

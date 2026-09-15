@@ -33,15 +33,38 @@
     "  overhead       bf_off vs stock: cost of the fork with the feature off"
   ],
   "datasets": {
-    "big": { "records": 60000000, "value_len": 100, "key_spacing": 16 },
-    "v32":  { "records": 4000000, "value_len": 32,  "key_spacing": 16 },
-    "v64":  { "records": 4000000, "value_len": 64,  "key_spacing": 16 },
-    "v100": { "records": 4000000, "value_len": 100, "key_spacing": 16 },
-    "v200": { "records": 4000000, "value_len": 200, "key_spacing": 16 }
+    "big": {
+      "records": 60000000,
+      "value_len": 100,
+      "key_spacing": 16
+    },
+    "v32": {
+      "records": 4000000,
+      "value_len": 32,
+      "key_spacing": 16
+    },
+    "v64": {
+      "records": 4000000,
+      "value_len": 64,
+      "key_spacing": 16
+    },
+    "v100": {
+      "records": 4000000,
+      "value_len": 100,
+      "key_spacing": 16
+    },
+    "v200": {
+      "records": 4000000,
+      "value_len": 200,
+      "key_spacing": 16
+    }
   },
   "defaults": {
     "dataset": "big",
-    "suts": ["stock", "bf"],
+    "suts": [
+      "stock",
+      "bf"
+    ],
     "repeats": 5,
     "seconds": 20,
     "warmup_seconds": 5,
@@ -70,7 +93,14 @@
       ],
       "workload": "read=100",
       "memmax": "auto",
-      "axes": { "budget_bytes": ["64M", "128M", "256M", "512M"] }
+      "axes": {
+        "budget_bytes": [
+          "64M",
+          "128M",
+          "256M",
+          "512M"
+        ]
+      }
     },
     {
       "name": "page_cache_floor",
@@ -91,7 +121,12 @@
       "workload": "read=100",
       "memmax": "auto",
       "axes": {
-        "bf_page_cache_floor": ["8M", "32M", "64M", "128M"]
+        "bf_page_cache_floor": [
+          "8M",
+          "32M",
+          "64M",
+          "128M"
+        ]
       }
     },
     {
@@ -99,17 +134,38 @@
       "workload": "read=100",
       "axes": {
         "skew": [
-          { "label": "uniform",   "dist": "uniform" },
-          { "label": "zipf0.6",   "dist": "zipf", "theta": 0.6 },
-          { "label": "zipf0.9",   "dist": "zipf", "theta": 0.9 },
-          { "label": "zipf0.99",  "dist": "zipf", "theta": 0.99 }
+          {
+            "label": "uniform",
+            "dist": "uniform"
+          },
+          {
+            "label": "zipf0.6",
+            "dist": "zipf",
+            "theta": 0.6
+          },
+          {
+            "label": "zipf0.9",
+            "dist": "zipf",
+            "theta": 0.9
+          },
+          {
+            "label": "zipf0.99",
+            "dist": "zipf",
+            "theta": 0.99
+          }
         ]
       }
     },
     {
       "name": "scan",
       "workload": "scan=100",
-      "axes": { "scan_len": [8, 32, 128] }
+      "axes": {
+        "scan_len": [
+          8,
+          32,
+          128
+        ]
+      }
     },
     {
       "name": "negative_read",
@@ -133,40 +189,96 @@
       "warmup_seconds": 8,
       "axes": {
         "mix": [
-          { "label": "r100u0",  "workload": "read=100" },
-          { "label": "r80u20",  "workload": "read=80,update=20" },
-          { "label": "r50u50",  "workload": "read=50,update=50" },
-          { "label": "r20u80",  "workload": "read=20,update=80" },
-          { "label": "r0u100",  "workload": "update=100" }
+          {
+            "label": "r100u0",
+            "workload": "read=100"
+          },
+          {
+            "label": "r80u20",
+            "workload": "read=80,update=20"
+          },
+          {
+            "label": "r50u50",
+            "workload": "read=50,update=50"
+          },
+          {
+            "label": "r20u80",
+            "workload": "read=20,update=80"
+          },
+          {
+            "label": "r0u100",
+            "workload": "update=100"
+          }
         ]
       }
     },
-    { "name": "ycsb_a", "workload": "read=50,update=50" },
-    { "name": "ycsb_b", "workload": "read=95,update=5" },
-    { "name": "ycsb_d", "workload": "read=95,insert=5", "dist": "latest",
-      "seconds": 30, "warmup_seconds": 8 },
-    { "name": "ycsb_e", "workload": "scan=95,insert=5" },
-    { "name": "ycsb_f", "workload": "read=50,rmw=50" },
+    {
+      "name": "ycsb_a",
+      "workload": "read=50,update=50"
+    },
+    {
+      "name": "ycsb_b",
+      "workload": "read=95,update=5"
+    },
+    {
+      "name": "ycsb_d",
+      "workload": "read=95,insert=5",
+      "dist": "latest",
+      "seconds": 30,
+      "warmup_seconds": 8
+    },
+    {
+      "name": "ycsb_e",
+      "workload": "scan=95,insert=5"
+    },
+    {
+      "name": "ycsb_f",
+      "workload": "read=50,rmw=50"
+    },
     {
       "name": "durability_bf",
       "seconds": 30,
       "warmup_seconds": 8,
       "workload": "update=100",
-      "suts": ["bf"],
+      "suts": [
+        "bf"
+      ],
       "autocheckpoint": 0,
       "axes": {
-        "synchronous": ["off", "normal", "full"],
-        "group_commit": [0, 8, 32]
-      }
+        "synchronous": [
+          "off",
+          "normal",
+          "full"
+        ],
+        "group_commit": [
+          0,
+          8,
+          32
+        ]
+      },
+      "_why": [
+        "autocheckpoint stays pinned to 0: this experiment measures WAL emission itself (what share of inserts stay buffered / the record-WAL trade-off), and a mid-run checkpoint materialises records and muddies exactly that."
+      ]
     },
     {
       "name": "durability_stock",
       "seconds": 30,
       "warmup_seconds": 8,
       "workload": "update=100",
-      "suts": ["stock"],
+      "suts": [
+        "stock"
+      ],
       "autocheckpoint": 0,
-      "axes": { "synchronous": ["off", "normal", "full"] }
+      "axes": {
+        "synchronous": [
+          "off",
+          "normal",
+          "full"
+        ]
+      },
+      "_why": [
+        "autocheckpoint stays pinned to 0: this experiment measures WAL emission itself (what share of inserts stay buffered / the record-WAL trade-off), and a mid-run checkpoint materialises records and muddies exactly that."
+      ]
     },
     {
       "name": "record_size",
@@ -176,7 +288,8 @@
         "old wal_write_amp.sh used 64-byte payloads, i.e. exactly the size where",
         "buffering always succeeds. This makes record size a measured axis",
         "instead of a hidden assumption. Needs its own datasets: value_len is a",
-        "property of the loaded table, not of the run."
+        "property of the loaded table, not of the run.",
+        "autocheckpoint stays pinned to 0: this experiment measures WAL emission itself (what share of inserts stay buffered / the record-WAL trade-off), and a mid-run checkpoint materialises records and muddies exactly that."
       ],
       "workload": "insert=100",
       "autocheckpoint": 0,
@@ -184,25 +297,48 @@
       "warmup_seconds": 8,
       "axes": {
         "record_size": [
-          { "label": "v32",  "dataset": "v32" },
-          { "label": "v64",  "dataset": "v64" },
-          { "label": "v100", "dataset": "v100" },
-          { "label": "v200", "dataset": "v200" }
+          {
+            "label": "v32",
+            "dataset": "v32"
+          },
+          {
+            "label": "v64",
+            "dataset": "v64"
+          },
+          {
+            "label": "v100",
+            "dataset": "v100"
+          },
+          {
+            "label": "v200",
+            "dataset": "v200"
+          }
         ]
       }
     },
     {
       "name": "write_amp",
       "workload": "insert=100",
-      "autocheckpoint": 0,
       "seconds": 30,
       "warmup_seconds": 8,
-      "repeats": 7
+      "repeats": 7,
+      "axes": {
+        "autocheckpoint": [
+          0,
+          1000
+        ]
+      },
+      "_why": [
+        "Bytes on disk per commit means two different things now, so measure both: at 0 it is the WAL bytes a commit emits (the record-granular WAL claim), at 1000 it also includes the materialisation those records eventually cause.  Reporting only one of them would be picking the flattering half."
+      ]
     },
     {
       "name": "overhead",
       "workload": "read=100",
-      "suts": ["stock", "bf_off"]
+      "suts": [
+        "stock",
+        "bf_off"
+      ]
     }
   ]
 }

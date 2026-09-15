@@ -3693,26 +3693,26 @@ static int openDatabase(
   sqlite3_wal_autocheckpoint(db, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT);
 
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
-  /* Phase 2 (WAL) v1 durability: disable auto-checkpoint and persist the WAL
-  ** across close, so recovery replay restores buffered records on reopen.
-  ** Known v1 limitation: the WAL grows until an explicit checkpoint, and that
-  ** is expensive -- walFindFrame was 21% of an insert profile, and BF runs this
-  ** way against a stock build that checkpoints every 1000 frames.
+  /* Phase 2 (WAL) durability: PERSIST_WAL so the WAL survives close and recovery
+  ** replay can restore records a crash caught between commit and
+  ** materialisation.
   **
-  ** It cannot simply be re-enabled, and the reason is NOT the one this comment
-  ** used to give (that the hook copies page images without materialising record
-  ** frames -- it does reach bfCheckpointMaterialize, via sqlite3BtreeCheckpoint).
-  ** The reason is that a mid-session checkpoint is itself broken: after one, the
-  ** next INSERT on a table whose materialisation split a leaf fails with
-  ** SQLITE_CORRUPT, while the database on disk stays perfectly consistent (it
-  ** reopens clean, integrity_check passes, reads return correct data).  It
-  ** reproduces with a plain PRAGMA wal_checkpoint, needs more than one leaf
-  ** (400 rows fine, 800 not), is specific to the BF cache (PRAGMA bf_cache=off
-  ** makes it go away), and predates this work (reproduced on b2ed3c8).
-  ** Deferring the checkpoint out of the commit path does not help, so it is not
-  ** a re-entrancy problem either.  Fix that first; the WAL growth is a symptom
-  ** of working around it. */
-  sqlite3_wal_autocheckpoint(db, 0);
+  ** Auto-checkpoint is deliberately LEFT AT SQLite's default (installed just
+  ** above).  It used to be forced off here, which left the WAL growing for the
+  ** life of the connection -- walFindFrame reached 21% of an insert profile, and
+  ** BF was benchmarked that way against a stock build that checkpoints every
+  ** 1000 frames.  Two reasons were given for the force, and both were wrong:
+  ** the hook does reach bfCheckpointMaterialize (via sqlite3BtreeCheckpoint),
+  ** and it is not a re-entrancy problem (deferring it out of the commit path
+  ** reproduced the failure identically).  The actual blocker was the wal-index
+  ** bug fixed in 672ca28; a checkpoint is safe now, and bench/ckpt_repro.sh
+  ** plus a checkpoint op in gen_stress.py keep it that way.
+  **
+  ** The trade this makes, measured: write-heavy workloads gain 1.5-2x, and a
+  ** checkpoint materialises buffered records into base pages, so inserts go from
+  ** 1.00 to 2.58 page frames per commit and write ~5x more bytes.  The
+  ** record-granular WAL claim is about what a COMMIT emits, which is unchanged;
+  ** it is no longer also a claim about total bytes on disk. */
   { int bfPersist = 1;
     sqlite3_file_control(db, "main", SQLITE_FCNTL_PERSIST_WAL, &bfPersist); }
 #endif
