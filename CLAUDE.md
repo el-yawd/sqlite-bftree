@@ -44,9 +44,28 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
   - Measured: **1 page frame per commit** (the WAL-format commit frame — zero base-page
     writes), and with `bf_group_commit=32` about **30x less WAL than stock** on
     single-row commits.  Counters live in `PRAGMA bf_cache_stats`.
-- **Phase 3 NEXT**: the read-side benchmark harness — dataset >> RAM (cgroup cap or
-  O_DIRECT VFS), Zipf-skewed point reads, BF sized well below the dataset, I/O counts
-  reported next to latency.  That is where the paper's central claim gets tested.
+- **Phase 3 IN PROGRESS**: the measurement campaign.  `bench/harness/` is the
+  proper benchmark — a C driver linked against the amalgamation (prepared
+  statements, per-op latency histograms, `/proc/self/io` block-layer bytes), a
+  matrix runner that enforces an equal memory budget and a cgroup cap, and a
+  report generator.  See `bench/harness/README.md` for the requirements it meets
+  and the workloads it runs.  **Not yet run at full scale** — the campaign
+  (`configs/full.json`, ~2-3 h) is the next thing to execute.
+  - Already surfaced by the smoke pass, and *not* yet explained:
+    - **Write-back insert refuses records above ~64-96 B** and falls back to the
+      base-page path (100% buffered at 64 B, 31% at 96 B, 14% at 200 B —
+      independent of `bf_cache_size` across a 16x range, so structural, not
+      capacity).  `wal_write_amp.sh` uses 64-byte payloads, i.e. exactly the
+      size where buffering always succeeds, so the "1 page frame/commit" claim
+      was only ever measured inside the good region.  `record_size` is now an
+      axis in `configs/full.json`.
+    - **UPDATE never buffers at all**: `wal_record_frames=0`,
+      `buffered_inserts=0` on a pure-update workload; it takes the page-image
+      path (still 1 frame/commit, so ~2x less WAL than stock, but none of the
+      record-granular win).
+    - **`negative_read` is ~4.5x SLOWER than stock** while reading 5x fewer
+      bytes from disk — a CPU-bound path, the opposite of the paper's §5.6
+      phantom-caching claim.
 
 ## Build & test
 ```bash
@@ -56,7 +75,19 @@ cc -O2 -DSQLITE_OMIT_BF_CACHE -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE \
 cd ../bench && sh stress.sh                                # differential oracle -> ALL CLEAN
 sh stress_buf.sh                                           # same, vs ../build/sqlite3_buf
 BF_GROUP=8 sh stress_buf.sh                                # ... with group commit on
+BF_PROMOTION=100 sh stress_buf.sh                          # ... with read promotion at max
 sh wal_write_amp.sh 5000 200 1                             # write-amplification report
+
+# Benchmark campaign (bench/harness/README.md documents the methodology)
+sh bench/harness/build_suts.sh --all                       # every SUT, one amalgamation
+python3 bench/harness/runner.py bench/harness/configs/smoke.json   # ~6 min sanity
+python3 bench/harness/runner.py bench/harness/configs/full.json    # ~2-3 h campaign
+python3 bench/harness/report.py bench/harness/results/full         # -> RESULTS.md
+
+# A/B of our own src/ changes: bf_pre = a second amalgamation built from REV
+sh bench/harness/build_suts.sh --pre HEAD                  # + bfbench_bf_pre
+python3 bench/harness/runner.py bench/harness/configs/fixes_smoke.json  # ~2 min
+python3 bench/harness/runner.py bench/harness/configs/fixes.json        # ~1.5 h
 ```
 Ablation switches (all default OFF, i.e. the feature is on): `SQLITE_BF_NO_MERGE_SCAN`,
 `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,

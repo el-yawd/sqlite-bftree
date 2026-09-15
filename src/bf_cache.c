@@ -152,17 +152,26 @@ static void bfCacheShutdown(void *pArg){
 }
 
 /*
-** Resize the hash table.
+** Grow the page hash table to nNew buckets (a power of two).
+**
+** The bucket count MUST track the page count.  It used to be fixed at 256 for
+** the life of the cache, which turned every xFetch into a linear walk of
+** nMax/256 pages: at a 256 MiB page cache (65536 pages) that is a 256-entry
+** chain per lookup, and measures as a ~13x slowdown against pcache1 on a
+** read-only workload.  pcache1 keeps roughly one bucket per page for the same
+** reason; bfCacheFetch now calls this whenever nPage reaches nHash.
 */
-static int bfCacheResizeHash(BfCacheInt *pCache){
+#define BF_MAX_HASH (1<<22)          /* 4M buckets; far above any real nMax */
+
+static int bfCacheResizeHash(BfCacheInt *pCache, int nNew){
   BfPage **apNew;
-  int nNew;
   int i;
   BfPage *pPage, *pNext;
 
-  nNew = pCache->nHash ? pCache->nHash * 2 : 256;
-  apNew = (BfPage**)sqlite3MallocZero(sizeof(BfPage*) * nNew);
-  if( !apNew ) return SQLITE_NOMEM;
+  assert( nNew>0 && (nNew & (nNew-1))==0 );
+  if( nNew<=pCache->nHash ) return SQLITE_OK;
+  apNew = (BfPage**)sqlite3MallocZero(sizeof(BfPage*) * (i64)nNew);
+  if( !apNew ) return SQLITE_NOMEM;   /* keep the old table; still correct */
 
   /* Rehash existing entries */
   for(i = 0; i < pCache->nHash; i++){
@@ -230,7 +239,7 @@ static sqlite3_pcache *bfCacheCreate(int szPage, int szExtra, int bPurgeable){
   }
 
   /* Initialize hash table */
-  rc = bfCacheResizeHash(pCache);
+  rc = bfCacheResizeHash(pCache, 256);
   if( rc != SQLITE_OK ){
     BF_ALLOC_TRACE("cache-create-fail", pCache, (int)sz);
     sqlite3BfCircularBufferDestroy(&pCache->base.cb);
@@ -380,7 +389,11 @@ static sqlite3_pcache_page *bfCacheFetch(
     if( pPage->pgno == iKey ){
       /* Found - pin it and return */
       pPage->nRef++;
-      pPage->pCache->nMiniPageHit++;
+      /* A page-cache hit, NOT a mini-page hit.  These used to share
+      ** nMiniPageHit, which made PRAGMA bf_cache_stats report the pcache hit
+      ** rate instead of the record-cache hit rate — a number that stayed flat
+      ** across an 8x sweep of bf_cache_size because it never depended on it. */
+      pPage->pCache->nPageFetchHit++;
       return (sqlite3_pcache_page*)bfCachePinPage(pPage);
     }
   }
@@ -446,7 +459,13 @@ static sqlite3_pcache_page *bfCacheFetch(
   pCache->nPage++;
   pCache->nPinned++;
 
-  pPage->pCache->nMiniPageMiss++;
+  /* Keep the chain length near 1.  Doubling is amortised O(1) and a failed
+  ** allocation simply leaves the smaller table in place. */
+  if( pCache->nPage >= pCache->nHash && pCache->nHash < BF_MAX_HASH ){
+    (void)bfCacheResizeHash(pCache, pCache->nHash * 2);
+  }
+
+  pPage->pCache->nPageFetchMiss++;
 
   return (sqlite3_pcache_page*)pPage;
 }
@@ -768,8 +787,12 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     return BF_OK;
   }
 
-  /* Mini-page full - try to upgrade to the next size class */
-  newSize = sqlite3BfMiniPageNextSizeClass(pMini, pCache->aSizeClass);
+  /* Mini-page full - upgrade to the smallest size class that actually FITS
+  ** this record alongside the live ones.  Stepping a single class up (the old
+  ** behaviour) left every record larger than 96 bytes unbufferable, because
+  ** one step from the 64-byte initial allocation reaches only 128. */
+  newSize = sqlite3BfMiniPageSizeClassFor(pMini, nKey, nVal,
+                                          pCache->aSizeClass);
   if( newSize > 0 && newSize <= BF_MAX_MINI_PAGE ){
     pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, newSize);
     if( pNew ){

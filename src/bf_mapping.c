@@ -360,4 +360,60 @@ int sqlite3BfMapFullPageCount(BfCache *pCache){
   return count;
 }
 
+
+/*
+** Space accounting for the mapping table and the mini-pages it points at.
+**
+** One walk, all five gauges, because they are only read by PRAGMA
+** bf_cache_stats at the end of a run and every one of them is needed to answer
+** the same question: what does the record cache actually COST per cached row?
+**
+** The mapping table is a sparse direct index -- a 256-entry batch of 24-byte
+** entries (6 KiB) is allocated the first time ANY page in that 256-page range
+** is touched.  Under a skewed-but-scattered read workload the hot pages spread
+** thinly over the whole file, so nearly every batch gets allocated to hold a
+** handful of live entries.  nBatches vs nEntries is what makes that visible:
+** nEntries/(nBatches*256) is the map's occupancy, and a low value means the
+** map is spending 6 KiB to remember one page.
+**
+** Any of the out pointers may be NULL.
+*/
+void sqlite3BfMapSpaceStats(
+  BfCache *pCache,
+  u64 *pnBatches,      /* Allocated 256-entry batches */
+  u64 *pnEntries,      /* Live (non-NULL) map entries */
+  u64 *pnMiniPages,    /* Live BF_LOC_MINI entries */
+  u64 *pnRecords,      /* Records held across all mini-pages */
+  u64 *pnMiniBytes,    /* Bytes of mini-page allocated (nodeSize sum) */
+  u64 *pnCapacity      /* Circular buffer capacity ACTUALLY in force */
+){
+  int batch, entry;
+  u64 nBatches = 0, nEntries = 0, nMini = 0, nRec = 0, nBytes = 0;
+
+  if( pCache ){
+    for(batch = 0; batch < pCache->nMapBatch; batch++){
+      if( !pCache->apMap[batch] ) continue;
+      nBatches++;
+      for(entry = 0; entry < BF_MAP_BATCH_SIZE; entry++){
+        BfMapEntry *pE = &pCache->apMap[batch][entry];
+        if( pE->locType == BF_LOC_NULL ) continue;
+        nEntries++;
+        if( pE->locType == BF_LOC_MINI && pE->pPage ){
+          BfMiniPage *pMini = (BfMiniPage*)pE->pPage;
+          nMini++;
+          nRec += pMini->metaCount;
+          nBytes += pMini->nodeSize;
+        }
+      }
+    }
+  }
+
+  if( pnCapacity )  *pnCapacity  = pCache ? pCache->cb.capacity : 0;
+  if( pnBatches )   *pnBatches   = nBatches;
+  if( pnEntries )   *pnEntries   = nEntries;
+  if( pnMiniPages ) *pnMiniPages = nMini;
+  if( pnRecords )   *pnRecords   = nRec;
+  if( pnMiniBytes ) *pnMiniBytes = nBytes;
+}
+
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */

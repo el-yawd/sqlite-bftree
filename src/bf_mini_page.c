@@ -189,12 +189,67 @@ int sqlite3BfMiniPageNeedsMerge(BfMiniPage *pMini){
 */
 u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass){
   int i;
-  for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+  /* Ascending: the SMALLEST class larger than the current node.
+  **
+  ** This loop used to run downward from BF_SIZE_CLASS_COUNT-1 and return the
+  ** first class greater than nodeSize -- which, since the largest class is
+  ** always greater, meant it returned BF_MAX_MINI_PAGE (4096) on the very
+  ** first iteration, every time.  Every mini-page that overflowed its 64-byte
+  ** initial allocation therefore jumped straight to 4096 bytes, so a ~110-byte
+  ** row occupied a 4 KiB mini-page: 37x space amplification, a ring that held
+  ** ~63k records instead of ~2M, and constant eviction churn.  The header
+  ** comment on BF_MIN_MINI_PAGE ("double until BF_MAX_MINI_PAGE") describes
+  ** the intent this now implements. */
+  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
     if( aSizeClass[i] > pMini->nodeSize ){
       return aSizeClass[i];
     }
   }
   return 0;  /* Already at maximum */
+}
+
+/*
+** The smallest size class that can hold this mini-page's LIVE records plus a
+** new record of nKey+nVal bytes.  Returns 0 if no class is large enough (or
+** the page is already at the largest that would help).
+**
+** Why this exists rather than repeated NextSizeClass steps: the caller
+** upgrades at most once per write, so a single "next class up" is not enough
+** when the record needs several steps.  From the 64-byte initial allocation
+** one step reaches 128, which holds a payload of at most
+** 128 - sizeof(BfMiniPage) - sizeof(BfKVMeta) = 96 bytes -- exactly the
+** measured cliff where write-back buffering started refusing records and
+** falling back to the base-page path.  Choosing the fitting class directly
+** makes one upgrade always sufficient.
+**
+** Live content is summed from the meta array rather than taken as
+** nodeSize-freeSpace: freeSpace excludes bytes stranded by fragmentation,
+** which would overstate the requirement.  The upgrade path copies through
+** sqlite3BfMiniPageCopy, which repacks, so the post-copy occupancy is exactly
+** this sum.
+*/
+u32 sqlite3BfMiniPageSizeClassFor(
+  BfMiniPage *pMini,
+  int nKey,
+  int nVal,
+  u32 *aSizeClass
+){
+  BfKVMeta *aMeta = bfMiniPageMeta(pMini);
+  u32 used = (u32)sizeof(BfMiniPage);
+  u32 needed;
+  int i;
+
+  for(i = 0; i < pMini->metaCount; i++){
+    used += bfRecordSpace(BF_KV_KEY_LEN(&aMeta[i]), BF_KV_VALUE_LEN(&aMeta[i]));
+  }
+  needed = used + bfRecordSpace(nKey, nVal);
+
+  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
+    if( aSizeClass[i] > pMini->nodeSize && aSizeClass[i] >= needed ){
+      return aSizeClass[i];
+    }
+  }
+  return 0;
 }
 
 /*

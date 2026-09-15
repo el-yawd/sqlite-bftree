@@ -219,6 +219,19 @@ void sqlite3PragmaBfCacheSize(
       u64 n = 1;
       while( n < (u64)nSize ) n *= 2;
       bfConfig.nBufferSize = n;
+
+      /* Apply it to the cache this connection already has.  Setting the global
+      ** alone is not enough: the cache is created during the schema load, long
+      ** before any BF pragma can run, so without this the new size would only
+      ** ever reach caches created later -- which, for the connection issuing
+      ** the pragma, means never.  See sqlite3BfBtreeResizeCache. */
+      {
+        sqlite3 *db = pParse->db;
+        int iDb = sqlite3FindDbName(db, zDb);
+        Btree *pBt = db->aDb[iDb>=0 ? iDb : 0].pBt;
+        extern int sqlite3BfBtreeResizeCache(Btree*, u64);
+        if( pBt ) (void)sqlite3BfBtreeResizeCache(pBt, n);
+      }
     }
   }
 }
@@ -277,6 +290,67 @@ void sqlite3PragmaBfCacheStats(
     sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "mini_page_misses", P4_STATIC);
     sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nMiss, P4_INT64);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+    {
+      /* The pcache2 layer, kept apart from the record counters above. */
+      u64 nPgHit = 0, nPgMiss = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreePageCacheStats(Btree*, u64*, u64*);
+        sqlite3BfBtreePageCacheStats(pBt, &nPgHit, &nPgMiss);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "page_cache_hits", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nPgHit, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "page_cache_misses", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                            (const u8*)&nPgMiss, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+
+    {
+      /* Space gauges: what the record cache costs, alongside what it saves.
+      ** map_batches x 256 x sizeof(BfMapEntry) is the mapping table's
+      ** footprint; comparing it to map_entries shows how much of that is
+      ** actually occupied.  cached_records / mini_page_bytes gives the real
+      ** bytes-per-cached-row, the number that decides whether a byte is better
+      ** spent here or left to the OS page cache. */
+      u64 nBatch=0, nEntry=0, nMini=0, nRec=0, nMiniB=0, nCap=0;
+      if( pBt ){
+        extern void sqlite3BfBtreeSpaceStats(Btree*, u64*, u64*, u64*,
+                                             u64*, u64*, u64*);
+        sqlite3BfBtreeSpaceStats(pBt, &nBatch, &nEntry, &nMini, &nRec, &nMiniB,
+                                 &nCap);
+      }
+      /* The capacity the ring is ACTUALLY running with, as opposed to
+      ** buffer_size above, which echoes the configured value.  They differ
+      ** whenever the cache was instantiated before the configuration was
+      ** applied, and only this one governs how much the cache can hold. */
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "cb_capacity", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nCap, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "map_batches", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nBatch, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "map_entries", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nEntry, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "live_mini_pages", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nMini, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "cached_records", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nRec, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "mini_page_bytes", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nMiniB, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
 
     sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "upgrades", P4_STATIC);
     sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nUpgrade, P4_INT64);

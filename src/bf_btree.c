@@ -672,6 +672,47 @@ static int bfClearOneEntry(void *pCtx, u32 pgno, BfMapEntry *pEntry){
 ** Stale BFOP_INSERT records from rolled-back transactions must not
 ** survive; discarding the entire cache for safety is correct.
 */
+/*
+** Apply a new circular-buffer capacity to a cache that already exists.
+**
+** PRAGMA bf_cache_size only wrote the global that bfCacheCreate() reads, and
+** the cache is built the first time the pager needs a page -- during
+** PRAGMA cache_size / journal_mode / the schema load, i.e. ALWAYS before the
+** BF pragmas can run.  (They must run after journal_mode, which reopens the
+** pager and drops BF settings made earlier, so there is no ordering that
+** worked.)  The configured size was therefore never in force: every cache ran
+** at the 8 MiB BF_DEFAULT_BUFFER_SIZE while PRAGMA bf_cache_stats faithfully
+** reported the 256 MiB that had been asked for.  Measured cost of that on a
+** skewed read workload: 34% record hit rate instead of 87%, 2k cached records
+** instead of 628k, and 1.2M evictions instead of none.
+**
+** Resizing means discarding the ring, so every mini-page in it goes too.  That
+** is safe only for CLEAN content: BFOP_CACHE/BFOP_PHANTOM records merely
+** duplicate the base page, so dropping them costs at most a re-read.  If the
+** cache holds buffered writes the base tree does not have yet, refuse and keep
+** the current ring -- a smaller-than-requested cache is a performance problem,
+** losing a committed row is a correctness one.
+**
+** Returns SQLITE_OK if the capacity is now in force (including when it already
+** was), SQLITE_BUSY if dirty content made the resize unsafe.
+*/
+int sqlite3BfBtreeResizeCache(Btree *p, u64 newCapacity){
+  BfCache *pBf;
+
+  if( !p || !p->pBt ) return SQLITE_OK;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( !pBf ) return SQLITE_OK;   /* not built yet: creation will read the global */
+  if( pBf->cb.capacity == newCapacity ) return SQLITE_OK;
+  if( pBf->bDirtyInserts || pBf->nDirty ) return SQLITE_BUSY;
+
+  /* Drop every mapping first: the mini-pages they point at live inside the
+  ** ring we are about to free. */
+  sqlite3BfMapIterate(pBf, bfClearOneEntry, NULL);
+  pBf->bDirtyInserts = 0;
+  sqlite3BfCircularBufferDestroy(&pBf->cb);
+  return sqlite3BfCircularBufferInit(&pBf->cb, newCapacity);
+}
+
 void sqlite3BfBtreeClearCache(Btree *p){
   BfCache *pBf;
   if( !p || !p->pBt ) return;
@@ -1362,7 +1403,7 @@ int sqlite3BfBtreeDescentProbe(BtCursor *pCur, Pgno chldPg, i64 intKey){
   pBf = btreeGetBfCache(pBt);
   if( !pBf ) return 0;
   /* Never shortcut while a bypass/merge replay is mutating the base tree, while
-  ** suppressed (range-seek / materialise re-descent), or for a write cursor —
+  ** suppressed (range-seek / materialise re-descent), or for a write cursor --
   ** writes need the physical leaf and must not be left in a leaf-less state. */
   if( pBf->bBypassActive || pBf->bMergingActive || pBf->bShortcutSuppressed ){
     return 0;
@@ -1381,6 +1422,7 @@ int sqlite3BfBtreeDescentProbe(BtCursor *pCur, Pgno chldPg, i64 intKey){
   /* BF_DELETED (tombstone/phantom) or miss: let the real descent decide. */
   return 0;
 }
+
 
 /*
 ** Length of the clean cached record the descent shortcut is about to serve,
@@ -1527,11 +1569,24 @@ int sqlite3BfBtreePromoteRecord(
   pBf = btreeGetBfCache(pBt);
   if( !pBf ) return SQLITE_OK;
 
-  if( pBf->promotionRate<=0 ) return SQLITE_OK;
+  /* Read the rate from the one place PRAGMA bf_promotion_rate writes it.
+  **
+  ** This used to test BfCache.promotionRate, a per-cache field that was
+  ** declared and read here and assigned NOWHERE -- sqlite3MallocZero left it 0
+  ** for the life of every cache, so this early-return fired on every read and
+  ** read-path promotion never executed once.  The record cache was therefore
+  ** populated only by writes: a read-only workload showed a 0.0% record hit
+  ** rate (and the promotion sweep in results/sweeps returned six identical
+  ** rows, because the knob was inert).  The field is gone; the global config
+  ** value is the only source of truth, which also makes the pragma live. */
   {
-    u32 r=0;
-    sqlite3_randomness(4, &r);
-    if( (r%100)>=(u32)pBf->promotionRate ) return SQLITE_OK;
+    int rate = sqlite3BfCachePromotionRate();
+    if( rate<=0 ) return SQLITE_OK;
+    if( rate<100 ){
+      u32 r=0;
+      sqlite3_randomness(4, &r);
+      if( (r%100)>=(u32)rate ) return SQLITE_OK;
+    }
   }
 
   /* Promote into the mini-page of the leaf the row lives on. */
@@ -1732,6 +1787,41 @@ void sqlite3BfBtreeStats(
   if( pUpgrades )     *pUpgrades     = pBf ? pBf->nUpgrades     : 0;
   if( pMerges )       *pMerges       = pBf ? pBf->nMergeToBase  : 0;
   if( pEvictions )    *pEvictions    = pBf ? pBf->cb.nEvictions : 0;
+}
+
+/*
+** pcache2 page-hash statistics for PRAGMA bf_cache_stats.
+**
+** Reported separately from mini_page_hits: the pager's BfCache IS the pcache2
+** instance (see sqlite3PagerOpenBfCache), so folding xFetch hits into the
+** record counters made the record-cache hit rate unreadable.
+*/
+void sqlite3BfBtreePageCacheStats(Btree *p, u64 *pHit, u64 *pMiss){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pHit )  *pHit  = pBf ? pBf->nPageFetchHit  : 0;
+  if( pMiss ) *pMiss = pBf ? pBf->nPageFetchMiss : 0;
+}
+
+/*
+** Space gauges for the record cache -- what it COSTS, next to what it saves.
+** See sqlite3BfMapSpaceStats.  Reported by PRAGMA bf_cache_stats; these are
+** live gauges, not cumulative counters, so a caller sampling them before and
+** after a run must not difference them.
+*/
+void sqlite3BfBtreeSpaceStats(
+  Btree *p,
+  u64 *pnBatches,
+  u64 *pnEntries,
+  u64 *pnMiniPages,
+  u64 *pnRecords,
+  u64 *pnMiniBytes,
+  u64 *pnCapacity
+){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  sqlite3BfMapSpaceStats(pBf, pnBatches, pnEntries, pnMiniPages,
+                         pnRecords, pnMiniBytes, pnCapacity);
 }
 
 /*

@@ -50,7 +50,9 @@ typedef struct BfFreeList BfFreeList;
 ** 8 MB gives ~116k 64-byte mini-page slots, adequate for a benchmark
 ** database with thousands of hot records.
 */
-#define BF_DEFAULT_BUFFER_SIZE    (8*1024*1024)   /* 8 MB circular buffer */
+#ifndef BF_DEFAULT_BUFFER_SIZE
+# define BF_DEFAULT_BUFFER_SIZE   (8*1024*1024)   /* 8 MB circular buffer */
+#endif
 #define BF_DEFAULT_COPY_ON_ACCESS 0.1             /* 10% copy-on-access region */
 #define BF_DEFAULT_PROMOTION_RATE 5               /* 5% read promotion rate */
 /* Upper bound on PRAGMA bf_group_commit: how many transactions may share one
@@ -289,7 +291,11 @@ struct BfCache {
   void *pStress;                  /* Argument to xStress */
 
   /* Configuration */
-  int promotionRate;        /* Percentage (0-100) to cache read records */
+  /* NOTE: the read-promotion percentage is NOT stored per cache.  A field here
+  ** was never assigned and silently disabled promotion everywhere; the single
+  ** source of truth is bfConfig.nPromotionRate, reached through
+  ** sqlite3BfCachePromotionRate().  Do not reintroduce a per-cache copy
+  ** without also wiring PRAGMA bf_promotion_rate to update it. */
 
   /* Bypass flag: when non-zero, all BF hooks skip immediately.
   ** Used during merge flush to prevent re-entrant BF writes. */
@@ -346,8 +352,10 @@ struct BfCache {
   int bShortcutSuppressed;
 
   /* Statistics */
-  u64 nMiniPageHit;         /* Lookups found in mini-page */
-  u64 nMiniPageMiss;        /* Lookups not found, went to disk */
+  u64 nMiniPageHit;         /* Record lookups served from a mini-page */
+  u64 nMiniPageMiss;        /* Record lookups that fell through to the page */
+  u64 nPageFetchHit;        /* pcache2 xFetch served from the page hash */
+  u64 nPageFetchMiss;       /* pcache2 xFetch that allocated/recycled a page */
   u64 nFullPageHit;         /* Lookups found in full page cache */
   u64 nMergeToBase;         /* Mini-pages merged to base page */
   u64 nEvictions;           /* Total evictions */
@@ -425,6 +433,8 @@ SQLITE_PRIVATE int sqlite3BfMiniPageDelete(BfMiniPage *pMini, const void *pKey, 
 SQLITE_PRIVATE int sqlite3BfMiniPageNeedsMerge(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageSpaceRemaining(BfMiniPage *pMini);
 SQLITE_PRIVATE u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass);
+SQLITE_PRIVATE u32 sqlite3BfMiniPageSizeClassFor(BfMiniPage *pMini, int nKey,
+                                                 int nVal, u32 *aSizeClass);
 
 /*
 ** Mapping table operations.
@@ -513,6 +523,10 @@ SQLITE_PRIVATE BfMapEntry *sqlite3BfMapGetOrCreate(BfCache *pCache, u32 pgno);
 SQLITE_PRIVATE int sqlite3BfMapCount(BfCache *pCache);
 SQLITE_PRIVATE int sqlite3BfMapMiniPageCount(BfCache *pCache);
 SQLITE_PRIVATE int sqlite3BfMapFullPageCount(BfCache *pCache);
+SQLITE_PRIVATE void sqlite3BfMapSpaceStats(BfCache *pCache, u64 *pnBatches,
+                                           u64 *pnEntries, u64 *pnMiniPages,
+                                           u64 *pnRecords, u64 *pnMiniBytes,
+                                           u64 *pnCapacity);
 SQLITE_PRIVATE int sqlite3BfMapIterate(BfCache *pCache,
     int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx);
 
@@ -565,6 +579,12 @@ SQLITE_PRIVATE int sqlite3BfBtreeBeginMergeScan(BtCursor *pCur);
 SQLITE_PRIVATE int sqlite3BfBtreeBeginMergeScanRev(BtCursor *pCur);
 /* 1 iff the cursor is eligible for merge-iteration (no state change). */
 SQLITE_PRIVATE int sqlite3BfBtreeCanMergeScan(BtCursor *pCur);
+/* Dirty-list maintenance (perf): note that `pgno` may now hold dirty records. */
+SQLITE_PRIVATE void sqlite3BfDirtyListAdd(BfCache *pCache, u32 pgno);
+/* Iterate only the mini-pages that may be dirty, dropping stale entries.
+** Returns 1 if the caller must fall back to sqlite3BfMapIterate (overflow). */
+SQLITE_PRIVATE int sqlite3BfDirtyListIterate(BfCache *pCache,
+    int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx);
 #if defined(SQLITE_BF_INSERT_BUFFERING)
 /* Merge-scan (Stage 2.2): next buffered insert on `leaf` at index >= *pIx. */
 SQLITE_PRIVATE int sqlite3BfBtreeMergeNextInsert(BtCursor *pCur, Pgno leaf,
@@ -576,12 +596,6 @@ SQLITE_PRIVATE int sqlite3BfBtreeMergePrevInsert(BtCursor *pCur, Pgno leaf,
 SQLITE_PRIVATE void sqlite3BfBtreeNoteInsertFallback(BtCursor *pCur);
 /* Largest rowid buffered for this cursor's table; 1 if known, 0 if not. */
 SQLITE_PRIVATE int sqlite3BfBtreeMaxBufferedRowid(BtCursor *pCur, i64 *pMax);
-/* Dirty-list maintenance (perf): note that `pgno` may now hold dirty records. */
-SQLITE_PRIVATE void sqlite3BfDirtyListAdd(BfCache *pCache, u32 pgno);
-/* Iterate only the mini-pages that may be dirty, dropping stale entries.
-** Returns 1 if the caller must fall back to sqlite3BfMapIterate (overflow). */
-SQLITE_PRIVATE int sqlite3BfDirtyListIterate(BfCache *pCache,
-    int (*xCallback)(void*, u32, BfMapEntry*), void *pCtx);
 /* Group commit (Phase 2): force the open cross-transaction record batch into
 ** the current transaction's WAL frame stream; free it at cache teardown. */
 SQLITE_PRIVATE void sqlite3BfBtreeGroupStagePending(Btree *p);

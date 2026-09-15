@@ -5616,7 +5616,31 @@ static const void *fetchPayload(
   }
 #ifndef SQLITE_OMIT_BF_CACHE
   if( pCur->curIntKey ){
-    (void)sqlite3BfBtreeRecordExists(pCur, &pCur->info.nKey, sizeof(pCur->info.nKey));
+    int bfSeen = sqlite3BfBtreeRecordExists(pCur,
+                     &pCur->info.nKey, sizeof(pCur->info.nKey));
+    /* Populate the record cache on a read miss.
+    **
+    ** This is THE read path: OP_Column reaches a row through
+    ** sqlite3BtreePayloadFetch -> fetchPayload, and never through
+    ** sqlite3BtreePayload unless the value must be copied out of an overflow
+    ** chain.  Promotion used to be hooked only into sqlite3BtreePayload, and
+    ** additionally required a whole-record read at offset 0, so an ordinary
+    ** "SELECT col FROM t WHERE rowid=?" promoted nothing.  Together with the
+    ** never-assigned rate field (see sqlite3BfBtreePromoteRecord) that left
+    ** the record cache populated by WRITES ONLY -- a read-only workload
+    ** measured a 0.0% record hit rate and saved no I/O at any cache size.
+    **
+    ** Only promote a record that lives entirely on this leaf: pPayload then
+    ** holds the whole row and the mini-page copy is exact.  A record with an
+    ** overflow chain would need the chain walked, which is the caller's job.
+    ** BFOP_CACHE records are CLEAN (sqlite3BfMiniPageInsert only marks dirty
+    ** for BFOP_INSERT/BFOP_DELETE), so this adds no dirty state, no flush and
+    ** no WAL traffic inside a read transaction. */
+    if( bfSeen==0 && pCur->info.nLocal==pCur->info.nPayload ){
+      (void)sqlite3BfBtreePromoteRecord(pCur,
+          &pCur->info.nKey, sizeof(pCur->info.nKey),
+          pCur->info.pPayload, (int)pCur->info.nLocal);
+    }
   }
 #endif
   *pAmt = (u32)amt;
@@ -6379,6 +6403,7 @@ static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
   pCur->curFlags &= ~BTCF_ValidOvfl;
   return SQLITE_OK;
 }
+
 #endif
 
 int sqlite3BtreeTableMoveto(
