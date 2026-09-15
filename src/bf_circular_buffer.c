@@ -52,26 +52,37 @@ static void bfCbTrace(const char *zTag, const void *pPtr, int nSize){
 */
 static int bfGetSizeClassIndex(BfCircularBuffer *pCb, u32 size){
   int i;
-  for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
     if( size <= pCb->freeList.aSizeClass[i] ){
-      return i;
+      return i;      /* aSizeClass ascends, so this is the smallest that fits */
     }
   }
   return -1;
 }
 
 /*
-** Initialize size classes for free list.
-** Size classes: 64, 128, 256, 512, 1024, 2048, 4096
+** Initialize size classes for free list: 64, 128, 256, 512, 1024, 2048, 4096,
+** ASCENDING, so aSizeClass[0] is the smallest.
+**
+** This array used to be filled backwards (index 0 = 4096), which every reader
+** since has had to know.  Two of them did not: sqlite3BfMiniPageNextSizeClass
+** and sqlite3BfMiniPageSizeClassFor walk it with for(i=0;...) and take the first
+** class that fits, so on a descending array they returned 4096 every time --
+** every mini-page that outgrew its 64-byte allocation jumped straight to 4 KiB.
+** That is the "37x space amplification" the 2026-09-07 note describes as fixed:
+** the loop was turned around, the array was not, so nothing changed.  One order,
+** the obvious one, everywhere.
 */
 static void bfInitSizeClasses(BfFreeList *pFl){
   int i;
   u32 size = BF_MIN_MINI_PAGE;
-  for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
     pFl->aSizeClass[i] = size;
     pFl->apHead[i] = 0;
     size *= 2;
   }
+  assert( pFl->aSizeClass[0]==BF_MIN_MINI_PAGE );
+  assert( pFl->aSizeClass[BF_SIZE_CLASS_COUNT-1]==BF_MAX_MINI_PAGE );
 }
 
 /*
@@ -181,8 +192,8 @@ static int bfFreeListAdd(BfFreeList *pFl, void *ptr, u32 size){
   int i;
   void **ppNext;
 
-  /* Find matching size class */
-  for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+  /* Smallest class that fits (aSizeClass ascends). */
+  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
     if( size <= pFl->aSizeClass[i] ){
       idx = i;
       break;
@@ -212,8 +223,8 @@ static void *bfFreeListRemove(BfFreeList *pFl, u32 size){
   void *ptr;
   void **ppNext;
 
-  /* Find smallest size class that fits */
-  for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+  /* Smallest class that fits AND has a free block (aSizeClass ascends). */
+  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
     if( size <= pFl->aSizeClass[i] && pFl->apHead[i] ){
       idx = i;
       break;

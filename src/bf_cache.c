@@ -229,11 +229,13 @@ static sqlite3_pcache *bfCacheCreate(int szPage, int szExtra, int bPurgeable){
     return 0;
   }
 
-  /* Initialize size classes */
+  /* Initialize size classes, ASCENDING (64 .. 4096).  The mini-page size-class
+  ** helpers scan this array forwards and take the first class that fits, so the
+  ** order is not cosmetic: filled backwards, they returned 4096 every time. */
   {
     int i;
     u32 size = BF_MIN_MINI_PAGE;
-    for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+    for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
       pCache->base.aSizeClass[i] = size;
       size *= 2;
     }

@@ -6371,26 +6371,28 @@ bf_last_no_flush:
 static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
   int n;
 
-  /* Provisional leaf-less keying so the BF read helpers resolve to chldPg. */
-  pCur->bfLeaf = chldPg;
-  pCur->curFlags |= BTCF_BfLeaf;
-  pCur->info.nKey = intKey;
-
   /* One scratch buffer per cursor, sized once to the max record class and
   ** reused across serves (BF records never exceed BF_MAX_MINI_PAGE). */
   if( pCur->nBfScratch<(int)BF_MAX_MINI_PAGE ){
     char *pNew = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
-    if( pNew==0 ){ pCur->curFlags &= ~BTCF_BfLeaf; return SQLITE_NOTFOUND; }
+    if( pNew==0 ) return SQLITE_NOTFOUND;
     pCur->pBfScratch = pNew;
     pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
   }
 
-  /* Single mini-page read: copies the record bytes and returns the length. */
-  n = sqlite3BfBtreeReadCachedRecord(pCur, pCur->pBfScratch, pCur->nBfScratch);
-  if( n<0 ){
-    pCur->curFlags &= ~BTCF_BfLeaf;
+  /* Single mini-page lookup + search, copying straight into the scratch.  The
+  ** cursor is not touched until this succeeds, so a miss leaves no flags to
+  ** unwind -- the caller just descends for real. */
+  n = pCur->nBfScratch;
+  if( !sqlite3BfBtreeDescentServe(pCur, chldPg, intKey, pCur->pBfScratch, &n) ){
     return SQLITE_NOTFOUND;
   }
+  if( n<0 || n>pCur->nBfScratch ) return SQLITE_NOTFOUND;
+
+  /* Leaf-less keying so the BF read helpers resolve to chldPg. */
+  pCur->bfLeaf = chldPg;
+  pCur->curFlags |= BTCF_BfLeaf;
+
   /* Populate the cell info the read path consumes.  BF records never overflow
   ** (capped at BF_MAX_MINI_PAGE) so nLocal==nPayload; nSize is set nonzero so
   ** getCellInfo() trusts this info instead of parsing the (parent) page. */
@@ -6570,9 +6572,7 @@ moveto_table_next_layer:
     ** subsequent point payload read through the BF cache.  Only fires at the
     ** true leaf edge (interior pgnos are never in the BF map).  Any non-point
     ** cursor op re-descends for real first (see getCellInfo / Next / etc.). */
-    if( sqlite3BfBtreeDescentProbe(pCur, chldPg, intKey)
-     && btreeBfServeFromCache(pCur, chldPg, intKey)==SQLITE_OK
-    ){
+    if( btreeBfServeFromCache(pCur, chldPg, intKey)==SQLITE_OK ){
       *pRes = 0;
       return SQLITE_OK;         /* row served from BF; leaf page not read */
     }

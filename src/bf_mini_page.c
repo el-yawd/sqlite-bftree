@@ -200,6 +200,7 @@ u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass){
   ** ~63k records instead of ~2M, and constant eviction churn.  The header
   ** comment on BF_MIN_MINI_PAGE ("double until BF_MAX_MINI_PAGE") describes
   ** the intent this now implements. */
+  assert( aSizeClass[0] < aSizeClass[BF_SIZE_CLASS_COUNT-1] );  /* ascending */
   for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
     if( aSizeClass[i] > pMini->nodeSize ){
       return aSizeClass[i];
@@ -244,6 +245,7 @@ u32 sqlite3BfMiniPageSizeClassFor(
   }
   needed = used + bfRecordSpace(nKey, nVal);
 
+  assert( aSizeClass[0] < aSizeClass[BF_SIZE_CLASS_COUNT-1] );  /* ascending */
   for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
     if( aSizeClass[i] > pMini->nodeSize && aSizeClass[i] >= needed ){
       return aSizeClass[i];

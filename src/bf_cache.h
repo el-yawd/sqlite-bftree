@@ -263,8 +263,20 @@ struct BfMapEntry {
 ** Mapping table batch size.
 ** Entries are allocated in batches for efficiency.
 */
-#define BF_MAP_BATCH_SIZE     256            /* Small batch to keep allocations bounded */
-#define BF_MAP_MAX_BATCHES    65536          /* 256 * 65536 = 16,777,216 pages (64 GB @ 4 KB) */
+/* A batch is allocated whole the first time ANY page in its range is cached, so
+** the batch size is a bet on locality.  Measured on a 6.8 GB database with a
+** zipf read workload, the bet loses badly: 4,647 batches of 256 entries held
+** 8,048 entries -- 0.7% occupancy, 27 MiB of mapping table for 2 MiB of live
+** mini-pages.  Cached leaves scatter over the whole file, so a big batch mostly
+** buys zeroes.  16 keeps the same structure and the same O(1) lookup while
+** costing 384 bytes per touched range instead of 6144.
+**
+** MAX_BATCHES has to grow with the same factor to keep the addressable file
+** size: 16 * 2^21 = 33,554,432 pages (128 GB @ 4 KB).  apMap is realloc'd to
+** just past the highest batch touched, so this is a ceiling, not a commitment
+** (1.67M-page file => ~105k pointers => 835 KiB). */
+#define BF_MAP_BATCH_SIZE     16
+#define BF_MAP_MAX_BATCHES    (1<<21)
 
 /*
 ** Main Bf-Tree cache structure.
@@ -586,7 +598,8 @@ SQLITE_PRIVATE int sqlite3BfBtreeCacheRecord(BtCursor *pCur, i64 rowid,
 SQLITE_PRIVATE void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno);
 /* Descent shortcut (Stage 1.6): true iff leaf pgno chldPg has a CLEAN cached
 ** record for intKey, so the descent can skip reading the leaf page. */
-SQLITE_PRIVATE int sqlite3BfBtreeDescentProbe(BtCursor *pCur, Pgno chldPg, i64 intKey);
+SQLITE_PRIVATE int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg,
+    i64 intKey, void *pBuf, int *pnBuf);
 /* Length of the clean cached record for the BF-served cursor's leaf key, or -1. */
 SQLITE_PRIVATE int sqlite3BfBtreeCachedPayloadSize(BtCursor *pCur);
 /* Copy the clean cached record into pBuf (cap nCap) in one read; len or -1. */

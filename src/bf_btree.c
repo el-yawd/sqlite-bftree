@@ -1404,14 +1404,16 @@ int sqlite3BfBtreeRecordExists(
 ** Interior pgnos are never in the map, so this only ever fires at the true
 ** leaf edge.
 */
-int sqlite3BfBtreeDescentProbe(BtCursor *pCur, Pgno chldPg, i64 intKey){
+int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
+                               void *pBuf, int *pnBuf){
   BtShared   *pBt;
   BfCache    *pBf;
   BfMapEntry *pEntry;
+  BfMiniPage *pMini;
   u8          keyBuf[8];
-  int         nBuf = 0, rc;
+  int         rc;
 
-  if( !pCur || !pCur->pBt || chldPg<=1 ) return 0;
+  if( !pCur || !pCur->pBt || chldPg<=1 || !pBuf || !pnBuf || *pnBuf<=0 ) return 0;
   if( !pCur->curIntKey ) return 0;              /* rowid tables only */
   pBt = pCur->pBt;
   pBf = btreeGetBfCache(pBt);
@@ -1426,15 +1428,22 @@ int sqlite3BfBtreeDescentProbe(BtCursor *pCur, Pgno chldPg, i64 intKey){
 
   pEntry = sqlite3BfMapLookup(pBf, chldPg);
   if( !pEntry || pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ) return 0;
+  pMini = (BfMiniPage*)pEntry->pPage;
 
+  /* ONE search, and it copies.  This used to be a probe that searched without a
+  ** buffer followed by a serve that searched again with one -- three map
+  ** lookups and two binary searches per served read, and two nMiniPageHit
+  ** increments for one hit, which inflated the reported record hit rate. */
   bfEncodeRowid(intKey, keyBuf);
-  rc = sqlite3BfRecordRead(pBf, chldPg, keyBuf, 8, 0, &nBuf);
-  if( rc==BF_OK ){            /* clean cached record present */
-    pBf->nMiniPageHit++;
-    return 1;
+  rc = sqlite3BfMiniPageSearch(pMini, keyBuf, 8, pBuf, pnBuf);
+  if( rc!=BF_OK ){
+    /* BF_DELETED (tombstone/phantom) or miss: let the real descent decide. */
+    if( rc==BF_DELETED ) pBf->nMiniPageHit++;
+    else pBf->nMiniPageMiss++;
+    return 0;
   }
-  /* BF_DELETED (tombstone/phantom) or miss: let the real descent decide. */
-  return 0;
+  pBf->nMiniPageHit++;
+  return 1;
 }
 
 
