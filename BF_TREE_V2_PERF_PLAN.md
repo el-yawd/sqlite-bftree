@@ -43,6 +43,59 @@ result.
   suspect is our copy-on-access rejection tombstoning reusable blocks. To be
   measured, not assumed.
 
+## Status (2026-09-15)
+
+| stage | state |
+|---|---|
+| 0 gate | done -- 54/54, 216/216, 216/216, 216/216 |
+| 1 truncate | **committed** `e6d399e` |
+| 2 txn-scoped logging | **committed** `e6d399e` |
+| 3 blind insert | **not attempted** -- see the revision below; the owner chose Stages 4-5 instead |
+| 4 write amplification | partly explained (see below) |
+| 5 ring occupancy | **answered and fixed**, `31d2a33` |
+
+Three things were found by reading the code for what is simply wrong, rather
+than by following this plan, and they were worth more than Stage 3 would have
+been:
+
+* **The size-class array was filled descending and scanned ascending**, so every
+  mini-page that outgrew 64 bytes became 4096. That *was* the ring-occupancy
+  question this plan files under Stage 5 (~4 KiB of ring per ~130 B record), and
+  it retires the "the ring reclaims no space from freed blocks" theory: the free
+  list is correct and is consulted first, exactly like the reference's
+  `circular_buffer/mod.rs:539`. Fixed: 3.0x more records cached, 544 -> 138 ring
+  bytes per record, evictions 4,048 -> 0, record hit rate 22.7% -> 50.4%.
+* **The mapping table then became the dominant cost** -- 37.9 MiB holding 30,873
+  entries (1.9% occupancy) on the 6.8 GB database, because a 6 KiB batch is
+  allocated for any touched page range. Batch 256 -> 16: 4.67 MiB, maxrss
+  57 -> 21 MiB, no cost where batches are dense.
+* **A cache-served read looked the record up three times** and double-counted
+  `mini_page_hits`, which inflated every record hit rate this repo has reported.
+
+**A correctness bug found on the way, and fixed** (`bench/ckpt_repro.sh`): a
+mid-session `PRAGMA wal_checkpoint` left the connection unable to write -- next
+INSERT "database disk image is malformed" -- while the database on disk stayed
+consistent. BF record frames occupy a wal-index slot without being appended to
+the index, so after a checkpoint restarts the log nothing performs
+`walIndexAppend`'s idx==1 block-zeroing and stale hash entries survive. It
+predates this work, and 864 oracle tests never saw it because no generator ever
+issued a checkpoint; `gen_stress.py` now does.
+
+**What that unblocks.** With the wal fix, `PRAGMA wal_autocheckpoint` works, so
+the forced `autocheckpoint=0` in `sqlite3_open` -- and the unbounded WAL behind
+it -- can be revisited. That is now the top item on the write path: after
+Stages 1-2, `walFindFrame` is **21% of an insert profile**, and BF is measured
+against a stock build that checkpoints every 1000 frames. A crash test (SIGKILL
+at 231k rows, auto-checkpoint every 200 frames) kept every committed row.
+
+### Next
+1. Re-enable auto-checkpoint by default, measured -- the 21% above.
+2. Re-profile the write path; the shape has changed completely (both Stage 1 and
+   Stage 2 frames are gone from it).
+3. Stage 4's remaining question: whether `pg frames/commit` still regresses at
+   64 B now that the size classes are honest and `MiniPageCopy` no longer
+   re-logs already-logged records.
+
 ## Stages
 
 Each stage is independently committable and ends with the same gate: the four

@@ -57,6 +57,20 @@ def main():
     for _ in range(n_ops):
         r = rng.random()
 
+        # A mid-session checkpoint, outside any transaction.  This op exists
+        # because its absence hid a corruption bug for the whole life of the
+        # suite: a PRAGMA wal_checkpoint left the connection unable to write
+        # (the next INSERT failed with "database disk image is malformed")
+        # while the database on disk stayed perfectly consistent, so nothing
+        # the oracle compared could see it.  The checkpoint's own output is
+        # engine-dependent -- BF and stock write different numbers of frames --
+        # so it is discarded; what must match is everything that happens after.
+        if journal == "wal" and not in_txn and r >= 0.985:
+            w(".output /dev/null")
+            w("PRAGMA wal_checkpoint(PASSIVE);")
+            w(".output stdout")
+            continue
+
         # Transaction control, interleaved with data ops.
         if not in_txn and r < 0.10:
             w("BEGIN;")

@@ -4149,6 +4149,40 @@ static int walWriteWalHeader(Wal *pWal, int szPage, int sync_flags){
   return SQLITE_OK;
 }
 
+#ifndef SQLITE_OMIT_BF_CACHE
+/*
+** Zero the wal-index hash block that iFrame belongs to, if iFrame is the first
+** frame of that block.
+**
+** walIndexAppend() does this itself for page frames -- its "idx==1" case -- and
+** that is what clears entries left in a block by an earlier epoch of the log.
+** BF record frames are deliberately kept OUT of the wal-index (their pages are
+** served as base image plus record-cache delta, and a checkpoint iterating the
+** index must never try to copy one to a real page).  So when a record frame
+** lands on the first slot of a block, nothing zeroes it.
+**
+** After a log restart that is every block: the record frame takes frame 1, the
+** first page frame appends at idx==2, and the second safety net does not fire
+** either (walCleanupHash() returns immediately when hdr.mxFrame==0).  Stale
+** hash entries from before the restart survive, readers resolve a page to a
+** frame from the previous epoch, and the connection reports SQLITE_CORRUPT --
+** "database disk image is malformed" -- on the next read, while the database
+** file itself is perfectly consistent.  Reproduced by bench/ckpt_repro.sh: a
+** mid-session PRAGMA wal_checkpoint (which is what restarts the log) followed
+** by one INSERT.
+*/
+static int walIndexZeroIfBlockStart(Wal *pWal, u32 iFrame){
+  WalHashLoc sLoc;
+  int rc = walHashGet(pWal, walFramePage(iFrame), &sLoc);
+  if( rc==SQLITE_OK && (iFrame - sLoc.iZero)==1 ){
+    int nByte = (int)((u8*)&sLoc.aHash[HASHTABLE_NSLOT] - (u8*)sLoc.aPgno);
+    assert( nByte>=0 );
+    memset((void*)sLoc.aPgno, 0, nByte);
+  }
+  return rc;
+}
+#endif
+
 /*
 ** Write a set of frames to the log. The caller must hold the write-lock
 ** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
@@ -4236,8 +4270,13 @@ static int walFrames(
       u8 *aBody = pWal->apBfStage[iBf];
       iFrame++;
       assert( iOffset==walFrameOffset(iFrame, szPage) );
-      walEncodeFrame(pWal, WAL_BF_RECORD_PGNO, 0, aBody, aRecHdr);
-      rc = walWriteToLog(&w, aRecHdr, sizeof(aRecHdr), iOffset);
+      /* This frame occupies a wal-index slot without appending to the index,
+      ** so take over walIndexAppend()'s block-zeroing duty for it. */
+      rc = walIndexZeroIfBlockStart(pWal, iFrame);
+      if( rc==SQLITE_OK ){
+        walEncodeFrame(pWal, WAL_BF_RECORD_PGNO, 0, aBody, aRecHdr);
+        rc = walWriteToLog(&w, aRecHdr, sizeof(aRecHdr), iOffset);
+      }
       if( rc==SQLITE_OK ){
         rc = walWriteToLog(&w, aBody, szPage, iOffset+sizeof(aRecHdr));
       }
