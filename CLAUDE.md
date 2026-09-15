@@ -93,6 +93,29 @@ Ablation switches (all default OFF, i.e. the feature is on): `SQLITE_BF_NO_MERGE
 `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,
 `SQLITE_BF_NO_MINIPAGE_COMPACT`.
 
+## Debug builds are the fastest diagnostic here
+
+```bash
+cd build && cc -O0 -g -DSQLITE_DEBUG -DSQLITE_BF_INSERT_BUFFERING \
+   -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE -I. -I../src \
+   -o sqlite3_dbg shell.c sqlite3.c -lm -lz
+python3 ../bench/gen_stress.py 7 wal 2500 > /tmp/d.sql && ./sqlite3_dbg /tmp/d.db < /tmp/d.sql
+```
+
+`SQLITE_DEBUG` turns on hundreds of internal invariant checks in btree/pager/wal.
+They pay for themselves: the 2026-09-15 wal-index corruption bug
+(`bench/ckpt_repro.sh`) fired `walIndexAppend`'s own assert **immediately**,
+while the release build only produced a confusing "database disk image is
+malformed" several statements later, in a different operation.  Reach for this
+before reaching for printf.
+
+Two things to know:
+- Do **not** add `-DSQLITE_OMIT_SHARED_CACHE` reflexively.  It silences the
+  table-lock assert, which is a real check on BF's own cursors -- that assert is
+  what pointed at `bfFlushOneMiniPage` opening a write cursor without the lock
+  the VDBE would have taken.
+- A debug build is far slower; use it for correctness, never for timing.
+
 ## Performance work: the method (measure, don't guess)
 
 Every performance change follows this loop.  It exists because guessing already

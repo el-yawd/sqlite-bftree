@@ -1,0 +1,61 @@
+{
+  "name": "autockpt",
+  "_comment": [
+    "Does re-enabling auto-checkpoint help, and what does it cost?",
+    "",
+    "No second binary is needed: wal_autocheckpoint is already a harness axis, so",
+    "one BF build is swept across it and compared with stock at its own default.",
+    "That keeps the comparison inside one campaign, which is the only kind this",
+    "repo has found trustworthy (identical code has spanned 9913/11652/8102 ops/s",
+    "across campaigns).",
+    "",
+    "What to read, in this order -- throughput alone cannot answer this:",
+    "  WAL B/commit      a checkpoint converts buffered records into base-page",
+    "                    writes, so the Phase-2 '1 page frame per commit' story",
+    "                    changes shape; if this rises a lot, the win is paid for",
+    "  pg frames/commit  the same thing seen from the record side",
+    "  read bytes/op     the reason to do this at all: an unbounded WAL makes",
+    "                    every read search a larger wal-index (walFindFrame was",
+    "                    21% of an insert profile)",
+    "  ops/s             last, and only next to its spread",
+    "",
+    "autocheckpoint=0 is today's forced BF behaviour; 1000 is SQLite's default;",
+    "10000 is there to show whether the interesting variable is 'bounded at all'",
+    "or 'bounded tightly'."
+  ],
+  "datasets": {
+    "v100": { "records": 4000000, "value_len": 100, "key_spacing": 16 },
+    "big":  { "records": 60000000, "value_len": 100, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "v100",
+    "suts": ["stock", "bf"],
+    "repeats": 3,
+    "seconds": 30,
+    "warmup_seconds": 8,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "256M",
+    "memmax": "1G",
+    "bf_page_cache_floor": "8M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true
+  },
+  "experiments": [
+    { "name": "insert", "workload": "insert=100",
+      "axes": { "autocheckpoint": [0, 1000, 10000] } },
+    { "name": "update", "workload": "update=100",
+      "axes": { "autocheckpoint": [0, 1000] } },
+    { "name": "read_after_writes",
+      "_why": ["A pure read workload never grows the WAL, so it cannot show the",
+               "cost being removed.  This one writes 20% of the time, which is",
+               "what makes the wal-index grow under autocheckpoint=0."],
+      "workload": "read=80,update=20",
+      "axes": { "autocheckpoint": [0, 1000] } },
+    { "name": "read_big", "dataset": "big", "workload": "read=95,update=5",
+      "seconds": 20, "warmup_seconds": 5,
+      "axes": { "autocheckpoint": [0, 1000] } }
+  ]
+}

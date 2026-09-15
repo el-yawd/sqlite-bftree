@@ -245,6 +245,19 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
   memset(&ctx, 0, sizeof(ctx));
   memset(&tmpCur, 0, (size_t)sqlite3BtreeCursorSize());
 
+  /* Take the write lock the VDBE would have taken with OP_TableLock before
+  ** opening a cursor on this table.  BF opens this one itself -- outside any
+  ** statement -- so nothing else does it, and btreeCursor() asserts the lock is
+  ** held: every SQLITE_DEBUG build aborts on the first flush
+  ** ("hasSharedCacheTableLock(...) failed").  That matters beyond tidiness,
+  ** because a debug build is the fastest diagnostic this project has -- it is
+  ** what found the wal-index corruption bug, firing an assert immediately where
+  ** the release build only produced a confusing SQLITE_CORRUPT several
+  ** statements later.  sqlite3BtreeLockTable() is a no-op on a non-shareable
+  ** btree, so this costs nothing in the common build. */
+  rc = sqlite3BtreeLockTable(pBtree, (int)pgnoRoot, 1);
+  if( rc!=SQLITE_OK ) return rc;
+
   pBf->bBypassActive = 1;
   pBf->pgnoRootForFlush = pgnoRoot;
 
