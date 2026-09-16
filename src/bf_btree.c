@@ -1825,6 +1825,14 @@ void sqlite3BfBtreeStats(
   if( pEvictions )    *pEvictions    = pBf ? pBf->cb.nEvictions : 0;
 }
 
+/* CLOCK second chances granted (PRAGMA bf_cache_stats).  Read it next to
+** evictions: the ratio says how much of the sweep is retention work. */
+void sqlite3BfBtreeClockStat(Btree *p, u64 *pnSpared){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pnSpared ) *pnSpared = pBf ? pBf->nClockSpared : 0;
+}
+
 /*
 ** pcache2 page-hash statistics for PRAGMA bf_cache_stats.
 **

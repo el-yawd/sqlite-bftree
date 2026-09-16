@@ -622,6 +622,20 @@ int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini){
 }
 
 /*
+** Does this mini-page hold a record that has been touched since its reference
+** bit was last cleared?  That is the CLOCK question: a page answering yes is
+** worth a second chance rather than eviction.
+*/
+int sqlite3BfMiniPageHasRef(BfMiniPage *pMini){
+  BfKVMeta *aMeta = bfMiniPageMeta(pMini);
+  int i;
+  for(i = 0; i < pMini->metaCount; i++){
+    if( BF_KV_IS_REF(&aMeta[i]) ) return 1;
+  }
+  return 0;
+}
+
+/*
 ** Clear reference bits on all records.
 ** Called at start of eviction cycle.
 */

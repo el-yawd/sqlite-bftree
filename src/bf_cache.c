@@ -1193,7 +1193,53 @@ static int evictCallback(void *pCtx, void *ptr){
     return BF_ERROR;         /* Case 3: dirty — refuse, never drop data */
   }
 
-  /* Case 2: clean — unlink, then allow the reclaim */
+#if !defined(SQLITE_BF_NO_CLOCK_EVICT)
+  /* Case 2a: clean AND recently read -- give it a second chance.
+  **
+  ** The ring evicts in FIFO order, which retains what was promoted most
+  ** recently rather than what is read most often.  Measured at steady state,
+  ** that costs 18-25 points of hit rate against the zipf ideal for the number
+  ** of records actually cached, in every configuration tried -- both skews,
+  ** larger-than-memory and saturated alike.
+  **
+  ** BF_KV_SET_REF already marks every record on access and nothing consulted it
+  ** at eviction time; only mini-page compaction read it.  So: relocate a
+  ** referenced page to the tail and clear its bits.  The page survives this
+  ** pass, and survives the next one only if it is read again in the meantime --
+  ** which is CLOCK.
+  **
+  ** Refusing instead of relocating would not work: a refusal aborts the whole
+  ** sweep (see sqlite3BfCircularBufferEvictOne), so a hot page at the head would
+  ** wedge the ring.  Relocating leaves the old slab orphaned, which is exactly
+  ** the case this callback already reclaims, so we return BF_OK for it.
+  **
+  ** nClockBudget bounds the relocations per sweep so a ring where everything is
+  ** hot still frees space instead of copying forever, and a failed allocation
+  ** simply falls through to eviction. */
+  if( pCache->nClockBudget > 0 && sqlite3BfMiniPageHasRef(pMini) ){
+    void *pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, pMini->nodeSize);
+    if( pNew ){
+      sqlite3BfCircularBufferMarkReady(pNew);
+      if( sqlite3BfMiniPageCopy((BfMiniPage*)pNew, pMini->nodeSize, pMini,
+                                BF_COPY_ALL)==BF_OK ){
+        /* Copy rebuilds flags from the records, losing BF_MINI_F_STALE (a
+        ** property of the page, not of any record), and sets REF on everything
+        ** it inserts -- so clear the bits AFTER the copy, or the second chance
+        ** would renew itself for free. */
+        ((BfMiniPage*)pNew)->flags |= (u16)(pMini->flags & BF_MINI_F_STALE);
+        sqlite3BfMiniPageClearRefs((BfMiniPage*)pNew);
+        pEntry->pPage = pNew;
+        pCache->nClockBudget--;
+        pCache->nClockSpared++;
+        return BF_OK;          /* old slab is orphaned now: reclaim it */
+      }
+      sqlite3BfCircularBufferDealloc(&pCache->cb, pNew);
+    }
+    /* No room to relocate: fall through and evict, as before. */
+  }
+#endif
+
+  /* Case 2: clean and cold — unlink, then allow the reclaim */
   pEntry->locType = BF_LOC_NULL;
   pEntry->pPage = 0;
   return BF_OK;
@@ -1202,6 +1248,11 @@ static int evictCallback(void *pCtx, void *ptr){
 
 int sqlite3BfCacheEvict(BfCache *pCache, int nTarget){
   int nEvicted = 0;
+
+  /* Budget for CLOCK second chances this sweep.  Generous enough that a mostly
+  ** hot ring still retains its hot set, bounded so it cannot relocate without
+  ** ever freeing anything. */
+  pCache->nClockBudget = nTarget * 4;
 
   nEvicted = sqlite3BfCircularBufferEvictN(&pCache->cb, nTarget,
       evictCallback, pCache);

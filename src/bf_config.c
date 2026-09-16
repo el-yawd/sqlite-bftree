@@ -365,6 +365,17 @@ void sqlite3PragmaBfCacheStats(
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
 
     {
+      u64 nSpared = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreeClockStat(Btree*, u64*);
+        sqlite3BfBtreeClockStat(pBt, &nSpared);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "clock_spared", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nSpared, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+
+    {
       u64 nMergeScans = 0, nMergeIns = 0, nMergeBail = 0;
       if( pBt ){
         extern void sqlite3BfBtreeMergeStats(Btree*, u64*, u64*, u64*);

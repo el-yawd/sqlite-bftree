@@ -376,6 +376,12 @@ struct BfCache {
   ** unlink and hand back to the ring, leaving the copy reading freed memory. */
   void *pEvictProtect;
 
+  /* CLOCK eviction.  nClockBudget caps how many pages one sweep may spare, so
+  ** a ring where everything is hot still makes progress instead of relocating
+  ** forever; nClockSpared is reported by PRAGMA bf_cache_stats. */
+  int nClockBudget;
+  u64 nClockSpared;
+
   /* Pages holding dirty-but-unlogged records, i.e. what THIS transaction has
   ** to log at commit.  Same conservative contract as aDirtyPg above: entries
   ** may be stale or duplicated (revisiting a page whose records are all logged
@@ -548,6 +554,7 @@ SQLITE_PRIVATE void sqlite3BfCircularBufferStats(BfCircularBuffer *pCb,
 SQLITE_PRIVATE int sqlite3BfMiniPageDirtyCount(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
+SQLITE_PRIVATE int sqlite3BfMiniPageHasRef(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageClearRefs(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini);
 /* copyMode values for sqlite3BfMiniPageCopy. */
