@@ -52,35 +52,47 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
   amalgamation as a `bf_pre` SUT so a before/after runs inside ONE campaign;
   cross-campaign numbers are not comparable (stock alone has spanned 3.2x).
 
-### Where the fork actually stands (2026-09-15, all within-campaign)
+### Where the fork actually stands (2026-09-16, steady state, within-campaign)
 
 | workload | vs stock |
 |---|---|
-| inserts | **3.96x** (was 0.22x, i.e. 4.5x slower, before this session) |
-| point reads, zipf 0.99, larger-than-memory | **1.15x**, 21% fewer bytes read |
-| point reads, zipf 0.99, warm in RAM | **1.31x** |
-| point reads, zipf 0.9 | 1.02–1.04x |
+| inserts | **3.96x** (was 0.22x before the 2026-09-15 fixes) |
+| point reads, larger-than-memory, zipf 0.9 / 0.99 | **1.06x / 1.02x**, reading 1.20x / 1.29x fewer bytes |
+| point reads, saturated ring (16 MiB / 4M rows) | 0.95x / 0.97x |
+| point reads, warm in RAM, zipf 0.99 | 1.31x (transient -- cache still filling, no eviction) |
 | update, mixed read/write | parity |
 
-**The win tracks the record hit rate, and nothing else.**  34% → 1.04x,
-55% → 1.15x, 57% → 1.02x, 71% → 1.31x.  Promotion rate, warmup length, ring
-occupancy and the OS page cache matter only through their effect on that number.
-A read benchmark whose warmup does not fill the ring measures an empty cache and
-reports parity — which is what every earlier campaign here did.
+**Read these as steady state, and distrust any read number that is not.**  The
+record cache keeps filling for minutes: the same workload and build measured
+53.8% / 60.5% / 69.6% hit rate at 5 / 20 / 60 s of warmup, with `evictions=0`
+throughout.  Earlier campaigns -- and an earlier version of this table, which
+claimed 1.15x -- measured that transient.  `configs/steady.json` uses a 420 s
+warmup and the numbers above only after `cached_records` plateaued across
+repeats.  **Report `cached_records` and `evictions` beside every hit rate**; a
+hit rate without them is uninterpretable.
 
-Gap to the paper's ~2x, quantified rather than mysterious: the hit rate
-saturates near 55% because a 128 MiB ring holds about half the hot set of a
-60M-row zipf-0.99 table, and with buffered I/O an avoided miss is cheap.  **A
-direct-I/O VFS is the remaining lever** (`../bf-tree` uses StdDirect/io_uring and
-30 threads); that is real work, not tuning.
+**The one thing holding reads back is measured and consistent: FIFO retention.**
+Every steady-state cell sits **18-25 points below the Zipf ideal** for the number
+of records it actually caches (33.9% vs 54.7%; 53.7% vs 71.7%; 31.9% vs 57.2%;
+49.2% vs 71.7%).  The ring evicts the oldest record, not the coldest, so it
+keeps what was promoted recently rather than what is read often.  The REF bit
+that would fix this already exists and is already set on every access --
+`evictCallback` ignores it.  A REF-bit CLOCK policy is the next change with a
+quantified prize behind it.
+
+The second constraint is the benchmark environment, not the code: BF reads
+20-29% fewer bytes and converts almost none of it into throughput, because under
+buffered I/O an avoided miss is usually an OS page-cache hit.  `../bf-tree` uses
+direct I/O precisely so a miss costs a device read.  Two cache-retention
+experiments (copy-on-access second chance; bulk mini-page copy) were built,
+measured and reverted for this reason -- see the memory notes.
 
 The three findings this file used to list as unexplained:
   - *record-size cliff* — **explained and fixed**.  `aSizeClass` was filled
     descending and scanned ascending, so every mini-page became 4096 B.
-  - *`negative_read` 4.5x slower* — **did not reproduce**; it was 0.86x, then a
-    stale-binary artefact.
+  - *`negative_read` 4.5x slower* — **did not reproduce**; a stale-binary artefact.
   - *UPDATE never buffers* — **still true** (`rec frames/commit` = 0); it takes
-    the page-image path at 1 frame/commit.  Unexplained, and the oldest open item.
+    the page-image path at 1 frame/commit.  The oldest open item.
 
 ## Build & test
 ```bash

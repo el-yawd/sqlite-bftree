@@ -1,0 +1,57 @@
+{
+  "name": "steady",
+  "_comment": [
+    "Step 3: the steady-state read baseline.  EVERY read number in this repo,",
+    "including today's 1.15x and 1.31x, is a transient: the record cache was",
+    "still filling when the measurement ended.  Warmups of 5/20/60 s gave hit",
+    "rates of 53.8% / 60.5% / 69.6% on the same workload and build, with",
+    "evictions=0 throughout -- so we have never measured what this fork",
+    "actually does once the cache stops growing.",
+    "",
+    "Warmup here is 420 s, and the number to check FIRST is cached_records: if",
+    "it is still climbing between repeats, the warmup is still too short and the",
+    "throughput ratio is not a steady-state result.  Report it next to every hit",
+    "rate, always.",
+    "",
+    "Two sizes on purpose.  big/128 MiB never saturates in reasonable time, so",
+    "it measures the regime the thesis claims (larger than memory, cache still",
+    "an advantage).  v100/16 MiB saturates in seconds, so it measures the regime",
+    "where FIFO retention is the binding constraint -- that is where a REF-bit",
+    "CLOCK eviction policy would pay, and this tells us by how much."
+  ],
+  "datasets": {
+    "big":  { "records": 60000000, "value_len": 100, "key_spacing": 16 },
+    "v100": { "records": 4000000,  "value_len": 100, "key_spacing": 16 }
+  },
+  "defaults": {
+    "suts": ["stock", "bf"],
+    "repeats": 2,
+    "seconds": 60,
+    "warmup_seconds": 420,
+    "workload": "read=100",
+    "dist": "zipf",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "read_txn": true,
+    "drop_cache": true
+  },
+  "experiments": [
+    { "name": "ltm_steady",
+      "_why": ["Larger than memory: 6.8 GB under a 384 MiB cap, so the OS page",
+               "cache cannot stand in for the engine's own.  This is the number",
+               "the thesis's point-read claim rests on."],
+      "dataset": "big", "budget_bytes": "256M", "memmax": "384M",
+      "bf_page_cache_floor": "8M", "promotion": 30,
+      "axes": { "theta": [0.9, 0.99] } },
+    { "name": "saturated",
+      "_why": ["A 16 MiB ring against 4M rows cycles within seconds, so this is",
+               "the steady state WITH eviction.  Compare the hit rate against",
+               "the zipf ideal for the number of records actually cached: the",
+               "difference is what FIFO retention costs, i.e. the size of the",
+               "prize for a REF-bit CLOCK policy."],
+      "dataset": "v100", "budget_bytes": "32M", "memmax": "auto",
+      "bf_page_cache_floor": "16M", "promotion": 30,
+      "axes": { "theta": [0.9, 0.99] } }
+  ]
+}
