@@ -127,7 +127,14 @@ fi
   echo "{"
   echo "  \"built_at\": \"$(date -Is)\","
   echo "  \"git_rev\": \"$(cd "$ROOT" && git rev-parse HEAD 2>/dev/null)\","
-  echo "  \"git_dirty\": $(cd "$ROOT" && [ -n "$(git status --porcelain)" ] && echo true || echo false),"
+  # --untracked-files=no on purpose: "dirty" has to mean "the code that built
+  # this binary is not the code at git_rev", and an untracked file cannot reach
+  # the amalgamation without a TRACKED build input (main.mk, mksqlite3c.tcl)
+  # also changing, which shows up here anyway.  Counting untracked files made
+  # every build dirty as soon as an unrelated directory existed in the tree --
+  # tfg/, the thesis -- which would have failed the strict gate on every future
+  # campaign for a reason that has nothing to do with reproducibility.
+  echo "  \"git_dirty\": $(cd "$ROOT" && [ -n "$(git status --porcelain --untracked-files=no)" ] && echo true || echo false),"
   echo "  \"sqlite_version\": \"$(cat "$ROOT/VERSION")\","
   echo "  \"cc\": \"$($CC --version | head -1)\","
   echo "  \"common_flags\": \"$(echo $COMMON)\","
