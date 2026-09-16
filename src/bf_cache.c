@@ -212,10 +212,22 @@ static sqlite3_pcache *bfCacheCreate(int szPage, int szExtra, int bPurgeable){
   pCache->base.szExtra = szExtra;
   pCache->base.bPurgeable = bPurgeable;
 
+#if SQLITE_THREADSAFE
+  /* A3a: the record-cache lock.  Recursive because the public entry points
+  ** nest (sqlite3BfRecordRead -> sqlite3BfMapLookup). */
+  pCache->base.mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_RECURSIVE);
+  if( pCache->base.mutex==0 ){
+    BF_ALLOC_TRACE("cache-create-fail", pCache, (int)sz);
+    sqlite3_free(pCache);
+    return 0;
+  }
+#endif
+
   /* Initialize circular buffer */
   rc = sqlite3BfCircularBufferInit(&pCache->base.cb, sqlite3BfCacheBufferSize());
   if( rc != SQLITE_OK ){
     BF_ALLOC_TRACE("cache-create-fail", pCache, (int)sz);
+    sqlite3_mutex_free(pCache->base.mutex);
     sqlite3_free(pCache);
     return 0;
   }
@@ -225,6 +237,7 @@ static sqlite3_pcache *bfCacheCreate(int szPage, int szExtra, int bPurgeable){
   if( rc != SQLITE_OK ){
     BF_ALLOC_TRACE("cache-create-fail", pCache, (int)sz);
     sqlite3BfCircularBufferDestroy(&pCache->base.cb);
+    sqlite3_mutex_free(pCache->base.mutex);
     sqlite3_free(pCache);
     return 0;
   }
@@ -623,6 +636,8 @@ static void bfCacheDestroy(sqlite3_pcache *p){
 #endif
   sqlite3_free(pCache->apHash);
   sqlite3BfCircularBufferDestroy(&pCache->base.cb);
+  sqlite3_mutex_free(pCache->base.mutex);
+  pCache->base.mutex = 0;
   sqlite3BfMapDestroy(&pCache->base);
   sqlite3_free(pCache);
 }

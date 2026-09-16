@@ -376,6 +376,45 @@ struct BfCache {
   ** unlink and hand back to the ring, leaving the copy reading freed memory. */
   void *pEvictProtect;
 
+  /* The record-cache lock.  Currently UNCONTENDED, and deliberately so: it is
+  ** the prerequisite for sharing one cache across connections, not a fix for
+  ** a race that exists today.
+  **
+  ** Today there is no race, because there is no sharing.  A BfCache is created
+  ** per pager -- see sqlite3PagerOpenBfCache, "one BfCache per pager is the
+  ** correct architecture" -- so each connection owns its own mapping table,
+  ** mini-pages and ring.  (bfGlobalCache and sqlite3BfGetGlobalCache look like
+  ** a shared singleton but have zero call sites; they are dead.)
+  **
+  ** That per-pager design is what makes multi-threading the REFERENCE workload
+  ** wrong rather than unsafe: the reference runs 30 threads against ONE buffer
+  ** pool, while N connections here would allocate N independent rings, each of
+  ** bf_cache_size.  The memory budget the whole harness is built on would be
+  ** overspent N-fold, or each thread would get 1/N of a cache.  Neither is the
+  ** thing the paper measures.
+  **
+  ** So the faithful change is to share ONE cache per database file across
+  ** connections -- and that is what needs this lock, because the moment two
+  ** connections touch one cache, ordinary reads collide: sqlite3BfMiniPageSearch
+  ** sets the REF bit with a read-modify-write on valueLenAndRef, the same u16
+  ** that carries the value length and the WAL-logged flag, and
+  ** sqlite3BfMapLookup walks a batch directory that bfMapEnsureCapacity
+  ** reallocs under it.
+  **
+  ** RECURSIVE, because the public entry points nest (sqlite3BfRecordRead calls
+  ** sqlite3BfMapLookup).  No inversion to design around: bf_cache.c never calls
+  ** into the btree -- flushes are driven the other way, from bfFlushOneMiniPage
+  ** in bf_btree.c -- and evictCallback refuses dirty pages rather than flushing
+  ** them, so the critical section holds no I/O and never re-enters SQLite.
+  **
+  ** NOT YET SUFFICIENT for that sharing.  The BF API hands out raw pointers
+  ** into cache state (sqlite3BfMapLookup returns a BfMapEntry*), so the lock
+  ** has to span the CALLER's use of them: the scope is the 28 sqlite3BfBtree*
+  ** entry points in btree.c, not the leaf functions.  Two of those -- the
+  ** forward and reverse merge scans -- retain mini-page pointers ACROSS btree
+  ** steps and need a pinning design before any lock makes them safe. */
+  sqlite3_mutex *mutex;
+
   /* Pages holding dirty-but-unlogged records, i.e. what THIS transaction has
   ** to log at commit.  Same conservative contract as aDirtyPg above: entries
   ** may be stale or duplicated (revisiting a page whose records are all logged
@@ -550,6 +589,16 @@ SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageClearRefs(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini);
+/* A3a: take/release the record-cache lock.  No-ops in a single-threaded build,
+** and tolerant of a null cache so call sites need no extra guard. */
+#if SQLITE_THREADSAFE
+# define bfCacheEnter(p)  do{ if( (p) && (p)->mutex ) sqlite3_mutex_enter((p)->mutex); }while(0)
+# define bfCacheLeave(p)  do{ if( (p) && (p)->mutex ) sqlite3_mutex_leave((p)->mutex); }while(0)
+#else
+# define bfCacheEnter(p)  do{ }while(0)
+# define bfCacheLeave(p)  do{ }while(0)
+#endif
+
 /* copyMode values for sqlite3BfMiniPageCopy. */
 #define BF_COPY_ALL        0   /* every record (size-class upgrade) */
 #define BF_COPY_REFERENCED 1   /* only records with the REF bit (eviction) */

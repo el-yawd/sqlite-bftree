@@ -101,50 +101,70 @@ Add a `paper` dataset and config to the harness:
 
 `steady` stays as the adversarial case.
 
-### A3. Multi-threaded readers  — **NOT a harness change; re-scoped 2026-09-16**
+### A3. Multi-threaded readers — **re-scoped twice; this is the correct version**
 
 The paper's 30 threads are not decoration: with many readers in flight a cache
 hit removes queueing, not just one request, which is a large part of why a hit
-is worth more there than here.  But this was written as "add `--threads N` to
-`bfbench.c`; WAL gives concurrent readers on separate connections and the
-single-writer constraint is untouched".  **That is true of SQLite and false of
-our cache**, so A3 is an ENGINE task with a harness task behind it.
+is worth more there than here.
 
-What the audit found:
+This item was first written as "add `--threads N` to `bfbench.c`" — a harness
+change.  It was then re-scoped as "the cache is a process global with no
+locking, so concurrent reads race".  **Both were wrong, and the second was wrong
+because it read dead code.**  What is actually true:
 
-* `BfCache` is a process **global** (`bfGlobalCache`, `bf_cache.c:74`), shared by
-  every connection in the process — not per-connection.
-* The only mutexes in `bf_cache.c` (5 uses, lines 691-712) guard **creation and
-  destruction of that singleton**.  Nothing guards per-operation work.
-* `bf_mapping.c`, `bf_mini_page.c` and `bf_btree.c` contain **zero** mutex calls.
-* A read that wins its promotion roll calls `sqlite3BfMapGetOrCreate` and
-  `sqlite3BfMiniPageInsert` (`bf_cache.c:781`, `:826`) — it **mutates** the
-  mapping table and mini-page contents.  Only the ring allocator underneath is
-  locked (`bf_circular_buffer.c`, 23 uses).
+* A `BfCache` is created **per pager** — `sqlite3PagerOpenBfCache` (`pager.c:4269`)
+  says so outright: *"one BfCache per pager is the correct architecture."*
+  Each connection therefore owns its own mapping table, mini-pages and ring.
+* `bfGlobalCache` / `sqlite3BfGetGlobalCache` (`bf_cache.c:74`, `:701`) look
+  like a shared singleton but have **zero call sites**.  Dead code.
+* So there is no cross-connection race today, because there is no sharing.
 
-So concurrent readers race on the mapping table and on mini-page contents, and
-`--threads 30` against today's engine would produce corruption, not a
-measurement.  "Concurrency is a documented non-transfer" in `CLAUDE.md` is
-broader than it reads: it is not only about writes.
+The real problem is the opposite of a race, and it is worse for fidelity:
+**the reference runs 30 threads against ONE buffer pool; N connections here
+allocate N independent rings, each of `bf_cache_size`** (`bf_cache.c:227`
+calls `sqlite3BfCacheBufferSize()` per cache).  Threading the harness as-is
+would either overspend the memory budget N-fold or give each thread 1/N of a
+cache — and the equal-budget comparison is the foundation the whole harness
+rests on.
 
 **Revised A3, in order:**
 
-* **A3a (engine).** One reader/writer lock over the BF cache, taken for the
-  mapping lookup + mini-page access + promotion and **released before any page
-  I/O**.  Coarse, but the critical section is sub-microsecond against a
-  ~100 µs miss, so it should still scale; refine only if measurement shows
-  contention.  Verify with a TSan build (`clang -fsanitize=thread`) under a
-  concurrent read stress — the differential oracles are single-threaded and
-  cannot see a race.
-* **A3b (harness).** `--threads N`: per-thread connection, prepared statements,
-  RNG and histograms; the zipf table and the Feistel permutation shared
-  read-only after init; per-thread histograms merged at the end.  Writers keep
-  serializing (`busy_timeout`), which stays a documented non-transfer.
+* **A3a (engine): share one record cache per database file across connections.**
+  This is the faithful architecture and it is what makes a thread axis mean
+  anything.  It needs the lock, because the moment two connections touch one
+  cache ordinary reads collide: `sqlite3BfMiniPageSearch` sets the REF bit with
+  a read-modify-write on `valueLenAndRef` — the same `u16` that carries the
+  value length and the WAL-logged flag, so a lost update corrupts a length, not
+  a hint — and `sqlite3BfMapLookup` walks a batch directory that
+  `bfMapEnsureCapacity` reallocs under it.
 
-**This is now the largest item in Stage A — bigger than any single Stage B
-item — and the Stage A gate cannot include "30 threads" until A3a lands.**  The
-rest of Stage A (A1, A2, A4) is independent of it and is already done, so the
-`paper` config can run single-threaded first and gain the thread axis later.
+  *Done:* `BfCache.mutex`, recursive, allocated and freed with the cache, with
+  `bfCacheEnter`/`bfCacheLeave` helpers that compile out when
+  `SQLITE_THREADSAFE=0`.  No inversion to design around — `bf_cache.c` never
+  calls into the btree (flushes are driven the other way, from
+  `bfFlushOneMiniPage`), and `evictCallback` refuses dirty pages rather than
+  flushing them, so the critical section holds no I/O.
+
+  *Not done, and the hard part:* the BF API hands out raw pointers into cache
+  state (`sqlite3BfMapLookup` returns a `BfMapEntry*`), so the lock must span
+  the **caller's** use of them.  The scope is the **28 `sqlite3BfBtree*` entry
+  points** called from `btree.c` (71 call sites), not the leaf functions —
+  locking the leaves would give false confidence.  Two of those entry points,
+  the forward and reverse merge scans, retain mini-page pointers **across**
+  btree steps and need a pinning design before any lock makes them safe.
+  Plus the lifecycle change itself: one cache per file rather than per pager,
+  with refcounting.
+
+* **A3b (harness).** `--threads N`: per-thread connection, prepared statements,
+  RNG and histograms; zipf table and Feistel permutation shared read-only after
+  init; histograms merged at the end.  Writers keep serializing
+  (`busy_timeout`), which stays a documented non-transfer.
+
+**A3a is a project, not a task — larger than all of Stage B put together.**  The
+rest of Stage A (A1, A2, A4) is independent of it and is done, so the `paper`
+config runs single-threaded now and gains the thread axis later.  Treat
+single-threaded `paper` numbers as a floor: they omit the queueing effect that
+is part of why the paper's hit is worth what it is.
 
 ### A4. Report the per-record ring cost
 `mini_page_bytes / cached_records` becomes a first-class column in `report.py`,
