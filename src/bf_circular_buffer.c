@@ -236,9 +236,32 @@ static void *bfFreeListRemove(BfFreeList *pFl, u32 size){
 
   ptr = pFl->apHead[idx];
   if( ptr ){
-    ppNext = (void**)ptr;
-    pFl->apHead[idx] = *ppNext;
-    BF_CB_TRACE("freelist-remove", ptr, (int)size);
+    /* The chain lives INSIDE the freed blocks, so it is only as valid as the
+    ** blocks are.  A block can be put on this list and later be swept by the
+    ** FIFO eviction head; once the tail wraps around and reuses that address,
+    ** its first 8 bytes are payload, and following the "next" pointer walks
+    ** into whatever now occupies them.
+    **
+    ** Nothing removes a block from this list when the head passes it, so
+    ** validate on the way out: a block that is genuinely still free is still in
+    ** BF_STATE_FREELISTED.  Anything else means the chain has been overtaken,
+    ** and since the next pointer is no longer trustworthy either, the whole
+    ** class is abandoned rather than followed.  The space is not lost -- it is
+    ** reclaimed by the head sweep like any other block.
+    **
+    ** This was latent for as long as eviction never actually ran (every read
+    ** benchmark here reports evictions=0).  It segfaults within seconds of the
+    ** ring genuinely cycling. */
+    BfAllocMeta *pMeta = bfGetMetaFromDataPtr(ptr);
+    if( bfMetaLoadState(pMeta)!=BF_STATE_FREELISTED ){
+      pFl->apHead[idx] = 0;
+      ptr = 0;
+      BF_CB_TRACE("freelist-stale-chain-dropped", 0, (int)size);
+    }else{
+      ppNext = (void**)ptr;
+      pFl->apHead[idx] = *ppNext;
+      BF_CB_TRACE("freelist-remove", ptr, (int)size);
+    }
   }
 
   sqlite3_mutex_leave(pFl->mutex);
