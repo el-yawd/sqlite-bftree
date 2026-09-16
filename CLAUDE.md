@@ -48,24 +48,39 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
   proper benchmark — a C driver linked against the amalgamation (prepared
   statements, per-op latency histograms, `/proc/self/io` block-layer bytes), a
   matrix runner that enforces an equal memory budget and a cgroup cap, and a
-  report generator.  See `bench/harness/README.md` for the requirements it meets
-  and the workloads it runs.  **Not yet run at full scale** — the campaign
-  (`configs/full.json`, ~2-3 h) is the next thing to execute.
-  - Already surfaced by the smoke pass, and *not* yet explained:
-    - **Write-back insert refuses records above ~64-96 B** and falls back to the
-      base-page path (100% buffered at 64 B, 31% at 96 B, 14% at 200 B —
-      independent of `bf_cache_size` across a 16x range, so structural, not
-      capacity).  `wal_write_amp.sh` uses 64-byte payloads, i.e. exactly the
-      size where buffering always succeeds, so the "1 page frame/commit" claim
-      was only ever measured inside the good region.  `record_size` is now an
-      axis in `configs/full.json`.
-    - **UPDATE never buffers at all**: `wal_record_frames=0`,
-      `buffered_inserts=0` on a pure-update workload; it takes the page-image
-      path (still 1 frame/commit, so ~2x less WAL than stock, but none of the
-      record-granular win).
-    - **`negative_read` is ~4.5x SLOWER than stock** while reading 5x fewer
-      bytes from disk — a CPU-bound path, the opposite of the paper's §5.6
-      phantom-caching claim.
+  report generator.  See `bench/harness/README.md`.  `--pre REV` builds a second
+  amalgamation as a `bf_pre` SUT so a before/after runs inside ONE campaign;
+  cross-campaign numbers are not comparable (stock alone has spanned 3.2x).
+
+### Where the fork actually stands (2026-09-15, all within-campaign)
+
+| workload | vs stock |
+|---|---|
+| inserts | **3.96x** (was 0.22x, i.e. 4.5x slower, before this session) |
+| point reads, zipf 0.99, larger-than-memory | **1.15x**, 21% fewer bytes read |
+| point reads, zipf 0.99, warm in RAM | **1.31x** |
+| point reads, zipf 0.9 | 1.02–1.04x |
+| update, mixed read/write | parity |
+
+**The win tracks the record hit rate, and nothing else.**  34% → 1.04x,
+55% → 1.15x, 57% → 1.02x, 71% → 1.31x.  Promotion rate, warmup length, ring
+occupancy and the OS page cache matter only through their effect on that number.
+A read benchmark whose warmup does not fill the ring measures an empty cache and
+reports parity — which is what every earlier campaign here did.
+
+Gap to the paper's ~2x, quantified rather than mysterious: the hit rate
+saturates near 55% because a 128 MiB ring holds about half the hot set of a
+60M-row zipf-0.99 table, and with buffered I/O an avoided miss is cheap.  **A
+direct-I/O VFS is the remaining lever** (`../bf-tree` uses StdDirect/io_uring and
+30 threads); that is real work, not tuning.
+
+The three findings this file used to list as unexplained:
+  - *record-size cliff* — **explained and fixed**.  `aSizeClass` was filled
+    descending and scanned ascending, so every mini-page became 4096 B.
+  - *`negative_read` 4.5x slower* — **did not reproduce**; it was 0.86x, then a
+    stale-binary artefact.
+  - *UPDATE never buffers* — **still true** (`rec frames/commit` = 0); it takes
+    the page-image path at 1 frame/commit.  Unexplained, and the oldest open item.
 
 ## Build & test
 ```bash
@@ -76,6 +91,7 @@ cd ../bench && sh stress.sh                                # differential oracle
 sh stress_buf.sh                                           # same, vs ../build/sqlite3_buf
 BF_GROUP=8 sh stress_buf.sh                                # ... with group commit on
 BF_PROMOTION=100 sh stress_buf.sh                          # ... with read promotion at max
+BF_CACHE_SIZE=262144 sh stress_buf.sh                      # ... with a ring small enough to CYCLE
 sh wal_write_amp.sh 5000 200 1                             # write-amplification report
 
 # Benchmark campaign (bench/harness/README.md documents the methodology)
@@ -89,6 +105,14 @@ sh bench/harness/build_suts.sh --pre HEAD                  # + bfbench_bf_pre
 python3 bench/harness/runner.py bench/harness/configs/fixes_smoke.json  # ~2 min
 python3 bench/harness/runner.py bench/harness/configs/fixes.json        # ~1.5 h
 ```
+**Run the `BF_CACHE_SIZE` variant.**  At the default ring size these workloads
+never evict -- every benchmark in this repo reports `evictions=0` and the oracle
+databases are smaller still -- so eviction, free-list reuse and
+upgrade-under-pressure went untested for the project's whole life.  That is how
+a segfault in `bfFreeListRemove` (`bench/ring_repro.sh`) reached a commit.  With
+`BF_CACHE_SIZE=262144` a single suite run produces ~2,200 evictions, ~10,300
+upgrades and ~1,400 compactions.
+
 Ablation switches (all default OFF, i.e. the feature is on): `SQLITE_BF_NO_MERGE_SCAN`,
 `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,
 `SQLITE_BF_NO_MINIPAGE_COMPACT`.
@@ -157,14 +181,14 @@ own harness in `benchmark/` (`bench_bftree.toml`, `bench_e2e.toml`, `run.sh`).
 Only after showing our code matches theirs is "structural difference" an honest
 conclusion.
 
-### Measured baselines (2026-08-18, 8M-row / 0.83 GiB db, warm)
-- read path (point reads, no writes): **1.14x wall / 1.30x CPU vs stock**
-- appends (200k rows, temp table): was **132x** stock -> **6.2x** after the
-  `BF_MINI_F_DIRTY` fix (17.5s -> 0.83s); remaining cost is the per-mutation
-  whole-map walk in `bfFlushTableDirty` (~29% of samples), which wants per-root
-  dirty tracking next
-- commits: **1 page frame/commit** (WAL-format floor, zero base-page writes);
-  `bf_group_commit=32` gives ~30x less WAL than stock
+### Measured baselines
+Superseded by the table above.  The 2026-08-18 baselines (1.14x reads, 6.2x
+appends, "1 page frame/commit") were taken before the size-class, truncate,
+commit-logging and promotion fixes, and with `wal_autocheckpoint` forced to 0.
+The commit-time claim still holds as a claim about **what a commit emits** (1.00
+record frame); since auto-checkpoint is on by default it is no longer also a
+claim about total bytes on disk — inserts reach 2.58 page frames/commit once
+checkpoints materialise the records.  `write_amp` measures both.
 
 ## Testing specialists (`.claude/agents/`)
 - **`esbmc-verifier`** — ESBMC bounded model checking of pure modules (WAL codec, mini-page,

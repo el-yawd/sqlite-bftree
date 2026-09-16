@@ -51,19 +51,30 @@ for seed in $SEEDS; do
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
         python3 ./gen_rev_stress.py "$seed" 400 >> "$b.sql"
       fi
-      # Optional BF knobs (BF_GROUP=N / BF_PROMOTION=N sh stress_buf.sh).
+      # Optional BF knobs (BF_GROUP=N / BF_PROMOTION=N / BF_CACHE_SIZE=N).
       # Stock ignores the unknown pragmas, so both sides run the same script.
       #
       # These MUST land AFTER the generator's own PRAGMA block: changing
       # journal_mode reopens the pager and drops any BF setting made before it,
       # silently -- the pragma still reads back the value you set.  So insert
       # them just after the leading run of PRAGMA lines, not at the top.
-      if [ -n "$BF_GROUP" ] || [ -n "$BF_PROMOTION" ]; then
+      if [ -n "$BF_GROUP" ] || [ -n "$BF_PROMOTION" ] || [ -n "$BF_CACHE_SIZE" ]; then
         : > "$b.bf.pragmas"
         [ -n "$BF_GROUP" ] && \
           printf 'PRAGMA bf_group_commit=%s;\n' "$BF_GROUP" >> "$b.bf.pragmas"
         [ -n "$BF_PROMOTION" ] && \
           printf 'PRAGMA bf_promotion_rate=%s;\n' "$BF_PROMOTION" >> "$b.bf.pragmas"
+        # BF_CACHE_SIZE=262144 makes the record ring small enough that these
+        # workloads CYCLE it: eviction runs, blocks go on and come off the free
+        # lists, and mini-pages are upgraded under memory pressure.  None of that
+        # is reachable at the default size -- every benchmark in this repo
+        # reports evictions=0 and the oracle databases are far smaller still --
+        # which is how a segfault in bfFreeListRemove (bench/ring_repro.sh) lived
+        # in committed code: the free-list chain is threaded through the freed
+        # blocks, and nothing removed a block when the eviction head swept past
+        # it.  Run a gate variant with this set.
+        [ -n "$BF_CACHE_SIZE" ] && \
+          printf 'PRAGMA bf_cache_size=%s;\n' "$BF_CACHE_SIZE" >> "$b.bf.pragmas"
         awk -v pf="$b.bf.pragmas" '
           !ins && !/^[Pp][Rr][Aa][Gg][Mm][Aa] / {
             while ((getline line < pf) > 0) print line
