@@ -368,6 +368,14 @@ struct BfCache {
   int nDirtyPgAlloc;        /* allocated slots */
   int bDirtyListOverflow;   /* 1 => list unusable, fall back to full walk */
 
+  /* A mini-page the caller is mid-way through reading, which the FIFO eviction
+  ** sweep must not reclaim.  sqlite3BfRecordWrite's upgrade and compaction
+  ** paths evict-and-retry when the ring is full, and unlike the create path
+  ** (where nothing is linked yet) their pEntry still points AT the slab they
+  ** are about to copy FROM -- a clean one, which evictCallback would happily
+  ** unlink and hand back to the ring, leaving the copy reading freed memory. */
+  void *pEvictProtect;
+
   /* Pages holding dirty-but-unlogged records, i.e. what THIS transaction has
   ** to log at commit.  Same conservative contract as aDirtyPg above: entries
   ** may be stale or duplicated (revisiting a page whose records are all logged

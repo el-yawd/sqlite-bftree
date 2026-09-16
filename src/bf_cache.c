@@ -844,6 +844,21 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
                                           pCache->aSizeClass);
   if( newSize > 0 && newSize <= BF_MAX_MINI_PAGE ){
     pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, newSize);
+    if( !pNew ){
+      /* Ring full: reclaim from the FIFO head and retry, exactly as the
+      ** create-a-mini-page path above does.  Without this the upgrade simply
+      ** fails and the record is not cached -- and because nothing else ever
+      ** calls sqlite3BfCacheEvict, a full ring meant a leaf could never grow
+      ** past the size it happened to reach, so the cache froze with whatever
+      ** it had admitted early.  Measured at saturation (16 MiB ring, 4M rows,
+      ** zipf 0.99): 46.4% hit rate where the ideal for that many cached records
+      ** is 71.5%.  The sweep refuses dirty mini-pages, so buffered writes are
+      ** never dropped. */
+      pCache->pEvictProtect = pMini;
+      sqlite3BfCacheEvict(pCache, 16);
+      pCache->pEvictProtect = 0;
+      pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, newSize);
+    }
     if( pNew ){
       sqlite3BfCircularBufferMarkReady(pNew);
       /* Copy ALL records, not just referenced ones: this mini-page may hold
@@ -892,6 +907,12 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     u16 curSize = pMini->nodeSize;
     if( sqlite3BfMiniPageDirtyCount(pMini) < sqlite3BfMiniPageCount(pMini) ){
       pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, curSize);
+      if( !pNew ){
+        pCache->pEvictProtect = pMini;     /* same reclaim-and-retry */
+        sqlite3BfCacheEvict(pCache, 16);
+        pCache->pEvictProtect = 0;
+        pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, curSize);
+      }
       if( pNew ){
         sqlite3BfCircularBufferMarkReady(pNew);
         rc = sqlite3BfMiniPageCopy((BfMiniPage*)pNew, curSize, pMini,
@@ -1056,6 +1077,9 @@ static int bfCacheMergeInternal(BfCache *pCache, u32 pgno, Pager *pPager){
 
   pMini = (BfMiniPage*)pEntry->pPage;
   if( !pMini ) return BF_OK;
+  if( (void*)pMini == pCache->pEvictProtect ){
+    return BF_ERROR;         /* in use by the caller that triggered this sweep */
+  }
 
   /* Check if mini-page has dirty records that need merging */
   if( !sqlite3BfMiniPageIsDirty(pMini) ){
