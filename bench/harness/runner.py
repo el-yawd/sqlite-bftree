@@ -219,6 +219,57 @@ def expand(config, only=None, suts_override=None):
     return runs
 
 
+def split_memory(run, page_floor):
+    """Decide the memory split for one experiment cell.
+
+    Returns (total, ring, page_cache).  `total` depends only on the cell, not
+    on the SUT, so every engine in the cell is given exactly the same bytes --
+    that is the whole point of this function existing in one place.
+
+    The ring must be a power of two: bf_circular_buffer.c masks addresses with
+    capacity-1, and so does the reference (circular_buffer/mod.rs asserts
+    is_power_of_two).  That constraint is faithful and stays.  What does NOT
+    have to stay is what we did with the remainder.
+
+    Rounding the ring DOWN inside a fixed budget kept the totals equal and
+    quietly halved the thing under test: budget 256M with an 8M floor asks for
+    a 248M ring, rounds down to 128M, and hands the other 128M to the page
+    cache.  The 2026-09-16 steady campaign ran its entire larger-than-memory
+    arm that way -- `bf.buffer_size` reads 134217728 in every row -- so the
+    record cache was measured at half its configured size, with the surplus
+    given to the component Bf-Tree exists to replace.  Rounding UP inside the
+    budget is worse: it gave BF 12.5% more memory than stock.
+
+    "match" (the default) rounds the ring UP and raises the TOTAL to match, so
+    `budget_bytes` is a floor rather than a ceiling: every SUT gets
+    ring + page_floor.  The ring is what the config asked for, and the totals
+    are still exactly equal.  "down" and "up" reproduce the two older
+    behaviours for comparison with results recorded before this.
+    """
+    budget = parse_size(run["budget_bytes"])
+    floor = parse_size(run.get("bf_page_cache_floor", page_floor))
+    floor = min(floor, budget // 2)
+    ring = budget - floor
+    mode = run.get("bf_ring_round", "match")
+
+    if mode == "match":
+        pow2 = 1
+        while pow2 < ring:
+            pow2 *= 2
+        return pow2 + floor, pow2, floor
+    if mode == "down":
+        pow2 = 1
+        while pow2 * 2 <= ring:
+            pow2 *= 2
+        return budget, pow2, budget - pow2
+    if mode == "up":
+        pow2 = 1
+        while pow2 < ring:
+            pow2 *= 2
+        return pow2 + floor, pow2, floor
+    raise SystemExit("unknown bf_ring_round %r (match|down|up)" % mode)
+
+
 def resolve_memmax(run):
     """Cap for one run, resolving the "auto" keyword.
 
@@ -227,12 +278,15 @@ def resolve_memmax(run):
     so ops/s falls as the budget *rises* (visible in the 2026-08-25 point_read
     table, both SUTs).  "auto" keeps the engine at a constant fraction of the
     cap, so the axis varies engine cache size and nothing else.
+
+    It scales with the EFFECTIVE total from split_memory(), not with the
+    configured budget_bytes, so a cell whose ring rounded up does not quietly
+    lose the headroom the cap was meant to guarantee.
     """
     mm = run.get("memmax")
     if mm != "auto":
         return mm
-    budget = parse_size(run["budget_bytes"])
-    return str(budget * 2 + (256 << 20))
+    return str(run["mem_split"]["total"] * 2 + (256 << 20))
 
 
 def parse_size(v):
@@ -256,7 +310,8 @@ def build_argv(run, dbpath, jsonpath, page_floor):
     """
     sut = run["sut"]
     binary = os.path.join(BIN, "bfbench_" + sut)
-    budget = parse_size(run["budget_bytes"])
+    split = run["mem_split"]
+    budget = split["total"]
 
     argv = [binary, "run",
             "--db", dbpath,
@@ -305,28 +360,11 @@ def build_argv(run, dbpath, jsonpath, page_floor):
         # real page cache hit a fixed 256-bucket hash and ran ~13x slower than
         # pcache1 -- so every BF run was pinned at the 8 MiB floor and "equal
         # budget" quietly meant "stock gets a page cache, BF does not".
-        floor = parse_size(run.get("bf_page_cache_floor", page_floor))
-        floor = min(floor, budget // 2)
-        ring = budget - floor
-        # The ring is a power of two by construction (bf_circular_buffer.c
-        # masks with capacity-1), and PRAGMA bf_cache_size rounds the request
-        # UP to reach one.  So asking for budget-floor does not give
-        # budget-floor: a 64 MiB budget with an 8 MiB floor asked for 56 MiB
-        # and got a 64 MiB ring, i.e. 72 MiB total against stock's 64 MiB --
-        # a 12.5% memory advantage along the very axis point_read sweeps.  It
-        # was invisible until PRAGMA bf_cache_size started taking effect at
-        # all (before that every ring was 8 MiB regardless of the request).
-        # Round DOWN instead and hand the remainder to the page cache: the
-        # totals are then exactly equal, and the split is explicit rather than
-        # accidental.  "up" restores the old, overshooting behaviour for
-        # comparison against results recorded before this.
-        if run.get("bf_ring_round", "down") == "down":
-            pow2 = 1
-            while pow2 * 2 <= ring:
-                pow2 *= 2
-            ring = pow2
-        argv += ["--bf-cache-bytes", str(ring),
-                 "--page-cache-bytes", str(budget - ring)]
+        #
+        # The ring/page-cache arithmetic and its history live in
+        # split_memory(); this branch only spends what it was handed.
+        argv += ["--bf-cache-bytes", str(split["ring"]),
+                 "--page-cache-bytes", str(split["page_cache"])]
         if run.get("group_commit") is not None:
             argv += ["--group-commit", str(run["group_commit"])]
         if run.get("promotion") is not None:
@@ -412,11 +450,31 @@ def main():
     page_floor = parse_size(config.get("defaults", {})
                             .get("bf_page_cache_floor", DEFAULT_PAGE_FLOOR))
 
+    # One split per cell, stamped before anything reads it, so build_argv,
+    # resolve_memmax, the preflight check and the recorded row cannot disagree
+    # about how many bytes this cell was given.
+    for r in runs:
+        total, ring, pcache = split_memory(r, page_floor)
+        r["mem_split"] = {"total": total, "ring": ring, "page_cache": pcache,
+                          "mode": r.get("bf_ring_round", "match")}
+
     print("config: %s   runs: %d" % (args.config, len(runs)))
     est = sum(float(r.get("seconds", 0)) + float(r.get("warmup_seconds", 0))
               for r in runs)
     print("estimated measured+warmup time: %.0f min (plus load, copies, zipf setup)"
           % (est / 60.0))
+
+    seen = []
+    for r in runs:
+        k = (r["budget_bytes"], r["mem_split"]["total"], r["mem_split"]["ring"],
+             r["mem_split"]["page_cache"], r["mem_split"]["mode"])
+        if k not in seen:
+            seen.append(k)
+    print("memory split (identical total for every SUT in a cell):")
+    for budget, total, ring, pcache, mode in seen:
+        print("  budget %-6s -> total %6.1f MiB = ring %6.1f + page cache %5.1f"
+              "   [%s]" % (budget, total / (1 << 20), ring / (1 << 20),
+                           pcache / (1 << 20), mode))
 
     if args.dry_run:
         for r in runs[:60]:
@@ -492,7 +550,7 @@ def main():
         mm = resolve_memmax(r)
         if mm:
             cap = parse_size(mm)
-            budget = parse_size(r["budget_bytes"])
+            budget = r["mem_split"]["total"]
             # Below 2x the engine budget there is no room left for the OS page
             # cache, and the run measures cgroup reclaim rather than the engine.
             if cap < budget * 2 + (128 << 20):
@@ -566,6 +624,25 @@ def main():
                 record["error"] = "unparsable driver json: %s" % e
         else:
             record["error"] = "driver produced no json (killed? OOM?)"
+
+        # The engine must actually hold the ring it was handed.  Nothing in
+        # this harness ever compared the request against what the build
+        # reports, which is how an entire campaign ran at half the configured
+        # record-cache size without a single warning.  Check it every run.
+        if record.get("run") and r["sut"] not in ("stock", "bf_off"):
+            got = ((record["run"].get("result") or {}).get("bf") or {}) \
+                    .get("buffer_size")
+            want = r["mem_split"]["ring"]
+            if got is not None and got != want:
+                record["ring_mismatch"] = {"asked": want, "got": got}
+                print("          ERROR: ring mismatch -- asked %.1f MiB, "
+                      "engine reports %.1f MiB"
+                      % (want / (1 << 20), got / (1 << 20)))
+                if strict:
+                    fout.write(json.dumps(record) + "\n")
+                    fout.flush()
+                    sys.exit("refusing to continue: the SUT is not running the "
+                             "memory budget it was given")
 
         if proc.returncode != 0:
             n_fail += 1

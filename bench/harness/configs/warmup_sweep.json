@@ -1,0 +1,52 @@
+{
+  "name": "warmup_sweep",
+  "_comment": [
+    "Does the 256 MiB ring reach steady state within the warmup we give it?",
+    "",
+    "At the old 128 MiB ring the ltm_steady arm SATURATED -- ~100k evictions per",
+    "run -- so a plateau was guaranteed and 420 s was demonstrably enough.  A1",
+    "doubled the ring and evictions fell to ZERO, which removes that guarantee:",
+    "the cache may simply still be filling when the measurement window opens.",
+    "",
+    "Repeats cannot answer this.  Every repeat is a fresh process that starts",
+    "with an empty cache and warms for the same duration, so two runs that are",
+    "both too short agree perfectly -- which is exactly what rep0/rep1 did",
+    "(802192 vs 776676 cached, hit 35.5% both).  Only a WARMUP axis answers it.",
+    "",
+    "Read cached_records and hit rate across the three points.  Flat => the",
+    "ltm_steady numbers are steady state and quotable.  Climbing => 420 s is too",
+    "short for the bigger ring, and every A1 read number is a floor, not a",
+    "result, and steady.json needs its warmup raised before anything is quoted.",
+    "",
+    "bf only: stock has no record cache to fill, and the question is solely",
+    "whether ours has stopped growing.  theta 0.9 only -- it is the slower",
+    "filling of the two and therefore the binding case."
+  ],
+  "datasets": {
+    "big": { "records": 60000000, "value_len": 100, "key_spacing": 16 }
+  },
+  "defaults": {
+    "suts": ["bf"],
+    "repeats": 1,
+    "seconds": 60,
+    "workload": "read=100",
+    "dist": "zipf",
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "read_txn": true,
+    "drop_cache": true
+  },
+  "experiments": [
+    {
+      "name": "warmup",
+      "dataset": "big",
+      "budget_bytes": "256M",
+      "memmax": "384M",
+      "bf_page_cache_floor": "8M",
+      "promotion": 30,
+      "axes": { "warmup_seconds": [420, 900, 1800] }
+    }
+  ]
+}

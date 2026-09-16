@@ -118,6 +118,7 @@ static uint64_t fnv64(uint64_t v){
 #define DIST_UNIFORM 0
 #define DIST_ZIPF    1
 #define DIST_LATEST  2
+#define DIST_ZIPFRAW 3
 
 typedef struct Zipf {
   uint64_t n;          /* item count */
@@ -604,6 +605,29 @@ static long long pickKey(RunState *s, Config *p){
       idx = (uint64_t)p->nRecords - 1 - (r % (uint64_t)p->nRecords);
       break;
     }
+    case DIST_ZIPFRAW:
+      /* Raw Zipfian: the rank IS the key index, so the hot set is the first N
+      ** physically adjacent rows.  This is what the Bf-Tree reference harness
+      ** does -- benchmark/src/common.rs samples rand_distr::Zipf and
+      ** install_value_to_buffer() writes that rank straight into the key --
+      ** and therefore what the paper's numbers were measured on.
+      **
+      ** It is the FRIENDLIER setting for a page cache, not a hostile one: a
+      ** 4 KiB leaf holding ~34 adjacent hot rows is a good deal for stock.
+      ** What it changes for us is mini-page occupancy.  Under the scrambled
+      ** default our mini-pages hold 1.26 records each (live_mini_pages 414574
+      ** vs cached_records 522780 in the 2026-09-16 campaign), so we pay a
+      ** header + meta + size-class round-up per SINGLE record -- 250 B to
+      ** cache a 116 B one.  Clustered keys amortise that header across many
+      ** records, and they are the precondition for the full-page cache
+      ** (BF_LOC_FULL) being an admission win rather than ring waste.
+      **
+      ** Both modes stay, and both get reported.  Neither is "the honest one":
+      ** YCSB scrambles, so the default is the conservative choice, while this
+      ** is the one that reproduces the paper.  Quoting only whichever flatters
+      ** the result is the thing to avoid. */
+      idx = zipfNext(&s->zipf, &s->rng) % (uint64_t)p->nRecords;
+      break;
     default:
       /* Scrambled Zipfian: rank -> hash -> key, so the hot set is spread over
       ** the whole file rather than the first few pages. */
@@ -1000,7 +1024,8 @@ static int cmdRun(Config *p){
           p->zDb, p->nRecords, p->nValueLen, p->nKeySpacing);
   fprintf(out, "    \"dist\": \"%s\", \"theta\": %.3f, \"scan_len\": %d,\n",
           p->dist==DIST_UNIFORM ? "uniform" :
-          p->dist==DIST_LATEST  ? "latest" : "zipf",
+          p->dist==DIST_LATEST  ? "latest" :
+          p->dist==DIST_ZIPFRAW ? "zipf-raw" : "zipf",
           p->theta, p->nScanLen);
   fprintf(out, "    \"mix\": {");
   for(i=0; i<OP_COMMIT; i++){
@@ -1124,7 +1149,10 @@ static const char zUsage[] =
 "\n"
 "run options:\n"
 "  --workload read=100,update=0,insert=0,scan=0,negative_read=0,rmw=0\n"
-"  --dist zipf|uniform|latest   --theta 0.9      --scan-len 32\n"
+"  --dist zipf|zipf-raw|uniform|latest   --theta 0.9      --scan-len 32\n"
+"       zipf     = YCSB scrambled rank (hot set spread over the key space)\n"
+"       zipf-raw = rank used directly as the key, as the Bf-Tree reference\n"
+"                  harness does (hot set contiguous); reproduces the paper\n"
 "  --seconds S | --ops N        --warmup-seconds S | --warmup-ops N\n"
 "  --bf-cache-bytes N           --page-cache-bytes N\n"
 "  --synchronous off|normal|full  --journal wal|delete\n"
@@ -1152,8 +1180,9 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--key-spacing")==0 ){ NEEDVAL; cfg.nKeySpacing = atoi(zVal); }
     else if( strcmp(z,"--workload")==0 ){ NEEDVAL; parseMix(&cfg, zVal); }
     else if( strcmp(z,"--dist")==0 ){ NEEDVAL;
-      cfg.dist = strcmp(zVal,"uniform")==0 ? DIST_UNIFORM
-               : strcmp(zVal,"latest")==0  ? DIST_LATEST : DIST_ZIPF; }
+      cfg.dist = strcmp(zVal,"uniform")==0  ? DIST_UNIFORM
+               : strcmp(zVal,"latest")==0   ? DIST_LATEST
+               : strcmp(zVal,"zipf-raw")==0 ? DIST_ZIPFRAW : DIST_ZIPF; }
     else if( strcmp(z,"--theta")==0 ){ NEEDVAL; cfg.theta = atof(zVal); }
     else if( strcmp(z,"--scan-len")==0 ){ NEEDVAL; cfg.nScanLen = atoi(zVal); }
     else if( strcmp(z,"--seconds")==0 ){ NEEDVAL; cfg.seconds = atof(zVal); }

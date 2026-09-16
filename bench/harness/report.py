@@ -136,6 +136,23 @@ def metrics(r):
         "bf_ring_MiB": (bf.get("cb_capacity") / (1 << 20)
                         if "cb_capacity" in bf else None),
         "bf_cached_records": bf.get("cached_records"),
+        # Bytes of ring spent per record actually cached: mini-page header +
+        # meta array + size-class round-up, amortised over however many records
+        # share the page.  This is the number that decides every capacity
+        # question, and it was computed by hand for a year.
+        #
+        # 2026-09-16: 250 B to cache a 116 B record, stable at 240-252 B across
+        # a 16 MiB and a 256 MiB ring and both skews -- so it is a property of
+        # the layout, not of pressure.  Two things move it: records per
+        # mini-page (1.26 under scrambled zipf, because a lone hot record pays
+        # for a whole header) and the size-class granularity (ours is a fixed
+        # 64..4096 doubling; the reference derives classes from the record
+        # size, tree.rs:222-250, giving a 192 B class where we take 256).
+        # Stage B1 attacks the second.
+        "bf_bytes_per_record": (bf.get("mini_page_bytes") / bf["cached_records"]
+                                if bf.get("cached_records") else None),
+        "bf_records_per_page": (bf.get("cached_records") / bf["live_mini_pages"]
+                                if bf.get("live_mini_pages") else None),
         "bf_evictions": bf.get("evictions"),
         "bf_upgrades": bf.get("upgrades"),
         "read_errors": res.get("read_errors", 0) + res.get("read_misses", 0),
@@ -153,7 +170,7 @@ NOISE_THRESHOLD = 0.15
 LOWER_IS_BETTER = {"p50_us", "p99_us", "p999_us", "commit_p50_us",
                    "commit_p99_us", "read_MiB", "write_MiB", "cpu_s",
                    "read_bytes_per_op", "write_bytes_per_commit",
-                   "maxrss_MiB"}
+                   "maxrss_MiB", "bf_bytes_per_record"}
 
 
 def ratio(metric, bf_val, stock_val):
@@ -305,15 +322,17 @@ def main():
                        for m in groups[(exp, ax, s)])]
         if det:
             W("")
-            W("| config | sut | ring MiB | cached recs | evictions | upgrades | "
-              "buffered% | rec frames/commit | pg frames/commit |")
-            W("|---|---|---|---|---|---|---|---|---|")
+            W("| config | sut | ring MiB | cached recs | B/record | recs/page | "
+              "evictions | upgrades | buffered% | rec frames/commit | "
+              "pg frames/commit |")
+            W("|---|---|---|---|---|---|---|---|---|---|---|")
             for ax, s, ms in det:
                 def med(metric, nd=1):
                     vs = [m[metric] for m in ms if m[metric] is not None]
                     return fmt(median(vs), nd) if vs else "-"
-                W("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                W("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
                     ax, s, med("bf_ring_MiB"), med("bf_cached_records", 0),
+                    med("bf_bytes_per_record", 0), med("bf_records_per_page", 2),
                     med("bf_evictions", 0), med("bf_upgrades", 0),
                     med("bf_buffered_pct"), med("bf_record_frames_per_commit", 2),
                     med("bf_page_frames_per_commit", 2)))

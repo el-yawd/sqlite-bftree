@@ -1,0 +1,100 @@
+{
+  "name": "paper",
+  "_comment": [
+    "Stage A2: the reference's own workload shape, so 'does Bf-Tree transfer'",
+    "is asked the way the paper asked it.",
+    "",
+    "Matched to benchmark/bench_bftree.toml ('storage' / 'read_only'):",
+    "  100M records, key_len 16, VALUE = THE KEY (bench_bftree.rs does",
+    "  `tree.insert(key, key)`, so a record is ~32 B, not our usual 116 B),",
+    "  zipf 0.9, read=100, memory 1 GiB against ~3.2 GB of data (~30%).",
+    "",
+    "Deliberately NOT matched, with reasons:",
+    "  - storage backends StdDirect / IoUringPolling / IoUringBlocking.  SQLite's",
+    "    unix VFS has no O_DIRECT and the comparison here is against",
+    "    gold-standard SQLite, so porting one would change what we compare to.",
+    "    It stays the honest prerequisite for the paper's ABSOLUTE numbers.",
+    "  - 30 threads.  Blocked on A3 (--threads in bfbench.c).  Until that lands",
+    "    this config understates the value of a cache hit: with many readers in",
+    "    flight a hit removes queueing, not just one request.",
+    "",
+    "TWO ARMS ON PURPOSE, and both get reported:",
+    "  paper_raw       dist=zipf-raw, the rank used directly as the key, as the",
+    "                  reference does.  Hot keys are contiguous.",
+    "  paper_scrambled dist=zipf, YCSB's FNV scramble, our long-standing",
+    "                  default.  Hot keys are scattered.",
+    "Neither is 'the honest one'.  Scrambling is the conservative choice and is",
+    "what YCSB does; raw is what the paper measured.  Quoting only the",
+    "flattering arm is the failure mode this config exists to prevent.",
+    "",
+    "MEASURED (2026-09-16), controlled: same 4M-row dataset, same 16 MiB ring,",
+    "same promotion=30, 1.5M ops, only --dist varying:",
+    "",
+    "  dist       recs/page  B/record  cached  rec hit%   ops/s",
+    "  zipf            1.57       229   71459     33.6   114029",
+    "  zipf-raw        2.56       201   79026     22.9   134988",
+    "",
+    "So clustering is worth ~1.6x in mini-page occupancy and ~12% in bytes per",
+    "cached record -- real, but an order of magnitude less than a first guess",
+    "off an uncontrolled 20k-row spot check suggested (that comparison was",
+    "coverage, not distribution: 20k rows under a 1 MiB ring caches a large",
+    "fraction of the table, so even scrambled keys cluster, and BOTH dists gave",
+    "~11-13 recs/page there).  Measure occupancy at the coverage ratio you",
+    "actually intend to run; it is a property of the regime, not of the dist.",
+    "",
+    "Note the direction of the hit rate: zipf-raw caches MORE records, hits on",
+    "FEWER of them, and is FASTER.  With contiguous hot keys the page cache",
+    "serves the hot set well on its own, so a record-cache miss is cheap and the",
+    "record hit rate stops being the metric that tracks throughput.  That is",
+    "worth knowing before B3 (full-page cache) is judged on hit rate.",
+    "",
+    "Watch B/record and recs/page (report.py) as closely as the hit rate.  And",
+    "note evictions: at a 1 GiB ring these may well be 0, in which case the",
+    "warmup, not the capacity, is what the number is measuring."
+  ],
+  "datasets": {
+    "paper": { "records": 100000000, "value_len": 16, "key_spacing": 16 }
+  },
+  "defaults": {
+    "suts": ["stock", "bf"],
+    "repeats": 2,
+    "seconds": 60,
+    "warmup_seconds": 420,
+    "workload": "read=100",
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "read_txn": true,
+    "drop_cache": true,
+    "bf_page_cache_floor": "8M"
+  },
+  "experiments": [
+    {
+      "name": "paper_raw",
+      "_why": [
+        "The replication target: reference workload, reference distribution.",
+        "If the mechanism transfers at all, it transfers here."
+      ],
+      "dataset": "paper",
+      "dist": "zipf-raw",
+      "budget_bytes": "1024M",
+      "memmax": "auto",
+      "promotion": 30
+    },
+    {
+      "name": "paper_scrambled",
+      "_why": [
+        "Same everything, YCSB-scrambled keys.  The delta between the two arms",
+        "IS the measurement of how much of the paper's win depends on hot keys",
+        "being physically clustered -- which is also the precondition for the",
+        "full-page cache (B3) being an admission win rather than ring waste."
+      ],
+      "dataset": "paper",
+      "dist": "zipf",
+      "budget_bytes": "1024M",
+      "memmax": "auto",
+      "promotion": 30
+    }
+  ]
+}
