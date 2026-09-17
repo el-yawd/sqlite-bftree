@@ -184,11 +184,55 @@ the honest "does it transfer" answer and the one the thesis should quote.
 Dependency order.  Each lands behind an ablation switch in the existing
 `SQLITE_BF_NO_*` style so the campaign can attribute the effect.
 
-### B1. Reference-derived size classes
-Replace the fixed 64…4096 doubling with the reference's formula, parameterised
-on the configured record size.  Converts directly into cached records (~25-30 %
-more at the `steady` shape, more at others).  Lowest risk and highest certainty
-in this list.
+### B1. Reference-derived size classes — **DONE, and it required a PRAGMA**
+
+`sqlite3BfInitSizeClasses` (`bf_mini_page.c`) implements the reference's
+derivation (`tree.rs:222-250`):
+`class(k) = 2^k * (base + sizeof(BfKVMeta)) + sizeof(BfMiniPage)`, cache-line
+aligned.  It is now the single definition feeding both the `BfFreeList` and
+`BfCache` copies of the ladder, which were duplicated — a disagreement between
+them would have filed a block under one class and handed it back as another.
+
+**The base is `PRAGMA bf_min_record`** (the reference's `cb_min_record_size`),
+default 64.  It has to be configuration, and the reason is measured rather than
+argued.  At a fixed base of 64, 4M rows under a 16 MiB ring:
+
+| value_len | recs/page | B/record | cached |
+|---|---|---|---|
+| 32 | 5.4 | −2.5% | +1.4% |
+| 64 | 2.3 | −12% | +11.7% |
+| 100 | 1.5 | **−23.6%** | **+27.7%** |
+| 200 | 1.2 | **+23.6%** | **−18.6%** |
+
+A single fixed base is therefore a 28% capacity win on one workload and a 19%
+capacity loss on another.  Shipping that as "the faithful ladder" would have
+tuned the engine for our own benchmark and penalised the replication — backwards
+for a change justified by fidelity.  The v200 row is why this is known: it was
+included as a falsification test and it fired, within 1.4 points of the
+predicted size.
+
+Setting the pragma resolves it — v200 at `bf_min_record=208` (its full record:
+8 B rowid key + 200 B value + 8 B meta) reads **262 B/record against the old
+ladder's 263**, i.e. exact parity, from 325 at the default.
+
+**But "set it to the record size" is NOT the rule.**  v100 is *better* at base 64
+(182 B/record) than at its own record size of 108 (211), while v200 is far
+better at 208 than at 64.  The relation is not monotonic, and the v100 case
+shows up as a change in mini-page OCCUPANCY (1.75 vs 1.57 records/page) rather
+than in class selection, which the class arithmetic does not explain.  Unknown
+mechanism; measure per workload rather than computing the base.
+
+| dataset | old ladder | base 64 | base = record size |
+|---|---|---|---|
+| v100 (116 B record) | 240 | **182** | 211 |
+| v200 (216 B record) | 263 | 325 | **262** |
+
+Caveat on all of the above: throughput moved 2-3% at most, and on the
+larger-than-memory shape the warmup sweep showed 20% more cached records buying
+*nothing* in hit rate.  **B1 is a capacity result, not yet a throughput
+result.**  Judge it on `B/record`, and expect it to matter only where capacity
+binds — which at 16 MiB / 4M rows it does (hit rate moved +0.8 pts at v100) and
+at 256 MiB / 60M rows it does not.
 
 ### B2. Copy-on-access second chance **+** REF-bit record discard — one mechanism
 This corrects the "REF-bit CLOCK eviction policy" item that `CLAUDE.md` carried:

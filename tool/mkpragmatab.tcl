@@ -426,6 +426,10 @@ set pragma_def {
   NAME: bf_group_commit
   TYPE: BF_GROUP_COMMIT
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
+  NAME: bf_min_record
+  TYPE: BF_MIN_RECORD
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
 }
 
 # Open the output file

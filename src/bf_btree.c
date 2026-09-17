@@ -739,6 +739,35 @@ int sqlite3BfBtreeResizeCache(Btree *p, u64 newCapacity){
   return sqlite3BfCircularBufferInit(&pBf->cb, newCapacity);
 }
 
+/*
+** Apply a new PRAGMA bf_min_record to the cache this connection already has.
+**
+** The size-class ladder is derived from the base record size, so changing it
+** changes every class.  Rebuilding it under live allocations would be unsafe:
+** blocks in the free list were filed under the OLD class sizes, so a later
+** allocation of a now-larger class could hand back a smaller block.  So this
+** does what a resize does -- drop every mapping, reinitialise the ring (which
+** rebuilds the free list's copy of the ladder from the global) and rebuild the
+** cache's copy.  Refuses while a write is buffered, same as the resize.
+*/
+int sqlite3BfBtreeSetMinRecord(Btree *p, u32 nMinRecord){
+  BfCache *pBf;
+  u64 cap;
+
+  if( !p || !p->pBt ) return SQLITE_OK;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( !pBf ) return SQLITE_OK;   /* not built yet: creation reads the global */
+  if( pBf->bDirtyInserts || pBf->nDirty ) return SQLITE_BUSY;
+
+  cap = pBf->cb.capacity;
+  sqlite3BfMapIterate(pBf, bfClearOneEntry, NULL);
+  pBf->bDirtyInserts = 0;
+  sqlite3BfUnlogListReset(pBf);
+  sqlite3BfCircularBufferDestroy(&pBf->cb);
+  sqlite3BfInitSizeClasses(pBf->aSizeClass, nMinRecord);
+  return sqlite3BfCircularBufferInit(&pBf->cb, cap);
+}
+
 void sqlite3BfBtreeClearCache(Btree *p){
   BfCache *pBf;
   if( !p || !p->pBt ) return;

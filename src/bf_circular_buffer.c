@@ -75,13 +75,11 @@ static int bfGetSizeClassIndex(BfCircularBuffer *pCb, u32 size){
 */
 static void bfInitSizeClasses(BfFreeList *pFl){
   int i;
-  u32 size = BF_MIN_MINI_PAGE;
+  sqlite3BfInitSizeClasses(pFl->aSizeClass,
+                           (u32)sqlite3BfCacheMinRecord());
   for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
-    pFl->aSizeClass[i] = size;
     pFl->apHead[i] = 0;
-    size *= 2;
   }
-  assert( pFl->aSizeClass[0]==BF_MIN_MINI_PAGE );
   assert( pFl->aSizeClass[BF_SIZE_CLASS_COUNT-1]==BF_MAX_MINI_PAGE );
 }
 
@@ -351,7 +349,9 @@ void *sqlite3BfCircularBufferAlloc(BfCircularBuffer *pCb, u32 size){
   u8 *pPhysical;
 
   if( size == 0 ) return 0;
-  if( size < BF_MIN_MINI_PAGE ) size = BF_MIN_MINI_PAGE;
+  /* Round up to the smallest class.  Was BF_MIN_MINI_PAGE; the ladder's first
+  ** class is now derived (B1), so ask the ladder rather than the constant. */
+  if( size < pCb->freeList.aSizeClass[0] ) size = pCb->freeList.aSizeClass[0];
 
   sqlite3_mutex_enter(pCb->mutex);
 

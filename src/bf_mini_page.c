@@ -187,6 +187,53 @@ int sqlite3BfMiniPageNeedsMerge(BfMiniPage *pMini){
 ** Get the next size class for upgrading a mini-page.
 ** Returns 0 if already at maximum size.
 */
+/*
+** Fill aSizeClass with the reference's derived ladder, ASCENDING.
+**
+** class(k) = 2^k * (nMinRecord + sizeof(BfKVMeta)) + sizeof(BfMiniPage),
+** rounded up to BF_CACHE_LINE, stopping once a class would exceed
+** BF_MAX_MINI_PAGE; BF_MAX_MINI_PAGE is always the last class.  If the
+** nMinRecord is PRAGMA bf_min_record (the reference's cb_min_record_size).  If
+** the geometry yields fewer than BF_SIZE_CLASS_COUNT distinct classes the tail is
+** padded with BF_MAX_MINI_PAGE, which is harmless: the scans take the first
+** class that fits, so duplicate trailing entries are never selected twice.
+**
+** See tree.rs:222-250.  Strictly ascending and strictly increasing is a
+** contract, not a nicety -- every consumer (the two free-list scans, and both
+** mini-page upgrade helpers) takes the FIRST class that fits.
+*/
+void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord){
+  u32 c;
+  u32 hdr = (u32)sizeof(BfMiniPage);
+  int i = 0;
+  int k;
+
+  if( nMinRecord < 8 ) nMinRecord = BF_DEFAULT_MIN_RECORD;
+  c = (u32)(nMinRecord + sizeof(BfKVMeta));
+
+  /* Leaves the LAST slot for BF_MAX_MINI_PAGE unconditionally: the derived
+  ** ladder happens to yield exactly 6 classes below 4096 for today's geometry,
+  ** but a different BF_MIN_RECORD would yield more, and the final class has to
+  ** be the full page or a max-size mini-page could not be allocated at all. */
+  for(k = 0; i < BF_SIZE_CLASS_COUNT - 1; k++){
+    u64 sz = ((u64)1 << k) * (u64)c + (u64)hdr;
+    if( sz % BF_CACHE_LINE ){
+      sz = (sz / BF_CACHE_LINE + 1) * BF_CACHE_LINE;
+    }
+    if( sz >= BF_MAX_MINI_PAGE ) break;
+    /* Strictly increasing only: cache-line rounding can repeat a class when
+    ** the record size is tiny. */
+    if( i==0 || (u32)sz > aSizeClass[i-1] ){
+      aSizeClass[i++] = (u32)sz;
+    }
+  }
+  while( i < BF_SIZE_CLASS_COUNT ){
+    aSizeClass[i++] = BF_MAX_MINI_PAGE;
+  }
+  assert( aSizeClass[0] >= sizeof(BfMiniPage) + sizeof(BfKVMeta) );
+  assert( aSizeClass[BF_SIZE_CLASS_COUNT-1]==BF_MAX_MINI_PAGE );
+}
+
 u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass){
   int i;
   /* Ascending: the SMALLEST class larger than the current node.

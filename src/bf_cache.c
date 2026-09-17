@@ -242,17 +242,13 @@ static sqlite3_pcache *bfCacheCreate(int szPage, int szExtra, int bPurgeable){
     return 0;
   }
 
-  /* Initialize size classes, ASCENDING (64 .. 4096).  The mini-page size-class
-  ** helpers scan this array forwards and take the first class that fits, so the
-  ** order is not cosmetic: filled backwards, they returned 4096 every time. */
-  {
-    int i;
-    u32 size = BF_MIN_MINI_PAGE;
-    for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
-      pCache->base.aSizeClass[i] = size;
-      size *= 2;
-    }
-  }
+  /* Size classes, ASCENDING.  The mini-page helpers scan this array forwards and
+  ** take the first class that fits, so the order is not cosmetic: filled
+  ** backwards, they returned 4096 every time.  Derived, and shared with the
+  ** free list's copy -- if the two disagreed, a block allocated from one class
+  ** would be freed into another. */
+  sqlite3BfInitSizeClasses(pCache->base.aSizeClass,
+                           (u32)sqlite3BfCacheMinRecord());
 
   /* Initialize hash table */
   rc = bfCacheResizeHash(pCache, 256);
@@ -804,7 +800,7 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     pMini = (BfMiniPage*)pEntry->pPage;
   }else{
     /* Allocate new mini-page */
-    pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, BF_MIN_MINI_PAGE);
+    pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, pCache->aSizeClass[0]);
     if( !pNew ){
       /* Ring full: reclaim clean/orphaned mini-pages from the FIFO head and
       ** retry once.  The sweep refuses dirty mini-pages (evictCallback), so
@@ -813,14 +809,14 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
       ** path.  Safe here: pEntry has no mini-page linked yet, so the sweep
       ** cannot reclaim anything this call still references. */
       sqlite3BfCacheEvict(pCache, 16);
-      pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, BF_MIN_MINI_PAGE);
+      pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, pCache->aSizeClass[0]);
     }
     if( !pNew ){
-      BF_ALLOC_TRACE("cbuf-alloc-null", &pCache->cb, BF_MIN_MINI_PAGE);
+      BF_ALLOC_TRACE("cbuf-alloc-null", &pCache->cb, (int)pCache->aSizeClass[0]);
       return BF_FULL;
     }
 
-    sqlite3BfMiniPageInit((BfMiniPage*)pNew, BF_MIN_MINI_PAGE, pEntry->diskOffset);
+    sqlite3BfMiniPageInit((BfMiniPage*)pNew, pCache->aSizeClass[0], pEntry->diskOffset);
     sqlite3BfCircularBufferMarkReady(pNew);
 
     pEntry->locType = BF_LOC_MINI;

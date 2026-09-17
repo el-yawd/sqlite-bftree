@@ -40,7 +40,48 @@ typedef struct BfFreeList BfFreeList;
 */
 #define BF_MIN_MINI_PAGE      64
 #define BF_MAX_MINI_PAGE      4096
-#define BF_SIZE_CLASS_COUNT   7    /* 64, 128, 256, 512, 1024, 2048, 4096 */
+#define BF_SIZE_CLASS_COUNT   7
+
+/* Size-class derivation (B1), matching the reference.
+**
+** ../bf-tree does not use a power-of-two ladder.  It DERIVES the classes from
+** the record size (BfTree::create_mem_page_size_classes, tree.rs:222-250):
+**
+**     class(k) = 2^k * (minRecord + sizeof(KVMeta)) + sizeof(LeafNode)
+**
+** rounded up to a cache line, ascending, stopping at the largest mini-page,
+** with the full leaf page size as the final class.  The ladder is therefore
+** "room for 1, 2, 4, 8 ... records" rather than "64, 128, 256 ... bytes", which
+** is a better fit for the thing actually being stored.
+**
+** For our geometry (BF_MIN_RECORD 64 + 8 B BfKVMeta, 24 B BfMiniPage header,
+** 64 B lines) that gives 128, 192, 320, 640, 1216, 2368, 4096 -- against the
+** old 64, 128, 256, 512, 1024, 2048, 4096.
+**
+** Why it should matter here: a lone cached record (1.20-1.23 per mini-page
+** under scrambled zipf) needs 24 + 8 + 8 + 100 = 140 B, which takes the 256 B
+** class on the old ladder and the 192 B class on this one -- 25% less ring per
+** record, measured at 250 B/record before the change.  It also raises the
+** FIRST class from 64 to 128: a fresh mini-page is allocated at aSizeClass[0]
+** (bf_cache.c), and 64 B leaves only 32 B for a record after the header, so
+** every real row upgraded on its first insert.
+**
+** CAVEAT, and the reason BF_MIN_RECORD must eventually be configurable as it is
+** in the reference (cb_min_record_size, a Config field their benchmark sets per
+** workload): the ladder is only well matched to records near BF_MIN_RECORD.
+** For the paper's own workload -- key 16 B, value = the key, so 24 + 8 + 16 +
+** 16 = 64 B for one record -- the OLD ladder's 64 B first class was an exact
+** fit and this one rounds to 128, i.e. 2x worse.  For our 100 B values it is
+** 25% better.  Hard-coding 64 therefore tunes for OUR benchmark and detunes the
+** replication, which is backwards for a change whose whole justification is
+** fidelity.
+**
+** RESOLVED: this is PRAGMA bf_min_record, defaulting to the reference's 64.
+** configs/b1.json measured the consequence of getting it wrong -- a 200-byte
+** value loses 18.6% of the records it could cache at N=64, while a 100-byte
+** value gains 27.7%.  Set it to the workload's record size. */
+#define BF_DEFAULT_MIN_RECORD 64   /* reference cb_min_record_size default */
+#define BF_CACHE_LINE         64
 
 /*
 ** Default configuration values.
@@ -532,6 +573,11 @@ SQLITE_PRIVATE int sqlite3BfMiniPageSearch(BfMiniPage *pMini,
 SQLITE_PRIVATE int sqlite3BfMiniPageDelete(BfMiniPage *pMini, const void *pKey, int nKey);
 SQLITE_PRIVATE int sqlite3BfMiniPageNeedsMerge(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageSpaceRemaining(BfMiniPage *pMini);
+/* Fill aSizeClass[BF_SIZE_CLASS_COUNT] with the derived ladder, ascending.
+** ONE definition: BfFreeList and BfCache each keep a copy, and if the two ever
+** disagreed a block allocated from one class would be freed into another. */
+SQLITE_PRIVATE void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord);
+SQLITE_PRIVATE int sqlite3BfCacheMinRecord(void);
 SQLITE_PRIVATE u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass);
 SQLITE_PRIVATE u32 sqlite3BfMiniPageSizeClassFor(BfMiniPage *pMini, int nKey,
                                                  int nVal, u32 *aSizeClass);

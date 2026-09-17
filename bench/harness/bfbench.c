@@ -418,6 +418,7 @@ typedef struct Config {
   const char *zJournal;
   int nGroupCommit;
   int nPromotion;
+  int nMinRecord;             /* PRAGMA bf_min_record; -1 leaves the default */
   int bfEnable;              /* -1 = leave alone, 0/1 = PRAGMA bf_cache */
   int nOpsPerTxn;
   int nAutoCheckpoint;
@@ -438,6 +439,7 @@ static void configDefaults(Config *p){
   p->nKeySpacing = 16;
   p->aMix[OP_READ] = 100;
   p->dist = DIST_ZIPF;
+  p->nMinRecord = -1;
   p->theta = 0.9;
   p->seconds = 0;
   p->nOps = 0;
@@ -870,6 +872,10 @@ static int cmdRun(Config *p){
   if( p->bfCacheBytes > 0 ){
     execFmt(db, "PRAGMA bf_cache_size=%lld;", p->bfCacheBytes);
   }
+  /* AFTER bf_cache_size: setting bf_min_record rebuilds the size-class ladder
+  ** by dropping every mapping and reinitialising the ring at its current
+  ** capacity, so it has to see the capacity this run actually wants. */
+  if( p->nMinRecord > 0 )    execFmt(db, "PRAGMA bf_min_record=%d;", p->nMinRecord);
   if( p->nPromotion >= 0 )   execFmt(db, "PRAGMA bf_promotion_rate=%d;", p->nPromotion);
   if( p->nGroupCommit >= 0 ) execFmt(db, "PRAGMA bf_group_commit=%d;", p->nGroupCommit);
   execOrDie(db, "PRAGMA temp_store=MEMORY;");
@@ -1157,6 +1163,8 @@ static const char zUsage[] =
 "  --bf-cache-bytes N           --page-cache-bytes N\n"
 "  --synchronous off|normal|full  --journal wal|delete\n"
 "  --group-commit N             --promotion N    --bf-cache on|off\n"
+"  --min-record N               PRAGMA bf_min_record: base of the derived\n"
+"                               size-class ladder (reference cb_min_record_size)\n"
 "  --ops-per-txn N              --autocheckpoint N   --mmap N\n"
 "  --seed N  --label S  --sut S  --json PATH\n"
 "  --drop-cache  --no-latency  --read-txn\n";
@@ -1195,6 +1203,7 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--journal")==0 ){ NEEDVAL; cfg.zJournal = zVal; }
     else if( strcmp(z,"--group-commit")==0 ){ NEEDVAL; cfg.nGroupCommit = atoi(zVal); }
     else if( strcmp(z,"--promotion")==0 ){ NEEDVAL; cfg.nPromotion = atoi(zVal); }
+    else if( strcmp(z,"--min-record")==0 ){ NEEDVAL; cfg.nMinRecord = atoi(zVal); }
     else if( strcmp(z,"--bf-cache")==0 ){ NEEDVAL;
       cfg.bfEnable = (strcmp(zVal,"on")==0 || strcmp(zVal,"1")==0) ? 1 : 0; }
     else if( strcmp(z,"--ops-per-txn")==0 ){ NEEDVAL; cfg.nOpsPerTxn = atoi(zVal); }

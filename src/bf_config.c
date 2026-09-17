@@ -35,6 +35,7 @@ typedef struct BfConfig {
   int nPromotionRate;         /* Read promotion rate (0-100) */
   double copyOnAccessRatio;   /* Copy-on-access threshold (0.0-1.0) */
   int nGroupCommit;           /* Transactions per record-frame group (0/1=off) */
+  int nMinRecord;             /* Size-class ladder base; see bf_min_record */
 } BfConfig;
 
 static BfConfig bfConfig = {
@@ -42,7 +43,8 @@ static BfConfig bfConfig = {
   BF_DEFAULT_BUFFER_SIZE,     /* 32 MB default */
   BF_DEFAULT_PROMOTION_RATE,  /* see bf_cache.h for why 30 */
   BF_DEFAULT_COPY_ON_ACCESS,  /* 10% copy-on-access region */
-  0                           /* Group commit off: one flush per commit */
+  0,                          /* Group commit off: one flush per commit */
+  BF_DEFAULT_MIN_RECORD       /* reference cb_min_record_size default */
 };
 
 /*
@@ -136,6 +138,16 @@ int sqlite3BfCacheEnabled(void){
 */
 u64 sqlite3BfCacheBufferSize(void){
   return bfConfig.nBufferSize;
+}
+
+/*
+** Base record size for the mini-page size-class ladder.
+** The reference's cb_min_record_size (config.rs), which its benchmark sets per
+** workload -- which is the whole reason this is configuration and not a
+** constant.  See PRAGMA bf_min_record below.
+*/
+int sqlite3BfCacheMinRecord(void){
+  return bfConfig.nMinRecord;
 }
 
 /*
@@ -543,6 +555,70 @@ void sqlite3PragmaBfPromotionRate(
     if( rate < 0 ) rate = 0;
     if( rate > 100 ) rate = 100;
     bfConfig.nPromotionRate = rate;
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_min_record
+**
+** PRAGMA bf_min_record;          -- Returns the ladder's base record size
+** PRAGMA bf_min_record = N;      -- Set it (bytes)
+**
+** The size classes are DERIVED from this: class(k) = 2^k * (N + sizeof(KVMeta))
+** + sizeof(BfMiniPage), cache-line aligned (tree.rs:222-250).  A ladder is only
+** well matched to records near N, so this has to be configuration -- the
+** reference has it as cb_min_record_size and its benchmark sets it per
+** workload.
+**
+** MEASURED, 2026-09-16, 4M rows under a 16 MiB ring, N=64 against the old
+** power-of-two ladder -- the same change helps or hurts depending on how a
+** record lands relative to a class boundary:
+**
+**   value_len  recs/page   B/record        cached
+**       32        5.4        -2.5%          +1.4%
+**       64        2.3         -12%         +11.7%
+**      100        1.5       -23.6%         +27.7%
+**      200        1.2       +23.6%         -18.6%   <- REGRESSION
+**
+** So leaving N at a constant tuned for one workload silently penalises the
+** others; a 200-byte value loses 19% of the records it could cache.  Set it to
+** the workload's typical record size.
+*/
+void sqlite3PragmaBfMinRecord(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+
+  if( zValue == 0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nMinRecord, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_min_record", SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    int n = sqlite3Atoi(zValue);
+    /* Bounded so the derived ladder stays sane: the first class must hold a
+    ** header plus one record, and the largest must still fit a full page. */
+    if( n < 8 ) n = 8;
+    if( n > (int)(BF_MAX_MINI_PAGE/4) ) n = (int)(BF_MAX_MINI_PAGE/4);
+    if( n != bfConfig.nMinRecord ){
+      bfConfig.nMinRecord = n;
+      /* Same reason as bf_cache_size: the cache is created during the schema
+      ** load, long before any BF pragma can run, so setting the global alone
+      ** would never reach the cache the connection issuing this pragma is
+      ** using.  Rebuilding the ladder under live allocations is not safe --
+      ** blocks were filed under the OLD class sizes -- so the setter drops
+      ** every mapping and reinitialises the ring, exactly as a resize does. */
+      {
+        sqlite3 *db = pParse->db;
+        int iDb = sqlite3FindDbName(db, zDb);
+        Btree *pBt = db->aDb[iDb>=0 ? iDb : 0].pBt;
+        extern int sqlite3BfBtreeSetMinRecord(Btree*, u32);
+        if( pBt ) (void)sqlite3BfBtreeSetMinRecord(pBt, (u32)n);
+      }
+    }
   }
 }
 
