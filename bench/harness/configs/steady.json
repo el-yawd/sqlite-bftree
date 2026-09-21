@@ -87,7 +87,7 @@
                "cb_copy_on_access_ratio of the ring, 0.0 = FIFO, 1.0 = LRU,",
                "swept in the paper's Figure 14 -- plus a per-record REF bit",
                "consulted ONLY during that copy, to discard cold records.",
-               "See BF_TREE_V2_PARITY_PLAN.md B2."],
+               "See BF_TREE_V2_PLAN.md (copy-on-access, item H1)."],
       "dataset": "v100", "budget_bytes": "32M", "memmax": "auto",
       "bf_page_cache_floor": "16M", "promotion": 30,
       "axes": { "theta": [0.9, 0.99] } }

@@ -8,8 +8,12 @@ durability. It supersedes an earlier integration fork (`../sqlite`, branch
 ## Read these first (in order)
 1. **`BF_TREE_V2_KNOWLEDGE.md`** — the *map*: paper durability model (§5.7), data-structure
    field tables, the 5 mini-page bugs to avoid by construction, integration edge-cases.
-2. **`BF_TREE_V2_PLAN.md`** — the *route*: staged plan (Phase 0–4), testing strategy,
-   critical files, verification.
+2. **`BF_TREE_V2_PLAN.md`** — the *route*, and the only planning document: current verified
+   state, what is implemented and where it stops, the reference-parity matrix, the single
+   ordered backlog, the validation/measurement method, and the mandatory progress log.
+   It absorbed `BF_TREE_V2_PARITY_PLAN.md`, `BF_TREE_V2_PERF_PLAN.md` and
+   `BF_TREE_V2_AGENT_HANDOFF.md` on 2026-09-21. **Update it before yielding** after any code,
+   test, benchmark, documentation, or design-decision work.
 3. `docs/reference/` — the prior fork's design docs (old transparent-cache design that v2
    reverses; cited by the knowledge doc).
 
@@ -25,7 +29,9 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
   rowid-table leaf mutations log as `[pgno, op, key, val]`; everything else stays page-image
   frames. No sidecar / two-log design.
 - **Configurable durability**: group-commit (~1 ms, paper-faithful) *and* strict per-commit
-  fsync via `PRAGMA synchronous`; measure both.
+  fsync via `PRAGMA synchronous`; measure both.  **Not yet what the code does** --
+  `bf_group_commit=N` is bounded *deferred* durability (`bf_btree.c:583`: the first N-1
+  commits stage nothing and return).  See `BF_TREE_V2_PLAN.md` item D2.
 - **Single-writer** (keep `BtShared` serialization); concurrency is a documented non-transfer.
 - v1 scope: rowid tables, primary B-tree only; secondary indexes etc. stay write-through.
 
@@ -37,13 +43,17 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
 - **Phase 1 DONE**: read cache + write-through — `BfCache` lifecycle, config/pragma,
   `pcache2` activation, btree read hooks, descent shortcut.
 - **Phase 2 DONE**: record-granular physiological WAL, now **ON by default**
-  (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`).  Write-back insert/update/delete,
+  (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`).  Write-back insert and DELETE,
   commit-time record logging, recovery replay, checkpoint materialisation, forward AND
   reverse merge scans, merged `Count`, group commit (`PRAGMA bf_group_commit=N`) and
   mini-page compaction.  Differential gate ALL CLEAN.
+  **Existing-row UPDATE is NOT buffered** (`btree.c:10577-10585` returns through
+  `btreeOverwriteCell` before the BF block); see `BF_TREE_V2_PLAN.md` D3a.
   - Measured: **1 page frame per commit** (the WAL-format commit frame — zero base-page
     writes), and with `bf_group_commit=32` about **30x less WAL than stock** on
-    single-row commits.  Counters live in `PRAGMA bf_cache_stats`.
+    single-row commits.  Counters live in `PRAGMA bf_cache_stats`.  Mind the denominator:
+    `wal_commits` counts WAL commit EVENTS, not SQL transactions — at group 32 that run's
+    983 WAL commits absorbed 30,720 transactions.  See `BF_TREE_V2_PLAN.md` §2.3.
 - **Phase 3 IN PROGRESS**: the measurement campaign.  `bench/harness/` is the
   proper benchmark — a C driver linked against the amalgamation (prepared
   statements, per-op latency histograms, `/proc/self/io` block-layer bytes), a
@@ -67,8 +77,8 @@ record cache keeps filling for minutes: the same workload and build measured
 53.8% / 60.5% / 69.6% hit rate at 5 / 20 / 60 s of warmup, with `evictions=0`
 throughout.  Earlier campaigns -- and an earlier version of this table, which
 claimed 1.15x -- measured that transient.  `configs/steady.json` uses a 420 s
-warmup and the numbers above only after `cached_records` plateaued across
-repeats.  **Report `cached_records` and `evictions` beside every hit rate**; a
+warmup -- since shown to be too short: 900 s is the larger-than-memory floor,
+and 420 s never evicted, so numbers taken there were mid-fill.  **Report `cached_records` and `evictions` beside every hit rate**; a
 hit rate without them is uninterpretable.
 
 **The one thing holding reads back is measured and consistent: FIFO retention.**
@@ -81,7 +91,7 @@ keeps what was promoted recently rather than what is read often.
 policy -- CLOCK is in neither the paper nor `../bf-tree`.  Theirs is a
 copy-on-access second-chance REGION (`PRAGMA bf_copy_on_access`, default 10%)
 plus the REF bit consulted only during that copy, to shed cold records.  Both
-halves are in now; see `BF_TREE_V2_PARITY_PLAN.md` B2 and
+halves are in now; see `BF_TREE_V2_PLAN.md` §2.4 / M-items and
 [[ref-bit-clock-is-not-in-the-paper]].  Note the REF bit was NOT "already set on
 every access" in any useful sense: insert set it on every record too, so it was
 always 1 and both `BF_COPY_REFERENCED` and `sqlite3BfMiniPageConsolidate` were
@@ -132,6 +142,10 @@ a segfault in `bfFreeListRemove` (`bench/ring_repro.sh`) reached a commit.  With
 `BF_CACHE_SIZE=262144` a single suite run produces ~2,200 evictions, ~10,300
 upgrades and ~1,400 compactions.
 
+**Pragma order (three rules, all fail silently):** `PRAGMA bf_cache` BEFORE anything creates
+a pager (it swaps the global pcache methods), then `journal_mode`, then the per-cache knobs,
+with `bf_min_record` after `bf_cache_size`.  `BF_TREE_V2_PLAN.md` §3.4 has the citations.
+
 Ablation switches (all default OFF, i.e. the feature is on): `SQLITE_BF_NO_MERGE_SCAN`,
 `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,
 `SQLITE_BF_NO_MINIPAGE_COMPACT`.
@@ -170,7 +184,7 @@ attributes each mechanism inside one campaign.
 The hard consequence: **a mechanism that cannot be switched off does not get to
 land**, because it would be unattributable at the letter gate.  Every Stage B
 item ships with a `SQLITE_BF_NO_*` switch or a PRAGMA.  See
-`BF_TREE_V2_PARITY_PLAN.md` C0.
+`BF_TREE_V2_PLAN.md` §6.1.
 
 ## Performance work: the method (measure, don't guess)
 
