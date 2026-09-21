@@ -75,10 +75,17 @@ hit rate without them is uninterpretable.
 Every steady-state cell sits **18-25 points below the Zipf ideal** for the number
 of records it actually caches (33.9% vs 54.7%; 53.7% vs 71.7%; 31.9% vs 57.2%;
 49.2% vs 71.7%).  The ring evicts the oldest record, not the coldest, so it
-keeps what was promoted recently rather than what is read often.  The REF bit
-that would fix this already exists and is already set on every access --
-`evictCallback` ignores it.  A REF-bit CLOCK policy is the next change with a
-quantified prize behind it.
+keeps what was promoted recently rather than what is read often.
+
+**Addressed 2026-09-21 by Stage B2, not yet measured.**  The fix is NOT a CLOCK
+policy -- CLOCK is in neither the paper nor `../bf-tree`.  Theirs is a
+copy-on-access second-chance REGION (`PRAGMA bf_copy_on_access`, default 10%)
+plus the REF bit consulted only during that copy, to shed cold records.  Both
+halves are in now; see `BF_TREE_V2_PARITY_PLAN.md` B2 and
+[[ref-bit-clock-is-not-in-the-paper]].  Note the REF bit was NOT "already set on
+every access" in any useful sense: insert set it on every record too, so it was
+always 1 and both `BF_COPY_REFERENCED` and `sqlite3BfMiniPageConsolidate` were
+dead code for the project's whole life.
 
 The second constraint is the benchmark environment, not the code: BF reads
 20-29% fewer bytes and converts almost none of it into throughput, because under
@@ -151,6 +158,19 @@ Two things to know:
   what pointed at `bfFlushOneMiniPage` opening a write cursor without the lock
   the VDBE would have taken.
 - A debug build is far slower; use it for correctness, never for timing.
+
+## When to benchmark: at LETTER boundaries, not per change
+
+Decided 2026-09-21.  Small changes gate on **correctness only** -- the
+differential oracles, plus `fixes_smoke.json` as a tripwire whose numbers are
+**never quotable** (no warmup, `cached_records` still climbing).  A full
+campaign runs once per stage letter, carrying an **ablation axis** so it still
+attributes each mechanism inside one campaign.
+
+The hard consequence: **a mechanism that cannot be switched off does not get to
+land**, because it would be unattributable at the letter gate.  Every Stage B
+item ships with a `SQLITE_BF_NO_*` switch or a PRAGMA.  See
+`BF_TREE_V2_PARITY_PLAN.md` C0.
 
 ## Performance work: the method (measure, don't guess)
 

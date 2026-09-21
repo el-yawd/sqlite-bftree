@@ -768,6 +768,30 @@ int sqlite3BfBtreeSetMinRecord(Btree *p, u32 nMinRecord){
   return sqlite3BfCircularBufferInit(&pBf->cb, cap);
 }
 
+/*
+** Apply a new PRAGMA bf_copy_on_access to the cache this connection already
+** has.  Cheap: the region is a threshold derived from the ring's capacity, so
+** nothing has to be dropped or rebuilt.
+*/
+void sqlite3BfBtreeSetCopyOnAccess(Btree *p, double r){
+  BfCache *pBf;
+  if( !p || !p->pBt ) return;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( !pBf ) return;             /* not built yet: creation reads the global */
+  sqlite3BfCircularBufferSetCopyOnAccess(&pBf->cb, r);
+}
+
+/* Copy-on-access second chances and the cold records they shed (PRAGMA
+** bf_cache_stats).  Read the two together: relocations with nothing shed are
+** pure retention cost, which is the shape the reverted 2026-09-15 experiment
+** had. */
+void sqlite3BfBtreeCopyOnAccessStat(Btree *p, u64 *pnMoved, u64 *pnShed){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pnMoved ) *pnMoved = pBf ? pBf->nCopyOnAccess : 0;
+  if( pnShed )  *pnShed  = pBf ? pBf->nCopyOnAccessShed : 0;
+}
+
 void sqlite3BfBtreeClearCache(Btree *p){
   BfCache *pBf;
   if( !p || !p->pBt ) return;
@@ -1485,6 +1509,9 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
     return 0;
   }
   pBf->nMiniPageHit++;
+  /* Served from the mini-page: second chance if the head is closing on it.
+  ** pMini is dead from here -- the value is already in the caller's buffer. */
+  sqlite3BfCacheCopyOnAccess(pBf, pEntry);
   return 1;
 }
 

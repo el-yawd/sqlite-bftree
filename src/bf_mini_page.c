@@ -342,7 +342,7 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
       if( nVal > 0 ) memcpy(pDst, pVal, nVal);
       BF_KV_SET_VALUE_LEN(pNewMeta, nVal);
       BF_KV_SET_OP_TYPE(pNewMeta, opType);
-      BF_KV_SET_REF(pNewMeta, 1);
+      BF_KV_SET_REF(pNewMeta, 0);   /* a write is not a read; see below */
       if( opType==BFOP_INSERT || opType==BFOP_DELETE ){
         pMini->flags |= BF_MINI_F_DIRTY | BF_MINI_F_UNLOGGED;
       }
@@ -434,7 +434,14 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
   BF_KV_SET_KEY_LEN(pNewMeta, nKey);
   BF_KV_SET_OP_TYPE(pNewMeta, opType);
   BF_KV_SET_VALUE_LEN(pNewMeta, nVal);
-  BF_KV_SET_REF(pNewMeta, 1);
+  /* A fresh record starts UNREFERENCED, as the reference's make_prefixed_meta
+  ** does (leaf_node.rs, asserted at :2006).  The REF bit means "read since it
+  ** entered this mini-page", and it is set by sqlite3BfMiniPageSearch alone.
+  ** Setting it here instead made every record permanently referenced, which is
+  ** why the discard_cold_cache half of BF_COPY_REFERENCED could never fire and
+  ** sqlite3BfMiniPageConsolidate was a no-op for the project's whole life
+  ** (keepCount always equalled metaCount, so it returned at its first test). */
+  BF_KV_SET_REF(pNewMeta, 0);
   BF_KV_SET_LOGGED(pNewMeta, 0);  /* brand-new record: not yet in the WAL */
   if( opType==BFOP_INSERT || opType==BFOP_DELETE ){
     pMini->flags |= BF_MINI_F_DIRTY | BF_MINI_F_UNLOGGED;
@@ -503,13 +510,16 @@ int sqlite3BfMiniPageSearch(BfMiniPage *pMini,
   pMeta = &aMeta[idx];
   opType = BF_KV_OP_TYPE(pMeta);
 
+  /* Mark as referenced.  BEFORE the tombstone test, as the reference does
+  ** (leaf_node.rs:1658 precedes its is_absent() check): a served negative
+  ** lookup is a hit, and a BFOP_PHANTOM that never records one would be shed
+  ** as cold by the very next copy-on-access, however often it is asked for. */
+  BF_KV_SET_REF(pMeta, 1);
+
   /* Check if this is a deletion marker */
   if( opType == BFOP_DELETE || opType == BFOP_PHANTOM ){
     return BF_DELETED;  /* Record was deleted */
   }
-
-  /* Mark as referenced */
-  BF_KV_SET_REF(pMeta, 1);
 
   /* Copy value */
   pVal = bfGetValuePtr(pMini, pMeta);
@@ -607,8 +617,28 @@ void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini){
 }
 
 /*
-** Consolidate the mini-page by removing unreferenced records.
+** Is this record a COLD CACHE record -- a clean duplicate of something the
+** base page already holds, that nobody has read since it was written here?
+**
+** This is the reference's discard_cold_cache predicate (leaf_node.rs:1528):
+**   discard_cold_cache && op.is_cache() && !meta.is_referenced()
+** Dropping such a record costs at most a later cache miss.  A dirty record
+** (BFOP_INSERT/BFOP_DELETE) is NEVER cold however its REF bit reads: it is the
+** only copy of committed data until it reaches the base page.
+*/
+int sqlite3BfKvIsColdCache(const BfKVMeta *pMeta){
+  u8 op = BF_KV_OP_TYPE(pMeta);
+  if( op!=BFOP_CACHE && op!=BFOP_PHANTOM ) return 0;
+  return !BF_KV_IS_REF(pMeta);
+}
+
+/*
+** Consolidate the mini-page by removing cold cache records.
 ** This compacts the page and reclaims space.
+**
+** Called from bfFlushOneMiniPage AFTER the dirty records have been applied to
+** the base page but BEFORE MarkClean converts them, so the dirty records are
+** still BFOP_INSERT/BFOP_DELETE here and the cold-cache test keeps them.
 */
 int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini){
   BfKVMeta *aMeta = bfMiniPageMeta(pMini);
@@ -622,7 +652,7 @@ int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini){
 
   /* First pass: count records to keep */
   for(i = 0; i < pMini->metaCount; i++){
-    if( BF_KV_IS_REF(&aMeta[i]) ){
+    if( !sqlite3BfKvIsColdCache(&aMeta[i]) ){
       keepCount++;
     }
   }
@@ -645,7 +675,7 @@ int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini){
 
   /* Copy referenced records */
   for(i = 0; i < pMini->metaCount; i++){
-    if( BF_KV_IS_REF(&aMeta[i]) ){
+    if( !sqlite3BfKvIsColdCache(&aMeta[i]) ){
       pSrc = bfGetKeyPtr(pMini, &aMeta[i]);
       nKey = BF_KV_KEY_LEN(&aMeta[i]);
       nVal = BF_KV_VALUE_LEN(&aMeta[i]);
@@ -807,9 +837,14 @@ int sqlite3BfMiniPageDropClean(BfMiniPage *pMini){
 
 /*
 ** Copy a mini-page to a new location with potentially different size.
-** Used for upgrading mini-page size class (BF_COPY_ALL), for the eviction
-** sweep (BF_COPY_REFERENCED), and to reclaim space inside a full mini-page by
-** dropping its pure-cache records (BF_COPY_DIRTY).
+** Used for upgrading mini-page size class (BF_COPY_ALL), for the copy-on-access
+** second chance (BF_COPY_REFERENCED), and to reclaim space inside a full
+** mini-page by dropping its pure-cache records (BF_COPY_DIRTY).
+**
+** BF_COPY_REFERENCED is the reference's copy_initialize_to(discard_cold_cache
+** = true): it carries every dirty record and every clean record that has been
+** read since it was written here, and sheds the rest.  That is what makes the
+** relocation pay for itself -- the page shrinks as it moves to the tail.
 **
 ** BF_COPY_DIRTY keeps only BFOP_INSERT/BFOP_DELETE.  Dropping a BFOP_CACHE
 ** (duplicate of a base cell) or a BFOP_PHANTOM (confirmed-absent key) costs at
@@ -829,7 +864,7 @@ int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
   pDst->rootPgno = pSrc->rootPgno;
 
   for(i = 0; i < pSrc->metaCount; i++){
-    if( copyMode==BF_COPY_REFERENCED && !BF_KV_IS_REF(&aSrcMeta[i]) ){
+    if( copyMode==BF_COPY_REFERENCED && sqlite3BfKvIsColdCache(&aSrcMeta[i]) ){
       continue;
     }
     if( copyMode==BF_COPY_DIRTY ){

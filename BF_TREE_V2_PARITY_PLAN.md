@@ -274,9 +274,48 @@ and `BF_CACHE_SIZE=262144` now produce real eviction, so it is finally testable.
 
 ## Stage C — measure and profile
 
-* `configs/fixes.json` with `--pre HEAD` after each of B1/B2/B3, so every
-  mechanism gets a within-campaign A/B against the build immediately before it.
-  Cross-campaign numbers remain not comparable.
+### C0. Campaigns run at LETTER boundaries, not per change
+
+Decided 2026-09-21, and it replaces this section's original "`configs/fixes.json`
+with `--pre HEAD` after each of B1/B2/B3".  A steady-state read campaign costs
+hours -- the larger-than-memory arm alone needs a 900 s warmup per cell
+([[warmup-and-capacity-do-not-bind]]) -- and B is five mechanisms.  Paying that
+five times serialises the work behind the measurement.
+
+So there are **two tiers**, and mixing them up is the error to avoid:
+
+**Per change — correctness only.**  The differential oracles (`stress.sh`,
+`stress_buf.sh`, the `BF_CACHE_SIZE=262144` cycling-ring variant) plus
+`fixes_smoke.json` as a *tripwire*: it catches an order-of-magnitude regression
+and nothing subtler.  **Numbers from this tier are never quotable** -- no
+warmup, no steady state, and `cached_records` still climbing.  Its only two
+verdicts are "nothing exploded" and "stop, something did".
+
+**Per letter — one campaign, with an ABLATION AXIS.**  This is what makes
+batching free rather than lossy.  Every Stage B item lands behind a
+`SQLITE_BF_NO_*` switch or a PRAGMA, by construction:
+
+| item | switch |
+|---|---|
+| B1 derived size classes | `PRAGMA bf_min_record` |
+| B2 copy-on-access + discard | `PRAGMA bf_copy_on_access`, `SQLITE_BF_NO_COPY_ON_ACCESS` |
+| B3 full-page cache | `SQLITE_BF_NO_FULL_PAGE` (to be added) |
+| B4 scan promotion rate | `PRAGMA bf_scan_promotion` (to be added) |
+| B5 eviction batching | `SQLITE_BF_NO_EVICT_BATCH` (to be added) |
+
+So ONE end-of-B campaign sweeping those knobs attributes each mechanism
+*within* the campaign -- the same attribution the per-change A/Bs were buying,
+one warmup instead of five, and every comparison within-campaign, which is the
+only kind this repo trusts.  **A mechanism that cannot be switched off does not
+get to land**: it would be unattributable at the letter gate.
+
+Consequence to accept honestly: a regression is found later, with more changes
+between it and the last known-good point.  The ablation axis is what makes that
+bisectable at all, which is why the switch is a hard requirement and not a
+nicety.
+
+### C1. The rest
+
 * One full `paper`-config campaign at the end, plus the Figure 14 ratio sweep
   and a promotion-rate sweep (both are named configs in `bench_bftree.toml`).
 * Profile the read path **at the paper config**.  The current profile is of a

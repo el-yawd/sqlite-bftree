@@ -746,6 +746,79 @@ void sqlite3BfCacheDestroy(BfCache *pCache){
 */
 
 /*
+** Copy-on-access second chance (Stage B2; paper 4.1, Figure 14).
+**
+** The ring evicts in FIFO order, which retains what was promoted most recently
+** rather than what is read most often.  Measured at steady state that costs
+** 18-25 points of hit rate against the Zipf ideal for the number of records
+** actually cached, in every configuration tried.
+**
+** The reference's answer is not an eviction policy but a REGION: the head-most
+** cb_copy_on_access_ratio of the ring (default 10%, PRAGMA bf_copy_on_access
+** here).  A page touched inside that region -- i.e. one the head is about to
+** reach -- is copied to the tail, so it survives this lap and survives the next
+** only if it is touched again.  At ratio 0 that is plain FIFO and at ratio 1 it
+** is strict LRU (tree.rs / mini_page_op.rs:151, storage.rs:332).
+**
+** The copy uses BF_COPY_REFERENCED, the reference's discard_cold_cache
+** (leaf_node.rs:1528): the page SHEDS its cold cache records as it relocates.
+** That is what makes the move pay for itself, and it is what the earlier
+** attempt at this (measured +1.2 pts hit / -3.6% ops, and reverted) was
+** missing -- it relocated whole pages and so bought retention with capacity.
+**
+** DEVIATION, deliberate: we relocate CLEAN mini-pages only, where the
+** reference also relocates on insert.  Two reasons, both ours rather than the
+** paper's.  (1) evictCallback refuses a dirty mini-page outright, so a dirty
+** page is already immune to the head and a second chance buys it nothing.
+** (2) The forward merge scan walks a mini-page by INDEX across cursor steps
+** (sqlite3BfBtreeMergeNextInsert), and only dirty pages carry the BFOP_INSERT
+** records it is walking; shedding records under it would shift those indices.
+** Relocating clean pages only keeps that invariant by construction.
+*/
+void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
+#if !defined(SQLITE_BF_NO_COPY_ON_ACCESS)
+  BfMiniPage *pMini, *pNew;
+  void *pRaw;
+  int nBefore, nAfter;
+
+  if( !pCache || !pEntry ) return;
+  if( pCache->cb.copyOnAccessRatio <= 0.0 ) return;
+  if( pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ) return;
+  if( pCache->bBypassActive || pCache->bMergingActive ) return;
+
+  pMini = (BfMiniPage*)pEntry->pPage;
+  if( (void*)pMini == pCache->pEvictProtect ) return;
+  if( sqlite3BfMiniPageIsDirty(pMini) ) return;
+  if( !sqlite3BfCircularBufferIsCopyOnAccess(&pCache->cb, pMini) ) return;
+
+  pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, pMini->nodeSize);
+  if( !pRaw ) return;      /* no room to move it: let the head have it */
+  sqlite3BfCircularBufferMarkReady(pRaw);
+  pNew = (BfMiniPage*)pRaw;
+
+  nBefore = sqlite3BfMiniPageCount(pMini);
+  if( sqlite3BfMiniPageCopy(pNew, pMini->nodeSize, pMini,
+                            BF_COPY_REFERENCED)!=BF_OK ){
+    sqlite3BfCircularBufferDealloc(&pCache->cb, pRaw);
+    return;                /* leave the original exactly as it was */
+  }
+  nAfter = sqlite3BfMiniPageCount(pNew);
+
+  /* The copy rebuilds the page flags from the records it carried; STALE is a
+  ** property of the PAGE (its base image is out of date), not of any record. */
+  pNew->flags |= (u16)(pMini->flags & BF_MINI_F_STALE);
+
+  sqlite3BfCircularBufferDealloc(&pCache->cb, pMini);
+  pEntry->pPage = pRaw;
+  pCache->nCopyOnAccess++;
+  pCache->nCopyOnAccessShed += (u64)(nBefore - nAfter);
+#else
+  UNUSED_PARAMETER(pCache);
+  UNUSED_PARAMETER(pEntry);
+#endif
+}
+
+/*
 ** Read a record from the cache.
 ** First checks mini-page, then falls through to full page.
 */
@@ -761,12 +834,13 @@ int sqlite3BfRecordRead(BfCache *pCache, u32 pgno,
   if( pEntry->locType == BF_LOC_MINI && pEntry->pPage ){
     BfMiniPage *pMini = (BfMiniPage*)pEntry->pPage;
     int rc = sqlite3BfMiniPageSearch(pMini, pKey, nKey, pBuf, pnBuf);
-    if( rc == BF_OK ){
+    if( rc == BF_OK || rc == BF_DELETED ){
       pCache->nMiniPageHit++;
-      return BF_OK;
-    }else if( rc == BF_DELETED ){
-      pCache->nMiniPageHit++;
-      return BF_DELETED;
+      /* Served: give the page its second chance if the head is close.  Safe
+      ** here and nowhere else in this function -- pMini is dead after this
+      ** point, the value has already been copied into the caller's buffer. */
+      sqlite3BfCacheCopyOnAccess(pCache, pEntry);
+      return rc;
     }
     /* Fall through to check base page */
   }

@@ -116,6 +116,24 @@ static u64 bfDistanceToTail(BfCircularBuffer *pCb, void *ptr){
 }
 
 /*
+** Set the size of the copy-on-access region, as a fraction of the ring.
+**
+** This is the reference's cb_copy_on_access_ratio (config.rs:47,
+** circular_buffer/mod.rs:429).  The region is the HEAD-most `ratio` of the
+** ring -- the part the eviction head is about to reach -- so 0.0 makes the
+** ring plain FIFO and 1.0 makes it strict LRU, which is the axis the paper's
+** Figure 14 sweeps.
+**
+** Must be called with the ring's own capacity already set.
+*/
+void sqlite3BfCircularBufferSetCopyOnAccess(BfCircularBuffer *pCb, double r){
+  if( r < 0.0 ) r = 0.0;
+  if( r > 1.0 ) r = 1.0;
+  pCb->copyOnAccessRatio = r;
+  pCb->copyOnAccessThreshold = (u64)(pCb->capacity * (1.0 - r));
+}
+
+/*
 ** Check if a pointer is in the copy-on-access region.
 ** If true, the data should be copied to tail before modification.
 */
@@ -306,8 +324,7 @@ int sqlite3BfCircularBufferInit(BfCircularBuffer *pCb, u64 capacity){
   bfInitSizeClasses(&pCb->freeList);
 
   /* Configure copy-on-access threshold */
-  pCb->copyOnAccessRatio = BF_DEFAULT_COPY_ON_ACCESS;
-  pCb->copyOnAccessThreshold = (u64)(capacity * (1.0 - pCb->copyOnAccessRatio));
+  sqlite3BfCircularBufferSetCopyOnAccess(pCb, sqlite3BfCacheCopyOnAccessRatio());
   BF_CB_TRACE("cbuf-init", pCb->pBuffer, (int)capacity);
 
   return SQLITE_OK;

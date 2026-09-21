@@ -907,6 +907,11 @@ void sqlite3Pragma(
     sqlite3PragmaBfCacheStats(pParse, zDb);
     break;
   }
+  case PragTyp_BF_COPY_ON_ACCESS: {
+    extern void sqlite3PragmaBfCopyOnAccess(Parse*, const char*, const char*);
+    sqlite3PragmaBfCopyOnAccess(pParse, zDb, zRight);
+    break;
+  }
   case PragTyp_BF_MIN_RECORD: {
     extern void sqlite3PragmaBfMinRecord(Parse*, const char*, const char*);
     sqlite3PragmaBfMinRecord(pParse, zDb, zRight);

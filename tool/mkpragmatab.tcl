@@ -430,6 +430,10 @@ set pragma_def {
   NAME: bf_min_record
   TYPE: BF_MIN_RECORD
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
+  NAME: bf_copy_on_access
+  TYPE: BF_COPY_ON_ACCESS
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
 }
 
 # Open the output file

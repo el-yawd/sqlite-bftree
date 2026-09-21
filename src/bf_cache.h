@@ -514,6 +514,9 @@ struct BfCache {
                             ** record (full at max size class / no usable leaf);
                             ** the rest were excluded by the buffering gate in
                             ** sqlite3BtreeInsert before BF was even asked */
+  u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
+                            ** (the second chance; PRAGMA bf_copy_on_access) */
+  u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
 };
 
 /*
@@ -557,6 +560,7 @@ SQLITE_PRIVATE int sqlite3BfCircularBufferEvictOne(BfCircularBuffer *pCb,
 SQLITE_PRIVATE int sqlite3BfCircularBufferEvictN(BfCircularBuffer *pCb, int nTarget,
     int (*xEvict)(void*, void*), void *pCtx);
 SQLITE_PRIVATE int sqlite3BfCircularBufferIsCopyOnAccess(BfCircularBuffer *pCb, void *ptr);
+SQLITE_PRIVATE void sqlite3BfCircularBufferSetCopyOnAccess(BfCircularBuffer *pCb, double r);
 
 /*
 ** Mini-page operations.
@@ -578,6 +582,7 @@ SQLITE_PRIVATE int sqlite3BfMiniPageSpaceRemaining(BfMiniPage *pMini);
 ** disagreed a block allocated from one class would be freed into another. */
 SQLITE_PRIVATE void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord);
 SQLITE_PRIVATE int sqlite3BfCacheMinRecord(void);
+SQLITE_PRIVATE double sqlite3BfCacheCopyOnAccessRatio(void);
 SQLITE_PRIVATE u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass);
 SQLITE_PRIVATE u32 sqlite3BfMiniPageSizeClassFor(BfMiniPage *pMini, int nKey,
                                                  int nVal, u32 *aSizeClass);
@@ -634,6 +639,8 @@ SQLITE_PRIVATE int sqlite3BfMiniPageDirtyCount(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageClearRefs(BfMiniPage *pMini);
+SQLITE_PRIVATE int sqlite3BfKvIsColdCache(const BfKVMeta *pMeta);
+SQLITE_PRIVATE void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry);
 SQLITE_PRIVATE int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini);
 /* A3a: take/release the record-cache lock.  No-ops in a single-threaded build,
 ** and tolerant of a null cache so call sites need no extra guard. */
@@ -647,7 +654,7 @@ SQLITE_PRIVATE int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini);
 
 /* copyMode values for sqlite3BfMiniPageCopy. */
 #define BF_COPY_ALL        0   /* every record (size-class upgrade) */
-#define BF_COPY_REFERENCED 1   /* only records with the REF bit (eviction) */
+#define BF_COPY_REFERENCED 1   /* drop cold cache records (copy-on-access) */
 #define BF_COPY_DIRTY      2   /* only BFOP_INSERT/BFOP_DELETE (compaction) */
 SQLITE_PRIVATE int sqlite3BfMiniPageCopy(BfMiniPage *pDst, u16 dstSize,
     BfMiniPage *pSrc, int copyMode);

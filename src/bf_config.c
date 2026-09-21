@@ -151,6 +151,14 @@ int sqlite3BfCacheMinRecord(void){
 }
 
 /*
+** Size of the copy-on-access region as a fraction of the ring (0.0-1.0).
+** The reference's cb_copy_on_access_ratio; see PRAGMA bf_copy_on_access.
+*/
+double sqlite3BfCacheCopyOnAccessRatio(void){
+  return bfConfig.copyOnAccessRatio;
+}
+
+/*
 ** Get the promotion rate.
 */
 int sqlite3BfCachePromotionRate(void){
@@ -361,6 +369,21 @@ void sqlite3PragmaBfCacheStats(
 
       sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "mini_page_bytes", P4_STATIC);
       sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nMiniB, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+
+    {
+      u64 nCoaMoved = 0, nCoaShed = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreeCopyOnAccessStat(Btree*, u64*, u64*);
+        sqlite3BfBtreeCopyOnAccessStat(pBt, &nCoaMoved, &nCoaShed);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "copy_on_access", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nCoaMoved, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "copy_on_access_shed", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nCoaShed, P4_INT64);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
     }
 
@@ -618,6 +641,58 @@ void sqlite3PragmaBfMinRecord(
         extern int sqlite3BfBtreeSetMinRecord(Btree*, u32);
         if( pBt ) (void)sqlite3BfBtreeSetMinRecord(pBt, (u32)n);
       }
+    }
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_copy_on_access
+**
+** PRAGMA bf_copy_on_access;        -- Returns the region size, in PERCENT
+** PRAGMA bf_copy_on_access = N;    -- Set it (0-100)
+**
+** The copy-on-access second chance (paper 4.1; the reference's
+** cb_copy_on_access_ratio, config.rs:47).  N is the head-most percentage of
+** the ring in which a mini-page that is READ gets relocated to the tail,
+** shedding its cold cache records on the way (sqlite3BfCacheCopyOnAccess).
+**
+**   0   -- plain FIFO, the behaviour before this pragma existed
+**   10  -- the reference's default, and ours
+**   100 -- strict LRU: every read relocates
+**
+** Figure 14 of the paper is a sweep of exactly this axis, which is why it is
+** configuration and not a constant.  Expressed in percent rather than as a
+** ratio because a PRAGMA value is parsed as an integer.
+*/
+void sqlite3PragmaBfCopyOnAccess(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+
+  if( zValue == 0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, (int)(bfConfig.copyOnAccessRatio*100.0 + 0.5), 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_copy_on_access", SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    int n = sqlite3Atoi(zValue);
+    if( n < 0 ) n = 0;
+    if( n > 100 ) n = 100;
+    bfConfig.copyOnAccessRatio = (double)n / 100.0;
+    /* Same reason as bf_cache_size and bf_min_record: the cache is created
+    ** during the schema load, long before any BF pragma can run, so the global
+    ** alone would never reach the ring this connection is already using.
+    ** Unlike those two this needs no teardown -- the region is a threshold
+    ** recomputed from the capacity, not a layout. */
+    {
+      sqlite3 *db = pParse->db;
+      int iDb = sqlite3FindDbName(db, zDb);
+      Btree *pBt = db->aDb[iDb>=0 ? iDb : 0].pBt;
+      extern void sqlite3BfBtreeSetCopyOnAccess(Btree*, double);
+      if( pBt ) sqlite3BfBtreeSetCopyOnAccess(pBt, bfConfig.copyOnAccessRatio);
     }
   }
 }
