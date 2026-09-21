@@ -11,15 +11,19 @@
 *************************************************************************
 ** This file implements configuration and PRAGMA support for Bf-Tree cache.
 **
-** Configuration options:
-**   SQLITE_CONFIG_BFCACHE        - Enable Bf-Tree cache globally
-**   SQLITE_CONFIG_BFCACHE_SIZE   - Set circular buffer size
+** PRAGMAs are the ONLY configuration surface.  A sqlite3_config() path
+** (SQLITE_CONFIG_BFCACHE / _SIZE) was declared here and never wired to
+** anything; it was removed 2026-09-21 along with its opcodes, which collided
+** with SQLite's own.
 **
 ** Pragmas:
 **   PRAGMA bf_cache              - Enable/disable for connection
 **   PRAGMA bf_cache_size         - Get/set cache size
 **   PRAGMA bf_cache_stats        - Show cache statistics
 **   PRAGMA bf_promotion_rate     - Get/set read promotion rate
+**   PRAGMA bf_group_commit       - Transactions per record-frame group
+**   PRAGMA bf_min_record         - Size-class ladder base
+**   PRAGMA bf_copy_on_access     - Copy-on-access region, percent
 */
 #include "sqliteInt.h"
 #include "bf_cache.h"
@@ -53,77 +57,6 @@ static BfConfig bfConfig = {
 */
 int sqlite3BfGroupCommitTxns(void){
   return bfConfig.nGroupCommit;
-}
-
-/*
-** Handle SQLITE_CONFIG_BFCACHE configuration.
-*/
-int sqlite3BfConfigSet(int op, va_list ap){
-  int rc = SQLITE_OK;
-
-  switch( op ){
-    case SQLITE_CONFIG_BFCACHE: {
-      /* Enable or disable Bf-Tree cache globally */
-      int bEnable = va_arg(ap, int);
-      bfConfig.bEnabled = bEnable ? 1 : 0;
-      if( bEnable ){
-        /* Set up Bf-Tree as the default pcache */
-        sqlite3BfCacheSetMethods();
-      }else{
-        sqlite3BfResetGlobalCache();
-        /* Revert to default pcache */
-        sqlite3PCacheSetDefault();
-      }
-      break;
-    }
-
-    case SQLITE_CONFIG_BFCACHE_SIZE: {
-      /* Set circular buffer size */
-      i64 nSize = va_arg(ap, i64);
-      if( nSize < BF_MAX_MINI_PAGE * 2 ){
-        rc = SQLITE_ERROR;  /* Too small */
-      }else{
-        /* Round up to power of 2 */
-        u64 n = 1;
-        while( n < (u64)nSize ) n *= 2;
-        bfConfig.nBufferSize = n;
-      }
-      break;
-    }
-
-    default:
-      rc = SQLITE_ERROR;
-      break;
-  }
-
-  return rc;
-}
-
-/*
-** Handle SQLITE_CONFIG_GETBFCACHE configuration.
-*/
-int sqlite3BfConfigGet(int op, va_list ap){
-  int rc = SQLITE_OK;
-
-  switch( op ){
-    case SQLITE_CONFIG_BFCACHE: {
-      int *pEnable = va_arg(ap, int*);
-      if( pEnable ) *pEnable = bfConfig.bEnabled;
-      break;
-    }
-
-    case SQLITE_CONFIG_BFCACHE_SIZE: {
-      i64 *pSize = va_arg(ap, i64*);
-      if( pSize ) *pSize = (i64)bfConfig.nBufferSize;
-      break;
-    }
-
-    default:
-      rc = SQLITE_ERROR;
-      break;
-  }
-
-  return rc;
 }
 
 /*
@@ -166,15 +99,6 @@ int sqlite3BfCachePromotionRate(void){
 }
 
 /*
-** Set the promotion rate.
-*/
-void sqlite3BfCacheSetPromotionRate(int rate){
-  if( rate < 0 ) rate = 0;
-  if( rate > 100 ) rate = 100;
-  bfConfig.nPromotionRate = rate;
-}
-
-/*
 ** Implementation of PRAGMA bf_cache
 **
 ** PRAGMA bf_cache;           -- Returns current enable state
@@ -204,7 +128,9 @@ void sqlite3PragmaBfCache(
       sqlite3BfCacheSetMethods();
     }else{
       bfConfig.bEnabled = 0;
-      sqlite3BfResetGlobalCache();
+      /* No global cache to tear down: caches are per pager.  The call that
+      ** used to be here operated on bfGlobalCache, which nothing ever
+      ** assigned, so it was a mutex acquire and nothing else. */
       sqlite3PCacheSetDefault();
     }
   }
@@ -384,21 +310,6 @@ void sqlite3PragmaBfCacheStats(
 
       sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "copy_on_access_shed", P4_STATIC);
       sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nCoaShed, P4_INT64);
-      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
-    }
-
-    {
-      u64 nConsRuns = 0, nConsShed = 0;
-      if( pBt ){
-        extern void sqlite3BfBtreeConsolidateStat(Btree*, u64*, u64*);
-        sqlite3BfBtreeConsolidateStat(pBt, &nConsRuns, &nConsShed);
-      }
-      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "consolidations", P4_STATIC);
-      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nConsRuns, P4_INT64);
-      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
-
-      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "consolidate_shed", P4_STATIC);
-      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nConsShed, P4_INT64);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
     }
 

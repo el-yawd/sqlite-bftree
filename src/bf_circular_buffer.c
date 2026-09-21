@@ -47,20 +47,6 @@ static void bfCbTrace(const char *zTag, const void *pPtr, int nSize){
 #define BF_ALLOC_META_SIZE  sizeof(BfAllocMeta)
 
 /*
-** Get the size class index for a given size.
-** Returns -1 if size is larger than maximum.
-*/
-static int bfGetSizeClassIndex(BfCircularBuffer *pCb, u32 size){
-  int i;
-  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
-    if( size <= pCb->freeList.aSizeClass[i] ){
-      return i;      /* aSizeClass ascends, so this is the smallest that fits */
-    }
-  }
-  return -1;
-}
-
-/*
 ** Initialize size classes for free list: 64, 128, 256, 512, 1024, 2048, 4096,
 ** ASCENDING, so aSizeClass[0] is the smallest.
 **
@@ -517,26 +503,6 @@ void sqlite3BfCircularBufferReleaseDeallocHandle(void *ptr){
 }
 
 /*
-** Finish deallocation after acquiring handle.
-*/
-void sqlite3BfCircularBufferFinishDealloc(BfCircularBuffer *pCb, void *ptr, int addToFreeList){
-  BfAllocMeta *pMeta = bfGetMetaFromDataPtr(ptr);
-
-  if( !addToFreeList || sqlite3BfCircularBufferIsCopyOnAccess(pCb, ptr) ){
-    bfToTombstone(pMeta);
-    BF_CB_TRACE("finish-dealloc-tombstone", ptr, (int)pMeta->size);
-    return;
-  }
-
-  if( bfFreeListAdd(&pCb->freeList, ptr, pMeta->size) ){
-    bfMetaStoreState(pMeta, BF_STATE_FREELISTED);
-  }else{
-    bfToTombstone(pMeta);
-  }
-  BF_CB_TRACE("finish-dealloc", ptr, (int)pMeta->size);
-}
-
-/*
 ** Try to bump head address to evicting address.
 ** Returns number of bytes advanced.
 */
@@ -675,27 +641,6 @@ int sqlite3BfCircularBufferEvictN(BfCircularBuffer *pCb, int n,
   }
 
   return total;
-}
-
-/*
-** Get the allocated size for a pointer.
-*/
-u32 sqlite3BfCircularBufferGetSize(void *ptr){
-  BfAllocMeta *pMeta = bfGetMetaFromDataPtr(ptr);
-  return pMeta->size;
-}
-
-/*
-** Get buffer usage statistics.
-*/
-void sqlite3BfCircularBufferStats(BfCircularBuffer *pCb,
-    u64 *pUsed, u64 *pCapacity, u64 *pAllocs, u64 *pEvictions){
-  sqlite3_mutex_enter(pCb->mutex);
-  if( pUsed ) *pUsed = pCb->tailAddr - pCb->headAddr;
-  if( pCapacity ) *pCapacity = pCb->capacity;
-  if( pAllocs ) *pAllocs = pCb->nAllocs;
-  if( pEvictions ) *pEvictions = pCb->nEvictions;
-  sqlite3_mutex_leave(pCb->mutex);
 }
 
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */

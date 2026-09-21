@@ -268,7 +268,6 @@ int sqlite3PagerWalSystemErrno(Pager*);
 
 /* P0.3: Per-pager BF-Tree cache */
 void sqlite3PagerOpenBfCache(Pager *pPager);
-int sqlite3PagerUsesBfCache(Pager *pPager);
 BfCache *sqlite3PagerGetBfCache(Pager *pPager);
 void sqlite3BfClosePagerCache(Pager *pPager);
 BfCache *sqlite3BfGetPagerCache(Pager *pPager);

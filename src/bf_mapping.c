@@ -177,39 +177,6 @@ int sqlite3BfMapInsert(BfCache *pCache, u32 pgno, u8 locType,
 }
 
 /*
-** Remove a mapping entry (set to NULL location).
-*/
-int sqlite3BfMapRemove(BfCache *pCache, u32 pgno){
-  BfMapEntry *pEntry = sqlite3BfMapLookup(pCache, pgno);
-
-  if( pEntry ){
-    BF_MAP_LOG("remove", pgno, pEntry->locType, pEntry->pPage);
-    pEntry->locType = BF_LOC_NULL;
-    pEntry->pPage = 0;
-    pEntry->diskOffset = 0;
-  }
-
-  return SQLITE_OK;
-}
-
-/*
-** Update just the location type and page pointer.
-*/
-int sqlite3BfMapUpdateLocation(BfCache *pCache, u32 pgno, u8 locType, void *pPage){
-  BfMapEntry *pEntry = sqlite3BfMapLookup(pCache, pgno);
-
-  if( !pEntry ){
-    return sqlite3BfMapInsert(pCache, pgno, locType, pPage, -1);
-  }
-
-  BF_MAP_LOG("update", pgno, locType, pPage);
-  pEntry->locType = locType;
-  pEntry->pPage = pPage;
-
-  return SQLITE_OK;
-}
-
-/*
 ** Iterate over all non-null entries in the mapping table.
 ** Callback returns non-zero to stop iteration.
 */
@@ -363,67 +330,6 @@ int sqlite3BfDirtyListIterate(BfCache *pCache,
   }
   return 0;
 }
-
-/*
-** Count non-null entries in the mapping table.
-*/
-int sqlite3BfMapCount(BfCache *pCache){
-  int batch, entry;
-  int count = 0;
-
-  for(batch = 0; batch < pCache->nMapBatch; batch++){
-    if( !pCache->apMap[batch] ) continue;
-
-    for(entry = 0; entry < BF_MAP_BATCH_SIZE; entry++){
-      if( pCache->apMap[batch][entry].locType != BF_LOC_NULL ){
-        count++;
-      }
-    }
-  }
-
-  return count;
-}
-
-/*
-** Count mini-pages in the mapping table.
-*/
-int sqlite3BfMapMiniPageCount(BfCache *pCache){
-  int batch, entry;
-  int count = 0;
-
-  for(batch = 0; batch < pCache->nMapBatch; batch++){
-    if( !pCache->apMap[batch] ) continue;
-
-    for(entry = 0; entry < BF_MAP_BATCH_SIZE; entry++){
-      if( pCache->apMap[batch][entry].locType == BF_LOC_MINI ){
-        count++;
-      }
-    }
-  }
-
-  return count;
-}
-
-/*
-** Count full pages in the mapping table.
-*/
-int sqlite3BfMapFullPageCount(BfCache *pCache){
-  int batch, entry;
-  int count = 0;
-
-  for(batch = 0; batch < pCache->nMapBatch; batch++){
-    if( !pCache->apMap[batch] ) continue;
-
-    for(entry = 0; entry < BF_MAP_BATCH_SIZE; entry++){
-      if( pCache->apMap[batch][entry].locType == BF_LOC_FULL ){
-        count++;
-      }
-    }
-  }
-
-  return count;
-}
-
 
 /*
 ** Space accounting for the mapping table and the mini-pages it points at.

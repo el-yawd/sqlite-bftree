@@ -252,20 +252,6 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   return BFWAL_OK;
 }
 
-/*
-** Fast, side-effect-free classification of a frame payload as a record batch
-** (magic + version + a self-consistent nUsed).  Lets the reader/recovery walk
-** distinguish record frames from page-image frames.
-*/
-int sqlite3BfWalIsBatch(const u8 *aBuf, int szBuf){
-  u32 nUsed;
-  if( szBuf < BFWAL_HDRSIZE ) return 0;
-  if( bfGet32(aBuf + 0) != BFWAL_MAGIC ) return 0;
-  if( bfGet16(aBuf + 4) != BFWAL_VERSION ) return 0;
-  nUsed = bfGet32(aBuf + 8);
-  return nUsed >= (u32)BFWAL_HDRSIZE && nUsed <= (u32)szBuf;
-}
-
 /****************************************************************************
 ** In-memory page -> ordered record-ops index (see bf_wal.h).
 **
@@ -425,21 +411,6 @@ int sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec){
   pRec->pKey = pOp->nKey ? pOp->pBody : 0;
   pRec->pVal = pOp->nVal ? pOp->pBody + pOp->nKey : 0;
   return BFWAL_OK;
-}
-
-void sqlite3BfWalIndexClearPage(BfWalIndex *p, u32 pgno){
-  unsigned h = bfIdxHash(pgno, p->nBucket);
-  BfWalIdxPage **ppSlot = &p->apBucket[h];
-  while( *ppSlot ){
-    if( (*ppSlot)->pgno==pgno ){
-      BfWalIdxPage *pDead = *ppSlot;
-      *ppSlot = pDead->pNext;
-      bfIdxFreePage(pDead);
-      p->nPage--;
-      return;
-    }
-    ppSlot = &(*ppSlot)->pNext;
-  }
 }
 
 int sqlite3BfWalIndexForEachPage(BfWalIndex *p,

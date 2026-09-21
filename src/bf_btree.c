@@ -792,15 +792,6 @@ void sqlite3BfBtreeCopyOnAccessStat(Btree *p, u64 *pnMoved, u64 *pnShed){
   if( pnShed )  *pnShed  = pBf ? pBf->nCopyOnAccessShed : 0;
 }
 
-/* Flush-time cold-record shedding (PRAGMA bf_cache_stats).  Was invisible, and
-** was dead; see the note at the Consolidate call site. */
-void sqlite3BfBtreeConsolidateStat(Btree *p, u64 *pnRuns, u64 *pnShed){
-  BfCache *pBf = 0;
-  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
-  if( pnRuns ) *pnRuns = pBf ? pBf->nConsolidations : 0;
-  if( pnShed ) *pnShed = pBf ? pBf->nConsolidateShed : 0;
-}
-
 /* Cold cache records shed by size upgrades -- the frequent copy, and the one
 ** that actually returns ring space.  Read it beside `upgrades`. */
 void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
@@ -1532,31 +1523,6 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
   return 1;
 }
 
-
-/*
-** Length of the clean cached record the descent shortcut is about to serve,
-** for the cursor's current leaf key (pCur->info.nKey).  Returns the byte
-** length on a clean hit, or -1 on miss/error.  The caller must already have
-** set up the leaf-less keying (BTCF_BfLeaf + bfLeaf) so bfCursorLeafPgno
-** resolves to the un-read leaf.
-*/
-int sqlite3BfBtreeCachedPayloadSize(BtCursor *pCur){
-  BtShared *pBt;
-  BfCache  *pBf;
-  u32       leaf;
-  u8        keyBuf[8];
-  int       nBuf = 0, rc;
-
-  if( !pCur || !pCur->pBt || !pCur->curIntKey ) return -1;
-  pBt = pCur->pBt;
-  pBf = btreeGetBfCache(pBt);
-  if( !pBf ) return -1;
-  leaf = bfCursorLeafPgno(pCur);
-  if( leaf==0 ) return -1;
-  bfEncodeRowid(pCur->info.nKey, keyBuf);
-  rc = sqlite3BfRecordRead(pBf, leaf, keyBuf, 8, 0, &nBuf);
-  return rc==BF_OK ? nBuf : -1;
-}
 
 /*
 ** Descent shortcut fast read: copy the clean cached record for the BF-served

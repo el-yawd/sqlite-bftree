@@ -431,7 +431,7 @@ struct BfCache {
   ** Today there is no race, because there is no sharing.  A BfCache is created
   ** per pager -- see sqlite3PagerOpenBfCache, "one BfCache per pager is the
   ** correct architecture" -- so each connection owns its own mapping table,
-  ** mini-pages and ring.  (bfGlobalCache and sqlite3BfGetGlobalCache look like
+  ** mini-pages and ring.  (A bfGlobalCache singleton and its accessor looked like
   ** a shared singleton but have zero call sites; they are dead.)
   **
   ** That per-pager design is what makes multi-threading the REFERENCE workload
@@ -522,8 +522,6 @@ struct BfCache {
                             ** the rest were excluded by the buffering gate in
                             ** sqlite3BtreeInsert before BF was even asked */
   u64 nUpgradeShed;         /* Cold cache records dropped by size upgrades */
-  u64 nConsolidations;      /* Flushes that shed at least one cold record */
-  u64 nConsolidateShed;     /* Cold cache records those flushes dropped */
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
@@ -543,8 +541,6 @@ struct BfCache {
 ** Initialize the Bf-Tree cache subsystem.
 ** Call once at SQLite initialization.
 */
-SQLITE_PRIVATE int sqlite3BfCacheInit(void);
-SQLITE_PRIVATE void sqlite3BfCacheShutdown(void);
 
 /*
 ** Create and destroy Bf-Tree cache instances.
@@ -555,8 +551,6 @@ SQLITE_PRIVATE void sqlite3BfCacheDestroy(BfCache *pCache);
 /*
 ** Configure cache size.
 */
-SQLITE_PRIVATE void sqlite3BfCacheSetCachesize(BfCache *pCache, int nMax);
-SQLITE_PRIVATE int sqlite3BfCachePagecount(BfCache *pCache);
 
 /*
 ** Circular buffer operations.
@@ -584,16 +578,12 @@ SQLITE_PRIVATE int sqlite3BfMiniPageLookupOp(BfMiniPage *pMini,
     const void *pKey, int nKey, u8 *pOp);
 SQLITE_PRIVATE int sqlite3BfMiniPageSearch(BfMiniPage *pMini,
     const void *pKey, int nKey, void *pBuf, int *pnBuf);
-SQLITE_PRIVATE int sqlite3BfMiniPageDelete(BfMiniPage *pMini, const void *pKey, int nKey);
-SQLITE_PRIVATE int sqlite3BfMiniPageNeedsMerge(BfMiniPage *pMini);
-SQLITE_PRIVATE int sqlite3BfMiniPageSpaceRemaining(BfMiniPage *pMini);
 /* Fill aSizeClass[BF_SIZE_CLASS_COUNT] with the derived ladder, ascending.
 ** ONE definition: BfFreeList and BfCache each keep a copy, and if the two ever
 ** disagreed a block allocated from one class would be freed into another. */
 SQLITE_PRIVATE void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord);
 SQLITE_PRIVATE int sqlite3BfCacheMinRecord(void);
 SQLITE_PRIVATE double sqlite3BfCacheCopyOnAccessRatio(void);
-SQLITE_PRIVATE u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass);
 SQLITE_PRIVATE u32 sqlite3BfMiniPageSizeClassFor(BfMiniPage *pMini, int nKey,
                                                  int nVal, u32 *aSizeClass);
 
@@ -602,19 +592,11 @@ SQLITE_PRIVATE u32 sqlite3BfMiniPageSizeClassFor(BfMiniPage *pMini, int nKey,
 */
 SQLITE_PRIVATE BfMapEntry *sqlite3BfMapLookup(BfCache *pCache, u32 pgno);
 SQLITE_PRIVATE int sqlite3BfMapInsert(BfCache *pCache, u32 pgno, u8 locType, void *pPage, i64 diskOffset);
-SQLITE_PRIVATE int sqlite3BfMapRemove(BfCache *pCache, u32 pgno);
-SQLITE_PRIVATE int sqlite3BfMapUpdateLocation(BfCache *pCache, u32 pgno, u8 locType, void *pPage);
 
 /*
 ** Cache operations (high-level interface).
 */
-SQLITE_PRIVATE int sqlite3BfCacheFetch(BfCache *pCache, u32 pgno, int createFlag, void **ppPage);
-SQLITE_PRIVATE int sqlite3BfCacheUnpin(BfCache *pCache, void *pPage, int reuseUnlikely);
-SQLITE_PRIVATE int sqlite3BfCacheMakeDirty(BfCache *pCache, u32 pgno);
-SQLITE_PRIVATE int sqlite3BfCacheMakeClean(BfCache *pCache, u32 pgno);
-SQLITE_PRIVATE int sqlite3BfCacheMerge(BfCache *pCache, u32 pgno);
 SQLITE_PRIVATE int sqlite3BfCacheEvict(BfCache *pCache, int nTarget);
-SQLITE_PRIVATE int sqlite3BfCacheTruncate(BfCache *pCache, u32 iLimit);
 
 /*
 ** Record-level operations (bypass full page for point queries).
@@ -638,7 +620,6 @@ SQLITE_PRIVATE void sqlite3BfCacheSetMethods(void);
 ** Additional circular buffer operations.
 */
 SQLITE_PRIVATE void sqlite3BfCircularBufferMarkReady(void *ptr);
-SQLITE_PRIVATE u32 sqlite3BfCircularBufferGetSize(void *ptr);
 SQLITE_PRIVATE void sqlite3BfCircularBufferStats(BfCircularBuffer *pCb,
     u64 *pUsed, u64 *pCapacity, u64 *pAllocs, u64 *pEvictions);
 
@@ -648,10 +629,8 @@ SQLITE_PRIVATE void sqlite3BfCircularBufferStats(BfCircularBuffer *pCb,
 SQLITE_PRIVATE int sqlite3BfMiniPageDirtyCount(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
-SQLITE_PRIVATE void sqlite3BfMiniPageClearRefs(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfKvIsColdCache(const BfKVMeta *pMeta);
 SQLITE_PRIVATE void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry);
-SQLITE_PRIVATE int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini);
 /* A3a: take/release the record-cache lock.  No-ops in a single-threaded build,
 ** and tolerant of a null cache so call sites need no extra guard. */
 #if SQLITE_THREADSAFE
@@ -693,9 +672,6 @@ SQLITE_PRIVATE void sqlite3BfMiniPageMarkLoggedAt(BfMiniPage *pMini, int ix);
 SQLITE_PRIVATE int sqlite3BfMapInit(BfCache *pCache);
 SQLITE_PRIVATE void sqlite3BfMapDestroy(BfCache *pCache);
 SQLITE_PRIVATE BfMapEntry *sqlite3BfMapGetOrCreate(BfCache *pCache, u32 pgno);
-SQLITE_PRIVATE int sqlite3BfMapCount(BfCache *pCache);
-SQLITE_PRIVATE int sqlite3BfMapMiniPageCount(BfCache *pCache);
-SQLITE_PRIVATE int sqlite3BfMapFullPageCount(BfCache *pCache);
 SQLITE_PRIVATE void sqlite3BfMapSpaceStats(BfCache *pCache, u64 *pnBatches,
                                            u64 *pnEntries, u64 *pnMiniPages,
                                            u64 *pnRecords, u64 *pnMiniBytes,
@@ -706,15 +682,11 @@ SQLITE_PRIVATE int sqlite3BfMapIterate(BfCache *pCache,
 /*
 ** Pager integration functions.
 */
-SQLITE_PRIVATE int sqlite3PagerUsesBfCache(Pager *pPager);
 SQLITE_PRIVATE BfCache *sqlite3PagerGetBfCache(Pager *pPager);
 SQLITE_PRIVATE int sqlite3BfPagerRecordRead(Pager *pPager, Pgno pgno,
     const void *pKey, int nKey, void *pBuf, int *pnBuf);
 SQLITE_PRIVATE int sqlite3BfPagerRecordWrite(Pager *pPager, Pgno pgno,
     const void *pKey, int nKey, const void *pVal, int nVal, int isDelete);
-SQLITE_PRIVATE int sqlite3BfPagerMergeMiniPage(Pager *pPager, Pgno pgno);
-SQLITE_PRIVATE int sqlite3BfPagerMergeAllMiniPages(Pager *pPager);
-SQLITE_PRIVATE int sqlite3BfCacheMergeWithPager(BfCache *pCache, u32 pgno, Pager *pPager);
 
 /*
 ** Btree integration functions.
@@ -740,7 +712,6 @@ SQLITE_PRIVATE void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno);
 SQLITE_PRIVATE int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg,
     i64 intKey, void *pBuf, int *pnBuf);
 /* Length of the clean cached record for the BF-served cursor's leaf key, or -1. */
-SQLITE_PRIVATE int sqlite3BfBtreeCachedPayloadSize(BtCursor *pCur);
 /* Copy the clean cached record into pBuf (cap nCap) in one read; len or -1. */
 SQLITE_PRIVATE int sqlite3BfBtreeReadCachedRecord(BtCursor *pCur, void *pBuf, int nCap);
 /* Re-descend a BF-served (BTCF_BfLeaf) cursor onto its real leaf page. */
@@ -830,9 +801,6 @@ SQLITE_PRIVATE int sqlite3BfBtreeApplyDelete(Pager *pPager, Pgno pgno,
 SQLITE_PRIVATE int sqlite3BfCacheEnabled(void);
 SQLITE_PRIVATE u64 sqlite3BfCacheBufferSize(void);
 SQLITE_PRIVATE int sqlite3BfCachePromotionRate(void);
-SQLITE_PRIVATE void sqlite3BfCacheSetPromotionRate(int rate);
-SQLITE_PRIVATE BfCache *sqlite3BfGetGlobalCache(int szPage);
-SQLITE_PRIVATE void sqlite3BfResetGlobalCache(void);
 
 /*
 ** Per-pager cache management (P0.3).
@@ -844,7 +812,11 @@ SQLITE_PRIVATE void sqlite3BfClosePagerCache(Pager *pPager);
 /*
 ** Configuration option numbers (add to sqlite3.h SQLITE_CONFIG_* list).
 */
-#define SQLITE_CONFIG_BFCACHE       30  /* int: enable bf-tree cache */
-#define SQLITE_CONFIG_BFCACHE_SIZE  31  /* i64: circular buffer size */
+/* SQLITE_CONFIG_BFCACHE / _SIZE used to be defined here as 30 and 31.
+** Removed 2026-09-21 with their (never-called) handlers.  They were a latent
+** collision, not merely dead: 30 is SQLite's own SQLITE_CONFIG_ROWID_IN_VIEW,
+** so wiring these up as written would have broken a real config option.  Every
+** BF setting is reachable through its PRAGMA; if a sqlite3_config() entry point
+** is ever wanted, allocate opcodes that upstream does not use. */
 
 #endif /* _BF_CACHE_H_ */

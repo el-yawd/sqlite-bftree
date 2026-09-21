@@ -93,7 +93,6 @@ int  sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec);
 /* Cheap classification: does this payload look like a record batch?  Used by
 ** the reader/recovery walk to tell record frames from page-image frames when a
 ** frame-header marker is not otherwise available. */
-int  sqlite3BfWalIsBatch(const u8 *aBuf, int szBuf);
 
 /*
 ** In-memory page -> ordered record-ops index.
@@ -114,7 +113,6 @@ void        sqlite3BfWalIndexFree(BfWalIndex *p);
 int         sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec);
 int         sqlite3BfWalIndexPageCount(BfWalIndex *p, u32 pgno);
 int         sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec);
-void        sqlite3BfWalIndexClearPage(BfWalIndex *p, u32 pgno);
 
 /* Feed every op of one record-batch frame payload into the index (recovery /
 ** reader walk convenience).  Returns BFWAL_OK, BFWAL_CORRUPT (bad payload), or

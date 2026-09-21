@@ -71,7 +71,6 @@ static struct BfCacheGlobal {
   u64 nTotalAlloc;               /* Total bytes allocated */
   u64 nTotalPages;               /* Total pages in all caches */
 } bfGlobal;
-static BfCache *bfGlobalCache;
 
 /*
 ** Page header structure for Bf-Tree pages.
@@ -675,56 +674,6 @@ void sqlite3BfCacheSetMethods(void){
 }
 
 /*
-** Initialize the Bf-Tree cache subsystem.
-*/
-int sqlite3BfCacheInit(void){
-  return bfCacheInit(0);
-}
-
-/*
-** Shutdown the Bf-Tree cache subsystem.
-*/
-void sqlite3BfCacheShutdown(void){
-  bfCacheShutdown(0);
-}
-
-/*
-** Return the lazily created runtime Bf-Tree cache used by btree hooks.
-**
-** This path does not depend on runtime sqlite3_config(SQLITE_CONFIG_PCACHE2)
-** reconfiguration, which is disallowed after initialization.
-*/
-BfCache *sqlite3BfGetGlobalCache(int szPage){
-  BfCache *pRet;
-  if( !sqlite3BfCacheEnabled() ) return 0;
-  if( szPage<=0 ) szPage = 4096;
-#if SQLITE_THREADSAFE
-  sqlite3_mutex_enter(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
-#endif
-  if( bfGlobalCache==0 ){
-    bfGlobalCache = (BfCache*)bfCacheCreate(szPage, 0, 1);
-  }
-  pRet = bfGlobalCache;
-#if SQLITE_THREADSAFE
-  sqlite3_mutex_leave(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
-#endif
-  return pRet;
-}
-
-void sqlite3BfResetGlobalCache(void){
-#if SQLITE_THREADSAFE
-  sqlite3_mutex_enter(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
-#endif
-  if( bfGlobalCache ){
-    bfCacheDestroy((sqlite3_pcache*)bfGlobalCache);
-    bfGlobalCache = 0;
-  }
-#if SQLITE_THREADSAFE
-  sqlite3_mutex_leave(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
-#endif
-}
-
-/*
 ** Public wrapper to create a BfCache (P0.3).
 ** Used for creating per-pager caches.
 */
@@ -1173,118 +1122,6 @@ static int bfApplyDirtyRecordCallback(void *pCtx, const u8 *pKey, int nKey,
   /* Other operation types (BFOP_CACHE, BFOP_PHANTOM) are not dirty records */
   
   return BF_OK;
-}
-
-/*
-** Merge a mini-page to its base page (internal implementation).
-**
-** At minimum this compacts the mini-page and converts dirty records into a
-** clean state so scans and eviction can proceed without leaving stale deltas
-** behind.
-*/
-static int bfCacheMergeInternal(BfCache *pCache, u32 pgno, Pager *pPager){
-  BfMapEntry *pEntry;
-  BfMiniPage *pMini;
-  int nDirty;
-  int rc;
-
-  UNUSED_PARAMETER(pPager);
-
-  if( !pCache ) return BF_ERROR;
-
-  pEntry = sqlite3BfMapLookup(pCache, pgno);
-  if( !pEntry || pEntry->locType != BF_LOC_MINI ){
-    return BF_OK;  /* No mini-page to merge */
-  }
-
-  pMini = (BfMiniPage*)pEntry->pPage;
-  if( !pMini ) return BF_OK;
-  if( (void*)pMini == pCache->pEvictProtect ){
-    return BF_ERROR;         /* in use by the caller that triggered this sweep */
-  }
-
-  /* Check if mini-page has dirty records that need merging */
-  if( !sqlite3BfMiniPageIsDirty(pMini) ){
-    return BF_OK;  /* Nothing to merge */
-  }
-
-  /* Count dirty records before processing */
-  nDirty = sqlite3BfMiniPageDirtyCount(pMini);
-
-  /* If we have a Pager context, apply dirty records to the base page */
-  if( pPager != NULL ){
-    /* Create context for the callback */
-    BfApplyContext applyCtx;
-    applyCtx.pPager = pPager;
-    applyCtx.pgno = pgno;
-    
-    /* Apply each dirty record to the base page */
-    rc = sqlite3BfMiniPageIterate(pMini, bfApplyDirtyRecordCallback, &applyCtx);
-    if( rc != BF_OK && rc != SQLITE_OK ){
-      return rc;
-    }
-  }
-
-  /* Shed this mini-page's cold cache records.  Instrumented because this call
-  ** was DEAD for the project's whole life and nothing could have shown it:
-  ** insert set REF=1 on every record, so Consolidate's keep-test passed for all
-  ** of them and it returned at its first branch, every time.  B2 gave the REF
-  ** bit its real meaning, which made this live -- a behaviour change at flush
-  ** time that arrived as a side effect rather than as a decision.  These two
-  ** counters are what let the end-of-B campaign see it at all. */
-  {
-    int nBefore = sqlite3BfMiniPageCount(pMini);
-    rc = sqlite3BfMiniPageConsolidate(pMini);
-    if( rc != BF_OK ){
-      return rc;
-    }
-    if( sqlite3BfMiniPageCount(pMini) < nBefore ){
-      pCache->nConsolidations++;
-      pCache->nConsolidateShed += (u64)(nBefore - sqlite3BfMiniPageCount(pMini));
-    }
-  }
-
-  /* All records processed successfully - update mini-page state */
-  sqlite3BfMiniPageMarkClean(pMini);
-
-  /* Update cache statistics
-  ** nMergeToBase: total number of merge operations completed
-  ** Incremented by the number of dirty operations processed
-  */
-  pCache->nMergeToBase += nDirty;
-
-  return BF_OK;
-}
-
-/*
-** Public API: Merge a mini-page to its base page.
-** Called when mini-page is full or being evicted.
-**
-** This keeps the merge entirely inside the BF cache layer. Dirty records are
-** consolidated into the mini-page state and then marked clean so scans do not
-** re-enter the pager/VDBE stack.
-**
-** The merge process:
-** 1. Look up the mini-page in the mapping table
-** 2. Check if it has dirty records (BFOP_INSERT or BFOP_DELETE)
-** 3. Count dirty records
-** 4. Mark the mini-page clean once consolidation is complete
-** 5. Update cache statistics
-**
-** Return: BF_OK on success, error code otherwise
-*/
-int sqlite3BfCacheMerge(BfCache *pCache, u32 pgno){
-  return bfCacheMergeInternal(pCache, pgno, NULL);
-}
-
-/*
-** Merge with Pager context for P1 record application.
-** P1 Implementation: Pass Pager to merge callback for btree record application.
-**
-** This is the main merge path that applies records to btree during merge.
-*/
-int sqlite3BfCacheMergeWithPager(BfCache *pCache, u32 pgno, Pager *pPager){
-  return bfCacheMergeInternal(pCache, pgno, pPager);
 }
 
 /*

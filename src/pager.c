@@ -4327,18 +4327,6 @@ void sqlite3BfClosePagerCache(Pager *pPager){
 }
 
 /*
-** Check if a pager is using Bf-Tree cache (P0.3).
-*/
-int sqlite3PagerUsesBfCache(Pager *pPager){
-  if( !pPager ) return 0;
-  /* Create cache on first check if not already present */
-  if( !pPager->pBfCache && sqlite3BfCacheEnabled() ){
-    sqlite3PagerOpenBfCache(pPager);
-  }
-  return pPager->pBfCache != 0;
-}
-
-/*
 ** Get the BfCache associated with a pager, if any (P0.3).
 */
 BfCache *sqlite3PagerGetBfCache(Pager *pPager){

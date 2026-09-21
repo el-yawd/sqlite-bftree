@@ -167,23 +167,6 @@ static u32 bfRecordSpace(int nKey, int nVal){
 }
 
 /*
-** Check how much space remains in the mini-page.
-*/
-int sqlite3BfMiniPageSpaceRemaining(BfMiniPage *pMini){
-  return pMini->freeSpace;
-}
-
-/*
-** Check if mini-page needs to be merged (too full or too many records).
-*/
-int sqlite3BfMiniPageNeedsMerge(BfMiniPage *pMini){
-  /* Merge when 90% full or has many records */
-  u32 used = pMini->nodeSize - pMini->freeSpace - sizeof(BfMiniPage);
-  return (used > (pMini->nodeSize * 9 / 10)) ||
-         (pMini->metaCount > 100);
-}
-
-/*
 ** Get the next size class for upgrading a mini-page.
 ** Returns 0 if already at maximum size.
 */
@@ -232,28 +215,6 @@ void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord){
   }
   assert( aSizeClass[0] >= sizeof(BfMiniPage) + sizeof(BfKVMeta) );
   assert( aSizeClass[BF_SIZE_CLASS_COUNT-1]==BF_MAX_MINI_PAGE );
-}
-
-u32 sqlite3BfMiniPageNextSizeClass(BfMiniPage *pMini, u32 *aSizeClass){
-  int i;
-  /* Ascending: the SMALLEST class larger than the current node.
-  **
-  ** This loop used to run downward from BF_SIZE_CLASS_COUNT-1 and return the
-  ** first class greater than nodeSize -- which, since the largest class is
-  ** always greater, meant it returned BF_MAX_MINI_PAGE (4096) on the very
-  ** first iteration, every time.  Every mini-page that overflowed its 64-byte
-  ** initial allocation therefore jumped straight to 4096 bytes, so a ~110-byte
-  ** row occupied a 4 KiB mini-page: 37x space amplification, a ring that held
-  ** ~63k records instead of ~2M, and constant eviction churn.  The header
-  ** comment on BF_MIN_MINI_PAGE ("double until BF_MAX_MINI_PAGE") describes
-  ** the intent this now implements. */
-  assert( aSizeClass[0] < aSizeClass[BF_SIZE_CLASS_COUNT-1] );  /* ascending */
-  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
-    if( aSizeClass[i] > pMini->nodeSize ){
-      return aSizeClass[i];
-    }
-  }
-  return 0;  /* Already at maximum */
 }
 
 /*
@@ -543,16 +504,6 @@ int sqlite3BfMiniPageSearch(BfMiniPage *pMini,
 }
 
 /*
-** Delete a record from the mini-page (insert tombstone).
-**
-** Returns BF_OK on success, BF_MINI_PAGE_FULL if no space.
-*/
-int sqlite3BfMiniPageDelete(BfMiniPage *pMini, const void *pKey, int nKey){
-  /* Insert a tombstone record with empty value */
-  return sqlite3BfMiniPageInsert(pMini, pKey, nKey, "", 0, BFOP_DELETE);
-}
-
-/*
 ** Count the number of dirty records in the mini-page.
 ** Dirty records are INSERT or DELETE operations that need to be written.
 */
@@ -630,85 +581,6 @@ int sqlite3BfKvIsColdCache(const BfKVMeta *pMeta){
   u8 op = BF_KV_OP_TYPE(pMeta);
   if( op!=BFOP_CACHE && op!=BFOP_PHANTOM ) return 0;
   return !BF_KV_IS_REF(pMeta);
-}
-
-/*
-** Consolidate the mini-page by removing cold cache records.
-** This compacts the page and reclaims space.
-**
-** Called from bfFlushOneMiniPage AFTER the dirty records have been applied to
-** the base page but BEFORE MarkClean converts them, so the dirty records are
-** still BFOP_INSERT/BFOP_DELETE here and the cold-cache test keeps them.
-*/
-int sqlite3BfMiniPageConsolidate(BfMiniPage *pMini){
-  BfKVMeta *aMeta = bfMiniPageMeta(pMini);
-  u8 *pDataEnd = bfMiniPageDataEnd(pMini);
-  int i, j;
-  int keepCount = 0;
-  u16 newOffset = 0;
-  u8 *pSrc, *pDst;
-  int nKey, nVal;
-  int rc;
-
-  /* First pass: count records to keep */
-  for(i = 0; i < pMini->metaCount; i++){
-    if( !sqlite3BfKvIsColdCache(&aMeta[i]) ){
-      keepCount++;
-    }
-  }
-
-  if( keepCount == pMini->metaCount ){
-    /* Nothing to consolidate */
-    return BF_OK;
-  }
-
-  /* Create temporary buffer for compaction */
-  u32 tempSize = pMini->nodeSize;
-  u8 *pTemp = sqlite3_malloc(tempSize);
-  if( !pTemp ) return SQLITE_NOMEM;
-  BF_MINI_TRACE("temp-alloc", pTemp, (int)tempSize);
-
-  BfMiniPage *pNewMini = (BfMiniPage*)pTemp;
-  sqlite3BfMiniPageInit(pNewMini, pMini->nodeSize, pMini->baseDiskOffset);
-  pNewMini->ownerPgno = pMini->ownerPgno;
-  pNewMini->rootPgno = pMini->rootPgno;
-
-  /* Copy referenced records */
-  for(i = 0; i < pMini->metaCount; i++){
-    if( !sqlite3BfKvIsColdCache(&aMeta[i]) ){
-      pSrc = bfGetKeyPtr(pMini, &aMeta[i]);
-      nKey = BF_KV_KEY_LEN(&aMeta[i]);
-      nVal = BF_KV_VALUE_LEN(&aMeta[i]);
-
-      rc = sqlite3BfMiniPageInsert(pNewMini, pSrc, nKey, pSrc + nKey, nVal,
-                                   BF_KV_OP_TYPE(&aMeta[i]));
-      if( rc!=BF_OK ){
-        BF_MINI_TRACE("temp-free", pTemp, (int)tempSize);
-        sqlite3_free(pTemp);
-        return rc;
-      }
-    }
-  }
-
-  /* Copy back */
-  memcpy(pMini, pNewMini, pMini->nodeSize);
-  BF_MINI_TRACE("temp-free", pTemp, (int)tempSize);
-  sqlite3_free(pTemp);
-
-  return BF_OK;
-}
-
-/*
-** Clear reference bits on all records.
-** Called at start of eviction cycle.
-*/
-void sqlite3BfMiniPageClearRefs(BfMiniPage *pMini){
-  BfKVMeta *aMeta = bfMiniPageMeta(pMini);
-  int i;
-
-  for(i = 0; i < pMini->metaCount; i++){
-    BF_KV_SET_REF(&aMeta[i], 0);
-  }
 }
 
 /*
