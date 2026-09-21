@@ -801,6 +801,14 @@ void sqlite3BfBtreeConsolidateStat(Btree *p, u64 *pnRuns, u64 *pnShed){
   if( pnShed ) *pnShed = pBf ? pBf->nConsolidateShed : 0;
 }
 
+/* Cold cache records shed by size upgrades -- the frequent copy, and the one
+** that actually returns ring space.  Read it beside `upgrades`. */
+void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pnShed ) *pnShed = pBf ? pBf->nUpgradeShed : 0;
+}
+
 void sqlite3BfBtreeClearCache(Btree *p){
   BfCache *pBf;
   if( !p || !p->pBt ) return;

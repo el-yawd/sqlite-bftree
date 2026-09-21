@@ -946,12 +946,49 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     }
     if( pNew ){
       sqlite3BfCircularBufferMarkReady(pNew);
-      /* Copy ALL records, not just referenced ones: this mini-page may hold
-      ** buffered dirty writes (BFOP_INSERT/BFOP_DELETE) that have never been
-      ** read back, so their REF bit is irrelevant.  Dropping them here would
-      ** silently lose committed data on the next flush. */
+      /* Shed cold cache records as we grow, exactly as the reference does at
+      ** this same point -- mini_page_op.rs:744 upgrades with
+      ** copy_initialize_to(..., discard_cold_cache = true).
+      **
+      ** This call used to pass BF_COPY_ALL, and the reason given was sound at
+      ** the time: "this mini-page may hold buffered dirty writes that have
+      ** never been read back, so their REF bit is irrelevant; dropping them
+      ** would silently lose committed data."  BF_COPY_REFERENCED then meant
+      ** "keep records with the REF bit", which would indeed have dropped
+      ** them.  It now means the reference's discard_cold_cache
+      ** (sqlite3BfKvIsColdCache): a dirty record is never cold whatever its
+      ** REF bit says, so the hazard that comment describes cannot occur.
+      **
+      ** This is the copy that MATTERS for capacity.  Upgrades outnumber
+      ** copy-on-access relocations by orders of magnitude -- every mini-page
+      ** that outgrows its size class comes through here -- so it is where the
+      ** paper's shedding actually buys ring space back.
+      **
+      ** DEFAULT OFF, against the reference, pending the end-of-B campaign.
+      ** Tripwire A/B (30k rows, 256 KiB ring, promotion 100, NOT quotable):
+      ** shedding bought +13.6% cached_records and -11.5% B/record, and cost
+      ** NINE POINTS of hit rate (28.8% -> 19.7%).  The records it drops were
+      ** genuinely never read -- carrying the REF bit across the copy was built
+      ** and measured and changed the numbers not at all -- they were simply
+      ** read LATER, after the upgrade that shed them.  So "not read since it
+      ** entered this page" is a poor coldness proxy whenever pages are copied
+      ** often relative to the reuse distance, which is our situation and may
+      ** not be the reference's.
+      **
+      ** A nine-point move is over the "stop" line for the tripwire tier, so
+      ** this does not ship on by default on faith.  Build with
+      ** -DSQLITE_BF_UPGRADE_SHED to enable it; the campaign decides. */
       rc = sqlite3BfMiniPageCopy((BfMiniPage*)pNew, newSize, pMini,
+#if defined(SQLITE_BF_UPGRADE_SHED)
+                                 BF_COPY_REFERENCED);
+#else
                                  BF_COPY_ALL);
+#endif
+      if( rc==BF_OK ){
+        int nShed = sqlite3BfMiniPageCount(pMini)
+                      - sqlite3BfMiniPageCount((BfMiniPage*)pNew);
+        if( nShed>0 ) pCache->nUpgradeShed += (u64)nShed;
+      }
       if( rc != BF_OK ){
         sqlite3BfCircularBufferDealloc(&pCache->cb, pNew);
         if( rc == SQLITE_NOMEM ) return SQLITE_NOMEM;
