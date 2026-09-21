@@ -1188,10 +1188,23 @@ static int bfCacheMergeInternal(BfCache *pCache, u32 pgno, Pager *pPager){
     }
   }
 
-  /* Consolidate the mini-page to remove unreferenced records */
-  rc = sqlite3BfMiniPageConsolidate(pMini);
-  if( rc != BF_OK ){
-    return rc;
+  /* Shed this mini-page's cold cache records.  Instrumented because this call
+  ** was DEAD for the project's whole life and nothing could have shown it:
+  ** insert set REF=1 on every record, so Consolidate's keep-test passed for all
+  ** of them and it returned at its first branch, every time.  B2 gave the REF
+  ** bit its real meaning, which made this live -- a behaviour change at flush
+  ** time that arrived as a side effect rather than as a decision.  These two
+  ** counters are what let the end-of-B campaign see it at all. */
+  {
+    int nBefore = sqlite3BfMiniPageCount(pMini);
+    rc = sqlite3BfMiniPageConsolidate(pMini);
+    if( rc != BF_OK ){
+      return rc;
+    }
+    if( sqlite3BfMiniPageCount(pMini) < nBefore ){
+      pCache->nConsolidations++;
+      pCache->nConsolidateShed += (u64)(nBefore - sqlite3BfMiniPageCount(pMini));
+    }
   }
 
   /* All records processed successfully - update mini-page state */

@@ -514,6 +514,8 @@ struct BfCache {
                             ** record (full at max size class / no usable leaf);
                             ** the rest were excluded by the buffering gate in
                             ** sqlite3BtreeInsert before BF was even asked */
+  u64 nConsolidations;      /* Flushes that shed at least one cold record */
+  u64 nConsolidateShed;     /* Cold cache records those flushes dropped */
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */

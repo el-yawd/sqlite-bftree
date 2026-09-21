@@ -792,6 +792,15 @@ void sqlite3BfBtreeCopyOnAccessStat(Btree *p, u64 *pnMoved, u64 *pnShed){
   if( pnShed )  *pnShed  = pBf ? pBf->nCopyOnAccessShed : 0;
 }
 
+/* Flush-time cold-record shedding (PRAGMA bf_cache_stats).  Was invisible, and
+** was dead; see the note at the Consolidate call site. */
+void sqlite3BfBtreeConsolidateStat(Btree *p, u64 *pnRuns, u64 *pnShed){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pnRuns ) *pnRuns = pBf ? pBf->nConsolidations : 0;
+  if( pnShed ) *pnShed = pBf ? pBf->nConsolidateShed : 0;
+}
+
 void sqlite3BfBtreeClearCache(Btree *p){
   BfCache *pBf;
   if( !p || !p->pBt ) return;
