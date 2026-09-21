@@ -208,14 +208,29 @@ static int bfFreeListAdd(BfFreeList *pFl, void *ptr, u32 size){
   int i;
   void **ppNext;
 
-  /* Smallest class that fits (aSizeClass ascends). */
-  for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
-    if( size <= pFl->aSizeClass[i] ){
+  /* File it under the LARGEST class that fits INSIDE the block (aSizeClass
+  ** ascends, so scan down).  This is the reference's direction --
+  ** try_add -> size_class_smaller_than, "first class <= size" over its
+  ** descending copy (freelist.rs:112, :152).
+  **
+  ** The direction is a safety property, not a preference.  Under this rule a
+  ** block filed under class C is guaranteed to be at least C bytes, so
+  ** bfFreeListRemove handing it to a request of <= C bytes always fits.  The
+  ** rule this replaces took the smallest class >= size, which files a block
+  ** under a class LARGER than itself and would hand a short block to a request
+  ** that overflows it.
+  **
+  ** No behaviour changes today: every sqlite3BfCircularBufferAlloc call site
+  ** passes an exact class size (aSizeClass[0], or a mini-page nodeSize, which
+  ** is one), so the two rules pick the same class.  It is the invariant that
+  ** was one non-class-sized allocation away from a heap overflow. */
+  for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+    if( pFl->aSizeClass[i] <= size ){
       idx = i;
       break;
     }
   }
-  if( idx < 0 ) return 0;
+  if( idx < 0 ) return 0;   /* smaller than the smallest class: not reusable */
 
   sqlite3_mutex_enter(pFl->mutex);
 

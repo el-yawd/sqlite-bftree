@@ -263,11 +263,44 @@ copy pay for itself — it shrinks the page as it relocates.  Re-land both
 together behind `PRAGMA bf_copy_on_access_ratio`, and sweep 0→100 % to
 reproduce Figure 14.
 
-### B3. Full-page cache (`BF_LOC_FULL`)
-`upgrade_to_full_page` (`mini_page_op.rs:1407`) plus the paper's rule that a
-mini-page past 2 KB merges with its leaf and becomes a 4 KB mirror.  We have
-the enum value and one dead reference (`bf_mapping.c:418`); nothing creates one.
-This attacks *admission*, which is what caps the hit rate.
+### B3. Full-page cache (`BF_LOC_FULL`) — **description corrected 2026-09-21**
+
+This item previously read: "`upgrade_to_full_page` (`mini_page_op.rs:1407`) plus
+the paper's rule that a mini-page past 2 KB merges with its leaf and becomes a
+4 KB mirror."  Audited against `../bf-tree`; **three things in that sentence are
+wrong**, and they change the design.
+
+1. **There is no 2 KB rule.**  `DEFAULT_MAX_MINI_PAGE_SIZE = 2048` exists
+   (`config.rs:24`) but is commented **`// Deprecated`**.  The bound actually
+   used is derived: `leaf_page_size - max_record_size_with_meta`, cache-line
+   aligned down (`tree.rs:194-210`).
+2. **On the read path it is an ALTERNATIVE to record caching, not an addition.**
+   `tree.rs:1419` -- after the promotion dice pass, `if
+   config.read_record_cache` insert `OpType::Cache` (record promotion, what we
+   have), **`else` `upgrade_to_full_page`**.  One or the other, chosen by
+   config, per read miss.  So "this attacks admission [on top of what we have]"
+   was wrong: in the reference, turning it on turns record promotion OFF.
+3. **On the write path it is a consequence of merging, not of a size
+   threshold.**  When a mini-page cannot grow further the page is merged into
+   its base and deallocated; *then*, only if `write_load_full_page` (default
+   true, `config.rs:155`) and the base page is non-empty, a full page is
+   created (`mini_page_op.rs:938-956`).
+
+Also worth carrying into the design: the reference calls a full page a **gap
+cache, not a record cache** -- "it caches the entire gap" (`mini_page_op.rs:936`).
+
+So B3 is really two independent switches, and they should be two items:
+* **B3a (write path):** `write_load_full_page` -- after a mini-page merges to
+  base because it outgrew the ladder, mirror the leaf.  Additive; no
+  interaction with record promotion.
+* **B3b (read path):** `read_record_cache = false` -- full-page promotion
+  INSTEAD of record promotion.  This is a mode, and the campaign should treat
+  it as a third arm, not as a flag stacked on the others.
+
+**Interaction with A2, unchanged and still the reason this comes after it:**
+under scrambled zipf a full-page promotion admits ~34 records to serve 1 and is
+ring waste; under the paper's contiguous zipf it is a large win.  Measure it
+where it is supposed to work, and report both.
 
 **Interaction with A2, and the reason this comes after it:** under scrambled
 zipf a full-page promotion admits ~34 records to serve 1 and is ring waste;
@@ -278,9 +311,10 @@ supposed to work, and report both.
 `scan_promotion_rate` distinct from `read_promotion_rate` (`config.rs:38`).
 One knob for both means scans either thrash the ring or point reads under-admit.
 
-### B5. Eviction batching
-Sweep toward `TARGET_EVICT_SIZE = 1024` B with a retry cap (`tree.rs:1012`),
-replacing one block per call.  Only matters under pressure — but `saturated`
+### B5. Eviction batching  *(citation verified 2026-09-21)*
+Sweep toward `TARGET_EVICT_SIZE = 1024` B with a retry cap of 10
+(`tree.rs:1012-1018`; `evicted` accumulates BYTES, not blocks), replacing one
+block per call.  Only matters under pressure — but `saturated`
 and `BF_CACHE_SIZE=262144` now produce real eviction, so it is finally testable.
 
 ---
@@ -362,6 +396,51 @@ Named in advance so the result is not argued backwards.
 3. **Does not reproduce at parity of configuration.**  Only then is "structural
    difference from SQLite's B-tree" an honest conclusion, and it needs a
    code-level diff against `../bf-tree` behind it.
+
+---
+
+## Reference-claim audit (2026-09-21)
+
+Every `*.rs:NNN` citation in this plan, in `CLAUDE.md` and in `src/` was checked
+against `../bf-tree`, on the rule that *a performance change must be justified
+by the reference, so the comparison stays clean*.  Result: **17 of 20 citations
+correct, 3 claims wrong.**  The wrong ones were all in prose that was doing
+argumentative work, which is the dangerous kind.
+
+| claim | verdict |
+|---|---|
+| `tree.rs:222-250` size-class derivation `2^k*(base+meta)+header`, cache-line aligned | **correct** (also de-duplicates equal classes; our port should too) |
+| `tree.rs:1012` `TARGET_EVICT_SIZE = 1024` + retry cap | **correct** (cap is 10; counts BYTES) |
+| `leaf_node.rs:1528` `discard_cold_cache && op.is_cache() && !is_referenced()` | **correct** |
+| `leaf_node.rs:1658` REF set on read, before the absent test | **correct** |
+| `mini_page_op.rs:744` upgrade copies with `discard_cold_cache = true` | **correct** |
+| `mini_page_op.rs:151` / `storage.rs:332` copy-on-access to tail | **correct** |
+| `circular_buffer/mod.rs:429` threshold `capacity * (1 - ratio)` | **correct** |
+| `config.rs:38` `scan_promotion_rate` distinct from read | **correct** |
+| `config.rs:47` `cb_copy_on_access_ratio` | **correct** |
+| `OpType::is_cache()` = Cache \| Phantom | **correct** |
+| *"64 is the reference's `cb_min_record_size` default"* | **WRONG** -- it is **4** (`config.rs:27`), never overridden in `benchmark/` or `dev/` |
+| *"its benchmark sets `min_record` per workload"* | **WRONG** -- nothing sets it |
+| *"a mini-page past 2 KB merges with its leaf"* (B3) | **WRONG** -- 2048 is marked `// Deprecated`; the bound is derived, and the trigger is different (see B3) |
+
+Two structural differences found that were not claims at all, and matter more
+than the citations:
+
+* **Free-list class order.** The reference keeps the tree's ladder ASCENDING
+  and the free list's copy DESCENDING on purpose (`freelist.rs:106`
+  `size_classes.reverse()`), with an explicit index mapping (`:125`).  B1
+  unified ours to one ascending array -- fine, but our `bfFreeListAdd` then
+  filed a block under the smallest class **>=** its size, where the reference
+  files under the largest class **<=** its size (`:112`, `:152`).  Ours is the
+  unsafe direction: a block filed under a class larger than itself can be
+  handed to a request that overflows it.  Harmless today only because every
+  `sqlite3BfCircularBufferAlloc` call site passes an exact class size.
+  **Fixed** to match the reference.
+* **Full-page cache is a MODE on the read path**, not an addition -- see B3.
+
+Method note for the next audit: check the CALL GRAPH, not just that the cited
+line says what it is said to say.  `Consolidate` was cited correctly and was
+still unreachable.
 
 ---
 
