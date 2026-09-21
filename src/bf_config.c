@@ -44,7 +44,7 @@ static BfConfig bfConfig = {
   BF_DEFAULT_PROMOTION_RATE,  /* see bf_cache.h for why 30 */
   BF_DEFAULT_COPY_ON_ACCESS,  /* 10% copy-on-access region */
   0,                          /* Group commit off: one flush per commit */
-  BF_DEFAULT_MIN_RECORD       /* reference cb_min_record_size default */
+  BF_DEFAULT_MIN_RECORD       /* ours, measured; the reference's default is 4 */
 };
 
 /*

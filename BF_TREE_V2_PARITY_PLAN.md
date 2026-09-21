@@ -195,7 +195,20 @@ them would have filed a block under one class and handed it back as another.
 
 **The base is `PRAGMA bf_min_record`** (the reference's `cb_min_record_size`),
 default 64.  It has to be configuration, and the reason is measured rather than
-argued.  At a fixed base of 64, 4M rows under a 16 MiB ring:
+argued.
+
+**Correction, 2026-09-21 — the provenance claim in this section was wrong.**
+It read "the reference has it as `cb_min_record_size` and its benchmark sets it
+per workload".  It does not: `config.rs:27` sets
+`DEFAULT_MIN_RECORD_SIZE = 4`, and **nothing in `benchmark/` or `dev/`
+overrides it**, so the reference runs the default 4 everywhere, including the
+configs that produced the paper's numbers.  Our 64 is OUR tuned value, arrived
+at by the measurements below; the reference's ladder is far finer-grained and
+starts far smaller.  The measurements stand -- only the appeal to the
+reference's authority was false, and it was doing real work in the argument,
+since "the reference tunes this per workload" was the stated reason it had to
+be a PRAGMA.  Whether base 4 beats base 64 for us is now an open question the
+end-of-B campaign should answer, not an assumption in either direction.  At a fixed base of 64, 4M rows under a 16 MiB ring:
 
 | value_len | recs/page | B/record | cached |
 |---|---|---|---|
@@ -317,7 +330,16 @@ nicety.
 ### C1. The rest
 
 * One full `paper`-config campaign at the end, plus the Figure 14 ratio sweep
-  and a promotion-rate sweep (both are named configs in `bench_bftree.toml`).
+  and a promotion-rate sweep.  The exact axes, read off
+  `benchmark/bench_bftree.toml` (the `copy_on_access_ratio` and
+  `promotion_rate` stanzas) so ours line up with theirs:
+  - `copy_on_access_ratio = [0.0, 0.05, 0.1, 0.15, 0.2, 0.4, 0.6, 0.8, 1.0]`
+  - `read_promotion_rate = [1, 5, 10, 20, 40, 60, 80, 100]`
+  - both sweeps run 100 % reads, Zipf 0.9, 100 M records, 1 GiB memory,
+    30 threads, `IoUringBlocking` -- so our single-threaded buffered-I/O
+    versions answer a strictly weaker question, and should say so.
+* Add `bf_min_record` to the campaign as an axis including the reference's
+  own default of 4 (see the B1 correction above).  Nobody has measured base 4.
 * Profile the read path **at the paper config**.  The current profile is of a
   workload where the cache rarely helps, so it profiles the wrong thing.
 * Check occupancy (`cached_records / live_mini_pages`) before optimising any

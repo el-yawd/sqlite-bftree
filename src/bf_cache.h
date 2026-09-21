@@ -80,7 +80,14 @@ typedef struct BfFreeList BfFreeList;
 ** configs/b1.json measured the consequence of getting it wrong -- a 200-byte
 ** value loses 18.6% of the records it could cache at N=64, while a 100-byte
 ** value gains 27.7%.  Set it to the workload's record size. */
-#define BF_DEFAULT_MIN_RECORD 64   /* reference cb_min_record_size default */
+/* Ladder base for the derived size classes (PRAGMA bf_min_record).
+**
+** 64 is OURS, chosen by measurement in B1 -- it is NOT the reference's default,
+** which an earlier version of this comment claimed.  `../bf-tree`
+** config.rs:27 has DEFAULT_MIN_RECORD_SIZE = 4, and nothing in its benchmark/
+** or dev/ trees overrides it, so the reference runs at 4.  Its ladder is
+** therefore far finer-grained and starts far smaller than ours. */
+#define BF_DEFAULT_MIN_RECORD 64
 #define BF_CACHE_LINE         64
 
 /*
