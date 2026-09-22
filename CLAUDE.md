@@ -26,7 +26,7 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
 
 ## Locked design decisions
 - **One** record-granular **physiological WAL** (extend SQLite's WAL frame format): BF
-  rowid-table leaf mutations log as `[pgno, op, key, val]`; everything else stays page-image
+  rowid-table leaf mutations log as `[leafPgno, rootPgno, op, key, val]`; everything else stays page-image
   frames. No sidecar / two-log design.
 - **Configurable durability**: group-commit (~1 ms, paper-faithful) *and* strict per-commit
   fsync via `PRAGMA synchronous`; measure both.  **Not yet what the code does** --

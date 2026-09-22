@@ -77,9 +77,9 @@ a comment array was repointed.  **No benchmark configuration changed** — in pa
 |---|---|
 | **0** — port the 3 durability-agnostic leaf modules | **DONE** — `bf_mini_page.c`, `bf_circular_buffer.c`, `bf_mapping.c`, `bf_cache.h`, whole-file guarded by `SQLITE_OMIT_BF_CACHE`, inlined into the amalgamation |
 | **1** — read cache + write-through | **DONE** (`8dba75c`) — lifecycle, config/pragmas, `pcache2` activation, btree read hooks, descent shortcut |
-| **2** — record-granular physiological WAL | **DONE** (`3bf3fb2`), **ON by default** (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`) — write-back insert and **delete**, commit-time record logging, recovery replay, checkpoint materialisation, forward and reverse merge scans, merged `Count`, transaction grouping, mini-page compaction.  **Existing-row UPDATE is NOT buffered** (§3.2, D3a).  Two contracts remain open: **D1** (recovery/checkpoint edge cases) and **D2** (what an acknowledged commit guarantees) |
+| **2** — record-granular physiological WAL | **DONE** (`3bf3fb2`), **ON by default** (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`) — write-back insert and **delete**, commit-time record logging, recovery replay, checkpoint materialisation, forward and reverse merge scans, merged `Count`, transaction grouping, mini-page compaction. WAL payload v2 persists both leaf and table-root pgno, fixing the 2026-09-22 recovery corruption. **Existing-row UPDATE is NOT buffered** (§3.2, D3a). Two contracts remain open: **D1** (remaining recovery/checkpoint edge cases) and **D2** (what an acknowledged commit guarantees) |
 | **3** — measurement campaign + reference parity | **IN PROGRESS** — this is where all remaining work in §5 lives |
-| **4** — the faithful file-incompatible branch | not started; §7.2 |
+| **4** — the faithful file-incompatible branch | not started; §7.3 |
 
 ### 2.3 The numbers that are currently defensible
 
@@ -292,9 +292,10 @@ Stops at:
 ### 3.2 Write / WAL path
 
 Physiological record batches inside SQLite's WAL stream · write-back rowid inserts and
-deletes · dirty/unlogged lists so commit does not walk the whole map · a recovery-time
-pgno→ops index · transaction grouping · checkpoint-time materialisation into page-image
-frames · record/page frame and cache counters.
+deletes · dirty/unlogged lists so commit does not walk the whole map · WAL payload v2 records
+both target leaf and owning table root · a recovery-time pgno→ops index retaining that root ·
+transaction grouping · checkpoint-time materialisation into page-image frames · record/page
+frame and cache counters.
 
 Stops at:
 
@@ -392,7 +393,8 @@ Checkpointing is async WAL replay; recovery is rebuild-then-replay.
 ### 4.2 Locked decisions
 
 * **One** record-granular **physiological WAL**, extending SQLite's own WAL with a record
-  frame kind.  BF rowid-table leaf mutations log as `[pgno, op, key, val]`; everything else
+  frame kind. BF rowid-table leaf mutations log as `[leafPgno, rootPgno, op, key, val]`;
+  everything else
   (schema, secondary indexes, overflow, freelist, splits) stays page-image frames.  One log,
   one recovery walk.  No sidecar, no cross-log atomicity.
 * **Configurable durability**: group commit *and* strict per-commit fsync via
@@ -413,7 +415,8 @@ the durability mode.
 
 **WAL frame format.** Frames stay page-size (preserving `walFrameOffset` arithmetic and
 checksums).  A frame *kind* flag marks a **record-batch frame** packing
-`[pgno u32][op u8][keyLen varint][valLen varint][key][val]…` up to page size.  Commit frames
+`[leafPgno u32][rootPgno u32][op u8][keyLen varint][valLen varint][key][val]…`
+up to page size.  Commit frames
 still carry `nTruncate`.  Keys use the canonical 8-byte big-endian `bfEncodeRowid`.
 
 **Read path / wal-index.** A reader reconstructs page P as: latest page image of P (file or
@@ -512,10 +515,11 @@ Three ordering rules override personal preference:
 **Current ranking, after the M1 measurement (2026-09-21).**  The items with measured headroom
 are the write path and the unswept retention knobs, not the eviction machinery:
 
-0. **D1's post-recovery tree corruption** — found 2026-09-21, ours, reproducible in one
-   command.  Ahead of everything: a fork whose crash recovery produces a malformed B-tree
-   cannot make a durability claim at all.
-1. **D1 / D2** — the two open durability contracts.  Nothing downstream is quotable until an
+0. **D1's post-recovery tree corruption — FIXED 2026-09-22.** WAL payload v1 omitted the
+   table root, so recovery treated a leaf as a root; the first replay split nested a new tree
+   below the real one. Payload v2 persists and restores `rootPgno`; `recover_repro.sh` is clean
+   at 250 and 2000 rows in all three checkpoint orders.
+1. **D1 / D2** — the remaining durability contracts. Nothing downstream is quotable until an
    acknowledged commit means something definite.
 2. **H1b** — copy-on-access has been landed and unmeasured since `c99c040`, and §2.4 names
    retention as one of the two constraints on reads.  It is a harness change, not an engine
@@ -560,7 +564,7 @@ nothing about them.
 > message proposing exactly that, which is an authorisation but not an explicit one.  Both
 > are plain reverts if the owner disagrees.
 
-### D1 — recovery and checkpoint ownership — **A BUG IS OPEN HERE, 2026-09-21**
+### D1 — recovery and checkpoint ownership — **BLOCKING CORRUPTION FIXED 2026-09-22; EDGE COVERAGE OPEN**
 *From: handoff P1a.*  Source: `bf_cache.c` (`bfReplayOnePage`, `sqlite3BfCacheReplayWal`),
 `btree.c` (`bfCheckpointMaterialize`), `bf_btree.c` (`bfTagLeafRoot`), `wal.c`.
 Repro: **`sh bench/recover_repro.sh`** (its header carries the full evidence).
@@ -575,29 +579,25 @@ Repro: **`sh bench/recover_repro.sh`** (its header carries the full evidence).
 > * **stock SQLite under the identical crash pattern is clean** in all three scenarios;
 > * the same workload with a **clean close is clean**, in-session and on reopen, so the crash
 >   is necessary;
-> * it is present **immediately after recovery, before any checkpoint**, so the checkpoint is
->   not the cause.
+> * correction after tracing: explicit checkpoint materialisation performs the bad split;
+>   the earlier “before checkpoint” chronology mistook implicit materialisation for pure recovery.
 >
-> Root cause not yet identified.  `bfReplayOnePage` writes recovered records into the *cache*
-> and never touches base, so the suspect is the state of the base tree the crash left on disk:
-> BF's commit writes record frames and **no** base pages, and the base tree only advances
-> through incremental flushes, so a crash can catch it at a shape no committed state should
-> be able to observe.  That is a durability-model question, which is why it lands squarely on
-> **D2** as well.
+> Root cause: BF WAL v1 stored only the target leaf. Recovery-created mini-pages therefore
+> defaulted `rootPgno` to that leaf. For the 250-row reproducer checkpoint opened its replay
+> cursor with `pgnoRoot=5` although the table root was page 2. Row 246 split page 5 into a new
+> root over pages 6/7 while page 5 remained a child of page 2, exactly producing differing
+> child depths. The earlier conclusion that the leaf→root gap was unrelated was false because
+> it checked row survival, not structure.
 >
-> **This blocks every durability claim in the thesis.**  It is now the top item in the
-> project, ahead of the ranking below.
+> Fix: BF WAL payload v2 logs `[leafPgno, rootPgno, op, key, val]`; the recovery index retains
+> the root and `bfReplayOnePage` restores it onto the mini-page. The 250- and 2000-row crash
+> reproducers pass all three checkpoint orders.
 
-The gap this probe was originally written for — the documented leaf→root hole, where a
-replay-created mini-page has no `rootPgno` and `bfFlushAllCallback` skips `rootPgno<=1` — is
-**answered and is NOT the problem**: no rows are lost to it in any of the three checkpoint
-orders.
-
-- [ ] **root-cause the post-recovery tree corruption above** — the blocking item
+- [x] **root-cause and fix the post-recovery tree corruption above** — fixed 2026-09-22
 - [x] checkpoint immediately after recovery, without first descending the table —
       `recover_repro.sh` scenarios B and C; no rows lost
-- [x] prove recovered records with a missing `rootPgno` cannot be skipped or lost — no loss in
-      any order; the leaf→root gap is not the defect
+- [x] persist and restore `rootPgno` across recovery — WAL payload v2; the leaf→root gap was
+      the structural defect even though the old row-count-only control showed no loss
 - [ ] reproduce recovery into a mini-page that reaches `BF_FULL` (`bfReplayOnePage` tolerates
       it on the grounds that the record "stays durable in the WAL and is re-applied at the
       next checkpoint from the base path" — unverified, and worth checking now that the
@@ -841,8 +841,8 @@ demoted it; see below.*
 inside the allocator.  So it now records the leaf that aborted the sweep in
 `pgnoEvictStall`, and `sqlite3BtreeInsert` drains it — flushing the stalled leaf's table,
 re-seeking (mandatory: the flush replays through its own cursor and can rebalance) and
-retrying the buffered insert once.  Guarded on `rootPgno>1`, because a replay-created
-mini-page has no root (§3.2, D1).
+retrying the buffered insert once. Guarded on `rootPgno>1` as corruption containment; WAL
+payload v2 now restores the root during recovery (§3.2, D1).
 
 **Why it barely matters, measured.**  60 k inserts in one transaction, 256 KiB ring,
 100 B values:
@@ -1099,14 +1099,54 @@ bundle.
   record-granular physiological WAL is the deliberate replacement.
 * **Write concurrency.**  `BtShared` serialization stays.  Read concurrency is in scope (S1).
 * **Native mini/base leaf split.**  SQLite materialises fixed pages and runs its own
-  balancing; see §7.2.
+  balancing; see §7.3.
 * **Secondary-index record buffering** — *deferred, not rejected.*  v1 scope keeps indexes
   write-through so a committing transaction still emits one ordered WAL stream with one commit
   marker, which makes atomicity trivial.  It becomes a candidate phase of its own **if** the
   measurement campaign shows the primary-table win is large enough to be worth re-opening the
   atomicity question.
 
-### 7.2 The faithful branch (after this one is measured)
+### 7.2 Multi-writer, and what it would buy — **parked, revisit only after everything else**
+
+Group commit does not transfer to this fork, and the reason is SQLite's, not ours:
+`sqlite3WalBeginWriteTransaction` (`wal.c`) takes an exclusive `WAL_WRITE_LOCK` — *"Only one
+writer allowed at a time"*.  WAL mode gives reader/writer concurrency, not writer/writer.  The
+lock is held for the whole transaction, so a second writer cannot even produce its records
+until the first has committed; there is never more than one transaction at the commit-flush
+point, and a flush with nothing to amortise against is just an fsync.
+
+**With serialized writers, "batch across transactions" and "wait until durable" are mutually
+exclusive.**  That is why the current `bf_group_commit` defers rather than waits: deferral is
+the only batching available to a single-writer engine, and it buys throughput with durability.
+
+**The enabler exists**: SQLite's `begin-concurrent` branch (the basis of Expensify's Bedrock)
+lets write transactions run concurrently and validates page-level conflicts at COMMIT.  Bodies
+overlap, commits still serialize — which is exactly what group commit needs.
+
+**And there is a genuine contribution hiding in it.**  `BEGIN CONCURRENT` detects conflicts at
+PAGE granularity, so two transactions inserting different rowids into the same leaf conflict
+although they do not overlap logically.  BF does not modify the page; it appends to a mini-page
+delta, and two disjoint record sets on one leaf merge deterministically.  So:
+
+> Bf-Tree's mini-page representation lowers SQLite's optimistic-concurrency conflict detection
+> from page granularity to record granularity, converting a class of false conflicts into
+> successful concurrent commits.
+
+That is testable, novel, and a property of THIS fork rather than of the paper.
+
+**Cost, ranked.**  (1) fix the recovery defect first — concurrency over an unsound recovery
+path is not worth building; (2) merge `begin-concurrent` into a fork that has already rewritten
+`wal.c` and `pager.c`, the same files it touches; (3) **S1 becomes mandatory**, because the
+record cache is per pager and a record buffered in connection A is invisible to B; (4)
+record-level conflict detection, including replay ordering for interleaved transactions; (5)
+group commit itself, days once the rest exists.  Multi-month; out of scope for the TFG as
+implementation, strong as a Future Work chapter.
+
+**Before any of it, one cheap experiment bounds the whole thing**: group commit can only ever
+recover the fsync cost of a commit, so measure insert throughput at `synchronous=off` versus
+`full` at `bf_group_commit=0`.  That gap is the entire prize.
+
+### 7.3 The faithful branch (after this one is measured)
 
 This fork keeps SQLite's fixed-page `btree.c` and inserts Bf-Tree as a record cache *beside*
 it: pragmatic, incrementally correct, and oracle-friendly.  It therefore leaves performance on
@@ -1466,3 +1506,39 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   crash and after recovery; and check whether a crash with BF's insert buffering compiled out
   (`-DSQLITE_OMIT_BF_CACHE` is not enough — use the Phase-1 `bf_ro` shape) still corrupts,
   which separates the record-WAL from the flush path.
+
+### 2026-09-22 — Zed GPT-5.6 — root-cause and fix crash-recovery tree corruption
+
+- Starting revision/state: `wal-commit-frame-merge` at `b2292d3`; recovery trace preserved in
+  `26a72a1`; untracked `tfg/` left untouched.
+- Goal: reproduce, diagnose and fix the top-priority durability blocker in
+  `BF_TREE_V2_RECOVERY_BUG.md`.
+- Evidence gathered: reproduced all three failures at 250 and 2000 rows. The 250-row trace
+  showed one recovered mini-page with `owner=5 root=5`, 49 genuinely absent records, and the
+  transition from `rowid=245 leaf=5 depth=0 nPage=5` to
+  `rowid=246 leaf=7 depth=1 nPage=7`. The committed WAL had correct `nTruncate=5` and page
+  images 1–5. Thus duplicate replay and page-count mismatch were ruled out.
+- Root cause: WAL v1 omitted the table root. Recovery defaulted `rootPgno` to the leaf owner,
+  so checkpoint opened a write cursor on leaf 5 as a root. Its first split made page 5 an
+  interior root over pages 6/7 while page 5 remained a child of the real root page 2.
+- Changes made: bumped the BF payload to version 2; encoded/decoded/indexed `rootPgno`; logged
+  each mini-page's owning root; restored it during cache replay; updated codec tests and the
+  stale recovery-gap documentation.
+- Files changed: `src/bf_wal.{c,h}`, `src/bf_btree.c`, `src/bf_cache.c`, `src/wal.c`,
+  `src/pager.c`, `test/bf/wal_codec_test.c`, `BF_TREE_V2_RECOVERY_BUG.md`,
+  `BF_TREE_V2_{KNOWLEDGE,PLAN}.md`, `CLAUDE.md`, `.claude/agents/esbmc-verifier.md`. `pager.c`
+  only gained the missing forward declaration needed to compile the branch with `SQLITE_DEBUG`.
+- Validation commands and exact outcomes: standalone `wal_codec_test`: `ALL PASS`; `make
+  sqlite3`: success; `recover_repro.sh` at 250, 2000 and 4000 rows: all 3 scenarios pass at
+  every size; `SQLITE_DEBUG` recovery at 250 rows: all 3 pass with no assertion; default
+  `stress_buf.sh`: timed out at 10 minutes after at least 65 consecutive passes and no failure;
+  `BF_CACHE_SIZE=262144 sh stress_buf.sh 1`: `ALL CLEAN` 12/12; `stress_xtable.sh`: `ALL
+  CLEAN` 15/15.
+- Benchmark status: NOT RUN; correctness-only change, no throughput number quotable.
+- Decisions and rationale: persist the owning root in the physiological record instead of
+  inferring it from mutable leaf identity or waiting for a query descent. File compatibility is
+  intentionally not required, and a version bump makes old payloads fail closed.
+- Remaining blockers or uncertainty: D1 still owes BF_FULL, multiple-root and crash-during-
+  checkpoint coverage; D2's acknowledged-commit contract remains open.
+- Exact next action: run the differential, small-ring and crash gates, then continue D1 edge
+  coverage.

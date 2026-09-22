@@ -103,6 +103,10 @@ int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData);
 
 /* Write a frame or frames to the log. */
 int sqlite3WalFrames(Wal *pWal, int, PgHdr *, Pgno, int, int);
+#ifndef SQLITE_OMIT_BF_CACHE
+/* May a record-only commit carry its commit marker on the last record frame? */
+int sqlite3WalBfCommitOnRecordOk(Wal *pWal, int sync_flags);
+#endif
 
 #ifndef SQLITE_OMIT_BF_CACHE
 /* Stage a BF record-batch payload for the next commit; discard staged ones. */

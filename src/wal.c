@@ -485,7 +485,7 @@ struct WalCkptInfo {
 ** already rejects page number 0, and the largest real page number is
 ** 0xfffffffe, so 0xffffffff is a page number that can never occur naturally.
 ** We reuse it as a sentinel meaning "this frame's payload is a record batch
-** (a list of [pgno,op,key,val] leaf mutations) rather than a single page
+** (a list of [leafPgno,rootPgno,op,key,val] mutations) rather than a single page
 ** image".  The real target page numbers live inside the payload; the frame's
 ** checksum still covers the payload exactly as for a page-image frame, so the
 ** WAL checksum chain, salt matching, and the nTruncate commit marker are all
@@ -1075,8 +1075,9 @@ static int walDecodeFrame(
 #ifndef SQLITE_OMIT_BF_CACHE
 /*
 ** A record-batch frame (page number == WAL_BF_RECORD_PGNO) has just been
-** decoded during a WAL scan.  Feed its payload of [pgno,op,key,val] leaf
-** mutations into pWal->pBfWal, the in-memory pgno -> ordered-record-ops index
+** decoded during a WAL scan. Feed its payload of
+** [leafPgno,rootPgno,op,key,val] mutations into pWal->pBfWal, the in-memory
+** leaf-pgno -> ordered-record-ops index
 ** that the reader/checkpoint path replays onto base pages.  The index is
 ** allocated lazily on the first record frame seen.  aData points at the
 ** szPage-byte frame payload.  Returns SQLITE_OK, or SQLITE_NOMEM_BKPT /
@@ -4207,7 +4208,11 @@ static int walFrames(
   WalIndexHdr *pLive;             /* Pointer to shared header */
   int nBf = 0;                    /* BF record frames emitted before pList */
 
-  assert( pList );
+  /* pList may be NULL for a record-only commit: the transaction changed no
+  ** page, and the last BF record frame carries the nTruncate commit marker
+  ** itself instead of dragging page 1 into the WAL for it.  See
+  ** sqlite3WalBfCommitOnRecordOk(). */
+  assert( pList || pWal->nBfStage>0 );
   assert( pWal->writeLock );
 
   /* If this frame set completes a transaction, then nTruncate>0.  If
@@ -4265,16 +4270,26 @@ static int walFrames(
   nBf = pWal->nBfStage;
   {
     int iBf;
+    /* A record-only commit (no dirty page at all) lets the LAST record frame
+    ** carry nTruncate, so the whole commit costs ONE page-sized frame instead
+    ** of two.  This is the difference between the record WAL costing more than
+    ** stock and costing less: at one row per transaction, a record frame plus a
+    ** page-1 commit frame is ~8 KB against stock's ~4 KB, measured 1.95x worse.
+    ** Recovery already accepts it -- walIndexRecover's WAL_BF_RECORD_PGNO arm
+    ** says the frame "can carry the nTruncate commit marker, handled below". */
+    int bMergeCommit = (isCommit && pList==0);
+    assert( pList!=0 || (isCommit && nBf>0) );
     for(iBf=0; iBf<nBf && rc==SQLITE_OK; iBf++){
       u8 aRecHdr[WAL_FRAME_HDRSIZE]; /* Frame header for the record frame */
       u8 *aBody = pWal->apBfStage[iBf];
+      u32 nRecTrunc = (bMergeCommit && iBf==nBf-1) ? nTruncate : 0;
       iFrame++;
       assert( iOffset==walFrameOffset(iFrame, szPage) );
       /* This frame occupies a wal-index slot without appending to the index,
       ** so take over walIndexAppend()'s block-zeroing duty for it. */
       rc = walIndexZeroIfBlockStart(pWal, iFrame);
       if( rc==SQLITE_OK ){
-        walEncodeFrame(pWal, WAL_BF_RECORD_PGNO, 0, aBody, aRecHdr);
+        walEncodeFrame(pWal, WAL_BF_RECORD_PGNO, nRecTrunc, aBody, aRecHdr);
         rc = walWriteToLog(&w, aRecHdr, sizeof(aRecHdr), iOffset);
       }
       if( rc==SQLITE_OK ){
@@ -4283,6 +4298,7 @@ static int walFrames(
       if( rc==SQLITE_OK ){
         rc = walBfIngestRecordFrame(pWal, aBody);
         pWal->nBfRecFrame++;
+        if( nRecTrunc ) pWal->nBfCommit++;   /* this frame IS the commit */
       }
       iOffset += szFrame;
     }
@@ -4366,7 +4382,10 @@ static int walFrames(
   */
   if( isCommit && WAL_SYNC_FLAGS(sync_flags)!=0 ){
     int bSync = 1;
-    if( pWal->padToSectorBoundary ){
+    /* Padding repeats the final PAGE frame, so it cannot express a record-only
+    ** commit.  sqlite3WalBfCommitOnRecordOk() refuses the merged form whenever
+    ** padding could be required, so pList is non-NULL here whenever we pad. */
+    if( pWal->padToSectorBoundary && pList!=0 ){
       int sectorSize = sqlite3SectorSize(pWal->pWalFd);
       w.iSyncPoint = ((iOffset+sectorSize-1)/sectorSize)*sectorSize;
       bSync = (w.iSyncPoint==iOffset);
@@ -4436,6 +4455,33 @@ static int walFrames(
   WALTRACE(("WAL%p: frame write %s\n", pWal, rc ? "failed" : "ok"));
   return rc;
 }
+
+#ifndef SQLITE_OMIT_BF_CACHE
+/*
+** True if a commit whose only content is staged BF record frames may put the
+** nTruncate commit marker on its last record frame, instead of pulling page 1
+** into the WAL purely to carry it.
+**
+** Two conditions, both about the sector padding at the end of walFrames():
+** padding repeats the final PAGE frame to the next sector boundary, so it
+** cannot express a record-only commit.  Refuse the merged form whenever
+** padding could run -- that is, whenever the commit will sync AND this WAL
+** pads.  Everything else is free to merge.
+**
+** SQLITE_BF_NO_COMMIT_ON_RECORD compiles the whole optimisation out, so the
+** campaign can attribute it.
+*/
+int sqlite3WalBfCommitOnRecordOk(Wal *pWal, int sync_flags){
+#ifdef SQLITE_BF_NO_COMMIT_ON_RECORD
+  UNUSED_PARAMETER2(pWal, sync_flags);
+  return 0;
+#else
+  if( pWal==0 || pWal->nBfStage<=0 ) return 0;
+  if( WAL_SYNC_FLAGS(sync_flags)!=0 && pWal->padToSectorBoundary ) return 0;
+  return 1;
+#endif
+}
+#endif /* SQLITE_OMIT_BF_CACHE */
 
 /* 
 ** Write a set of frames to the log. The caller must hold the write-lock

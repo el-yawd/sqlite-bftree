@@ -23,7 +23,7 @@ SQLite's own code is exhaustively tested — **do not verify it**. Your job is t
 or fuzzer can miss (deep pointer/arithmetic invariants, all-paths bounds safety, idempotence).
 Concretely, the pure, pointer-bounded modules:
 
-- **WAL record-frame codec** (`src/bf_wal.c` — `[pgno][op][keyLen varint][valLen varint][key][val]`):
+- **WAL record-frame codec** (`src/bf_wal.c` — `[leafPgno][rootPgno][op][keyLen varint][valLen varint][key][val]`):
   `decode(encode(r)) == r`; decoding **truncated / oversized / adversarial** bytes never reads or
   writes out of bounds and always either rejects or yields an in-bounds record; varint decode is
   bounded.
