@@ -1,9 +1,8 @@
 # Crash recovery writes a structurally malformed B-tree
 
-**Status:** OPEN. Severity: **top**. Found 2026-09-21, written up 2026-09-22.
-**Repro:** `sh bench/recover_repro.sh` — fails all three scenarios.
-**Blocks:** every durability claim in the thesis. Also blocks §7.2 (multi-writer), because
-concurrency over an unsound recovery path is not worth building.
+**Status:** FIXED 2026-09-22; broader D1 crash/checkpoint coverage remains open.
+**Repro:** `sh bench/recover_repro.sh` — now passes all three scenarios at 250, 2000 and 4000 rows.
+**Impact before fix:** blocked every durability claim in the thesis and §7.2 multi-writer work.
 
 ---
 
@@ -15,6 +14,35 @@ B-tree that recovery leaves on disk is **structurally invalid**, and any subsequ
 that database **loses committed rows**. Stock SQLite under the identical crash pattern is
 clean, and the same workload closed cleanly is clean. So this is ours, and it is specific to
 recovering record frames.
+
+## Resolution (2026-09-22)
+
+The WAL stored only the target **leaf** pgno. During recovery,
+`sqlite3BfRecordWrite()` therefore created the mini-page with its default
+`rootPgno = ownerPgno`. For the 250-row reproducer both values became page 5, although the
+real table root was page 2. Checkpoint materialisation then called
+`sqlite3BtreeCursor(..., pgnoRoot=5, ...)`, treating leaf 5 as a standalone B-tree root.
+Recovered rows 202–245 fit on page 5; row 246 split it, so SQLite correctly transformed page
+5 into a root over new children 6 and 7. But page 5 was still a child of the real root page 2,
+leaving that root with children at different depths.
+
+The decisive trace was:
+
+```
+BFFLUSH owner=5 root=5 records=49 stale=0 nPage=5
+BFAPPLY owner=5 rowid=245 exists=0 leaf=5 depth=0 nPage=5 rc=0
+BFAPPLY owner=5 rowid=246 exists=0 leaf=7 depth=1 nPage=7 rc=0
+```
+
+This also disproved H1/H5 for that case: all 49 recovered rows were absent from base
+(`existing=0`). The WAL's committed `nTruncate=5` was correct, disproving H3's page-count
+form.
+
+The fix bumps the BF record-batch payload to version 2 and logs both
+`[leafPgno, rootPgno, op, key, value]`. The recovery index retains `rootPgno`, and cache replay
+restores it onto the mini-page before any checkpoint or mutation can materialise the records.
+This permanently closes the documented leaf→root reconstruction gap instead of relying on a
+query descent to retag recovered state.
 
 ```
 PRAGMA integrity_check;
@@ -65,7 +93,7 @@ Each line below is a measurement, not an inference.
 | 1 | After recovery, **all committed rows are readable**: 2000/2000, and `.dump` is stable across repeats. |
 | 2 | `integrity_check` reports `Tree 2 page 2 cell NN: Child page depth differs` — the root's children are at differing depths. |
 | 3 | The **base file alone** (crash image with `-wal` removed) is pristine: `integrity_check` = `ok`, and it does not even contain table `t` — `CREATE TABLE` was still in the WAL. **The crash left the database file undamaged.** |
-| 4 | The defect is present **immediately after recovery, before any checkpoint**. The checkpoint is not the cause. |
+| 4 | Correction: the earlier “before checkpoint” inference was wrong. A traced explicit checkpoint reproduces the bad split while materialising recovered records; reopening/query shutdown can also trigger that materialisation before the next observed check. |
 | 5 | It **persists** through materialisation + `wal_checkpoint(TRUNCATE)` + a fresh reopen. It is not a transient view. |
 | 6 | On that materialised file (empty WAL), **stock SQLite itself reports the corruption**. The damage is written to disk; it is not a BF read-path artifact. |
 | 7 | **Subsequent writes lose committed rows.** 2000 rows + 500 plain independent inserts → `count(*)` = **2344**, expected 2500 (156 lost). With `INSERT ... SELECT` from the same table → **1577** (923 lost). |
@@ -89,19 +117,18 @@ what settles it.
 
 Do not re-investigate these without new information.
 
-* **The documented leaf→root gap is NOT the defect.** `sqlite3BfCacheReplayWal`'s KNOWN GAP
-  comment says a replay-created mini-page has no `rootPgno` (the WAL stores only the leaf
-  pgno), and `bfFlushAllCallback` skips `rootPgno<=1`. `recover_repro.sh` tests all three
-  checkpoint orders — descend-first, checkpoint-first, checkpoint-in-a-separate-process — and
-  **no rows are lost to it in any of them**. This hazard has been carried as "future work"
-  since Phase 2 and it is not what is breaking.
+* **Correction: the documented leaf→root gap WAS the defect.** The original control checked
+  only whether rows were lost. Recovery did not leave `rootPgno<=1`; mini-page creation
+  defaulted it to the logged leaf pgno, so flush did not skip it. It opened a replay cursor on
+  that leaf as though it were the table root, and the first split nested a new B-tree below a
+  child of the real root. Exact row counts therefore coexisted with structural corruption.
 * **Not a self-referencing-statement bug.** A fresh database runs the same
   `INSERT ... SELECT ... FROM t` correctly: 2500 rows, `integrity_check` = `ok`.
 * **Not `bfApplyOneRecord` placing rows by a stale leaf.** It applies each record with
   `sqlite3BtreeInsert(pCur, &payload, 0, 0)`; with `seekResult == 0` SQLite positions the
   cursor by key itself, so the logged leaf pgno is not used for placement.
 * **Not a reader-side artifact.** Item 6: stock agrees the materialised file is corrupt.
-* **Not the checkpoint.** Item 4: it precedes any checkpoint.
+
 
 ---
 
@@ -133,7 +160,7 @@ that contains it, and replay re-applies it regardless.
 
 ### H2 — Records replayed against pages that are no longer leaves of that table
 
-The WAL stores only the leaf pgno. Between the record being logged and recovery finishing,
+WAL v1 stored only the leaf pgno. Between the record being logged and recovery finishing,
 later page images in the same WAL may have **freed or repurposed** that page — as an interior
 page, an overflow page, or a freelist page. Replay attaches records to the pgno anyway;
 `bfTagLeafRoot` later stamps it with whatever root a descent happens to pass through; and the
@@ -191,8 +218,8 @@ materialisation applies them again. Combined with the upgrade/compaction paths t
 | What | Where |
 |---|---|
 | replay entry point | `src/bf_cache.c` — `sqlite3BfCacheReplayWal`, `bfReplayOnePage` |
-| the documented leaf→root gap | `src/bf_cache.c`, comment above `sqlite3BfCacheReplayWal` |
-| record struct, **no frame number** | `src/bf_wal.h:54-62` (`BfWalRec`) |
+| root restoration during replay | `src/bf_cache.c` — `bfReplayOnePage` |
+| record struct: leaf + root, still **no frame number** | `src/bf_wal.h` (`BfWalRec`) |
 | record frames emitted before page images | `src/wal.c`, the `nBf` loop in `walFrames` |
 | recovery's frame walk | `src/wal.c`, `walIndexRecover` — `WAL_BF_RECORD_PGNO` arm |
 | applying one record to base | `src/bf_btree.c` — `bfApplyOneRecord` |
@@ -202,21 +229,16 @@ materialisation applies them again. Combined with the upgrade/compaction paths t
 
 ---
 
-## 7. Next steps, in order
+## 7. Remaining D1 work
 
-1. **Run the two counting experiments** (H1/H5 share one, H2 has its own). Both are
-   instrumentation only, no behaviour change, and between them they should eliminate at least
-   two hypotheses in a single run.
-2. **Re-measure the byte-28 observation on pristine copies** (H3). Cheap, and if it holds it is
-   probably the whole answer.
-3. Only then choose the fix. If H1/H2 survive, the fix is likely D1's *direct replay* option —
-   recovered records applied by key from the owning table root rather than rehydrated into
-   mini-pages keyed by a logged leaf pgno — which probably means **adding the root pgno to the
-   record format**. That is permitted: §4.2 states this fork has no on-disk compatibility
-   requirement. It would also close the leaf→root gap permanently, and it answers R10, which
-   was deferred pending exactly this evidence.
-4. Re-verify on `main`. This was found on `main`; the `wal-commit-frame-merge` branch touches
-   the commit path, so the reproducer must be re-run there before that branch merges.
+1. Add a crash oracle with multiple rowid-table roots, proving each recovered leaf retains its
+   own table root.
+2. Force recovery admission to reach `BF_FULL`; the current fallback claim remains unverified.
+3. Inject crashes during checkpoint/materialisation and compare against allowed committed
+   states.
+4. Resolve H2 for leaf pgno reuse across WAL history. WAL v2 now exposes root changes, but the
+   pgno→ops index still has no frame number and does not yet shadow stale operations against
+   later page images.
 
 ---
 

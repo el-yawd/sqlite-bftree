@@ -3178,6 +3178,10 @@ static int pagerRollbackWal(Pager *pPager){
 ** The list of pages passed into this routine is always sorted by page number.
 ** Hence, if page 1 appears anywhere on the list, it will be the first page.
 */
+#ifndef SQLITE_OMIT_BF_CACHE
+static int pagerBfHasStaged(Pager *pPager);
+#endif
+
 static int pagerWalFrames(
   Pager *pPager,                  /* Pager object */
   PgHdr *pList,                   /* List of frames to log */

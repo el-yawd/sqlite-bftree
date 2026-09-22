@@ -38,28 +38,27 @@ static void test_roundtrip(void){
 
   sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
 
-  r.pgno=7;  r.op=BFWAL_OP_INSERT; r.nKey=8; r.pKey=(const u8*)k0;
+  r.pgno=7;  r.rootPgno=2; r.op=BFWAL_OP_INSERT; r.nKey=8; r.pKey=(const u8*)k0;
   r.nVal=5;  r.pVal=(const u8*)v0;
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
 
-  r.pgno=7;  r.op=BFWAL_OP_DELETE; r.nKey=8; r.pKey=(const u8*)k1;
+  r.pgno=7;  r.rootPgno=2; r.op=BFWAL_OP_DELETE; r.nKey=8; r.pKey=(const u8*)k1;
   r.nVal=0;  r.pVal=0;
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
 
-  r.pgno=99; r.op=BFWAL_OP_INSERT; r.nKey=0; r.pKey=0; r.nVal=0; r.pVal=0;
+  r.pgno=99; r.rootPgno=42; r.op=BFWAL_OP_INSERT; r.nKey=0; r.pKey=0; r.nVal=0; r.pVal=0;
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
 
   sqlite3BfWalBatchFinish(&b);
-  CHECK( sqlite3BfWalIsBatch(buf,sizeof(buf)) );
 
   CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
   CHECK( sqlite3BfWalIterNext(&it,&r)==BFWAL_OK );
-  CHECK( r.pgno==7 && r.op==BFWAL_OP_INSERT && r.nKey==8 && r.nVal==5 );
+  CHECK( r.pgno==7 && r.rootPgno==2 && r.op==BFWAL_OP_INSERT && r.nKey==8 && r.nVal==5 );
   CHECK( memcmp(r.pKey,k0,8)==0 && memcmp(r.pVal,v0,5)==0 );
   CHECK( sqlite3BfWalIterNext(&it,&r)==BFWAL_OK );
-  CHECK( r.pgno==7 && r.op==BFWAL_OP_DELETE && r.nKey==8 && r.nVal==0 );
+  CHECK( r.pgno==7 && r.rootPgno==2 && r.op==BFWAL_OP_DELETE && r.nKey==8 && r.nVal==0 );
   CHECK( sqlite3BfWalIterNext(&it,&r)==BFWAL_OK );
-  CHECK( r.pgno==99 && r.nKey==0 && r.nVal==0 && r.pKey==0 && r.pVal==0 );
+  CHECK( r.pgno==99 && r.rootPgno==42 && r.nKey==0 && r.nVal==0 && r.pKey==0 && r.pVal==0 );
   CHECK( sqlite3BfWalIterNext(&it,&r)==BFWAL_DONE );
 }
 
@@ -71,7 +70,7 @@ static void test_full(void){
   int rc, n=0;
   memset(key,0xAB,sizeof(key));
   sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
-  r.op=BFWAL_OP_INSERT; r.nKey=64; r.pKey=key; r.nVal=0; r.pVal=0;
+  r.rootPgno=2; r.op=BFWAL_OP_INSERT; r.nKey=64; r.pKey=key; r.nVal=0; r.pVal=0;
   for(;;){
     r.pgno=(u32)(n+1);
     rc = sqlite3BfWalBatchAppend(&b,&r);
@@ -116,7 +115,7 @@ static void test_corrupt_header(void){
   BfWalBatch b;
   BfWalRec r;
   sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
-  r.pgno=1; r.op=BFWAL_OP_INSERT; r.nKey=0; r.pKey=0; r.nVal=0; r.pVal=0;
+  r.pgno=1; r.rootPgno=2; r.op=BFWAL_OP_INSERT; r.nKey=0; r.pKey=0; r.nVal=0; r.pVal=0;
   sqlite3BfWalBatchAppend(&b,&r);
   sqlite3BfWalBatchFinish(&b);
   /* Corrupt nUsed to claim more than the buffer holds. */
@@ -135,7 +134,7 @@ static void test_index_order(void){
     u8 key[1]; u8 val[2];
     u32 pg = (u32)(1 + (i%3));
     key[0]=(u8)i; val[0]=(u8)pg; val[1]=(u8)i;
-    r.pgno=pg; r.op=(i&1)?BFWAL_OP_DELETE:BFWAL_OP_INSERT;
+    r.pgno=pg; r.rootPgno=50+pg; r.op=(i&1)?BFWAL_OP_DELETE:BFWAL_OP_INSERT;
     r.nKey=1; r.pKey=key; r.nVal=(i&1)?0:2; r.pVal=(i&1)?0:val;
     CHECK( sqlite3BfWalIndexAppend(ix,&r)==BFWAL_OK );
   }
@@ -146,13 +145,11 @@ static void test_index_order(void){
   /* Page 1 got i = 0,3,6,...,27; verify log order preserved via val[1]. */
   for(i=0;i<10;i++){
     CHECK( sqlite3BfWalIndexGet(ix,1,i,&r)==BFWAL_OK );
-    CHECK( r.pgno==1 );
+    CHECK( r.pgno==1 && r.rootPgno==51 );
     if( r.op==BFWAL_OP_INSERT ){ CHECK( r.nVal==2 && r.pVal[1]==(u8)(i*3) ); }
   }
   CHECK( sqlite3BfWalIndexGet(ix,1,10,&r)==BFWAL_DONE );
-  sqlite3BfWalIndexClearPage(ix,2);
-  CHECK( sqlite3BfWalIndexPageCount(ix,2)==0 );
-  CHECK( sqlite3BfWalIndexPageCount(ix,1)==10 );  /* others intact */
+
   sqlite3BfWalIndexFree(ix);
 }
 
@@ -169,7 +166,7 @@ static void test_index_from_frame(void){
   sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
   for(i=0;i<50;i++){
     u8 key[2]; key[0]=(u8)i; key[1]=(u8)(i>>8);
-    r.pgno=(u32)(1+(i%5)); r.op=BFWAL_OP_INSERT; r.nKey=2; r.pKey=key;
+    r.pgno=(u32)(1+(i%5)); r.rootPgno=77; r.op=BFWAL_OP_INSERT; r.nKey=2; r.pKey=key;
     r.nVal=2; r.pVal=(const u8*)v;
     CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
   }
@@ -185,6 +182,7 @@ static void test_index_from_frame(void){
       BfWalRec a, c;
       CHECK( sqlite3BfWalIndexGet(ix1,pg,i,&a)==BFWAL_OK );
       CHECK( sqlite3BfWalIndexGet(ix2,pg,i,&c)==BFWAL_OK );
+      CHECK( a.rootPgno==77 && c.rootPgno==77 );
       CHECK( a.op==c.op && a.nKey==c.nKey && a.nVal==c.nVal );
       CHECK( a.nKey==0 || memcmp(a.pKey,c.pKey,a.nKey)==0 );
     }

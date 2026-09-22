@@ -102,7 +102,7 @@ non-transfer).
 See `BF_TREE_V2_PLAN.md` for the full target. Essentials:
 
 - **Single physiological WAL.** Extend SQLite's WAL with a **record-batch frame kind** (fixed
-  page-size frame whose payload packs `[pgno u32][op u8][keyLen varint][valLen varint][key][val]…`)
+  page-size frame whose payload packs `[leafPgno u32][rootPgno u32][op u8][keyLen varint][valLen varint][key][val]…`)
   alongside normal page-image frames. BF rowid-table leaf mutations → record frames; schema,
   secondary indexes, overflow, freelist, splits → page-image frames. **One log, one recovery
   walk, one commit marker per txn** (cross-log atomicity avoided by construction).

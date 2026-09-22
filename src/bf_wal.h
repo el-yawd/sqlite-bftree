@@ -16,7 +16,8 @@
 ** is a 4 KB page image, a *record-batch* frame's payload packs a list of
 ** rowid-table leaf mutations
 **
-**     [pgno u32][op u8][keyLen varint][valLen varint][key bytes][val bytes] ...
+**     [leafPgno u32][rootPgno u32][op u8][keyLen varint][valLen varint]
+**     [key bytes][val bytes] ...
 **
 ** so a commit persists small records instead of whole pages (§5.7 of the
 ** paper; see BF_TREE_V2_KNOWLEDGE.md §1.5).  This header declares the PURE
@@ -44,7 +45,7 @@
 /* Batch-payload header: magic(4) version(2) nRec(2) nUsed(4) = 12 bytes.  op
 ** values reuse the mini-page BFOP_* space; only the dirty ops are ever logged. */
 #define BFWAL_MAGIC     0x42465731u   /* "BFW1" */
-#define BFWAL_VERSION   1
+#define BFWAL_VERSION   2
 #define BFWAL_HDRSIZE   12
 #define BFWAL_OP_INSERT 0             /* == BFOP_INSERT */
 #define BFWAL_OP_DELETE 1             /* == BFOP_DELETE (valLen==0) */
@@ -53,7 +54,8 @@
 ** On decode, pKey/pVal point INTO the source buffer (no copy). */
 typedef struct BfWalRec BfWalRec;
 struct BfWalRec {
-  u32       pgno;    /* Target leaf page number (nonzero) */
+  u32       pgno;      /* Target leaf page number (nonzero) */
+  u32       rootPgno;  /* Owning rowid-table root page (greater than 1) */
   u8        op;      /* BFWAL_OP_INSERT or BFWAL_OP_DELETE */
   u32       nKey;    /* Key length in bytes */
   u32       nVal;    /* Value length in bytes (0 for DELETE) */

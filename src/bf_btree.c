@@ -545,7 +545,8 @@ static int bfLogAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
     if( !sqlite3BfMiniPageDirtyUnloggedAt(pMini, i, &pKey,&nKey,&pVal,&nVal,&op) ){
       continue;
     }
-    rec.pgno = pMini->ownerPgno;                     /* leaf pgno (Phase 1 key) */
+    rec.pgno = pMini->ownerPgno;                     /* cache/replay leaf key */
+    rec.rootPgno = pMini->rootPgno;                  /* owning table root */
     rec.op   = (op==BFOP_DELETE) ? BFWAL_OP_DELETE : BFWAL_OP_INSERT;
     rec.nKey = (u32)nKey;
     rec.pKey = pKey;
@@ -1407,12 +1408,10 @@ int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur){
     return 0;
   }
 
-  /* A mini-page built by WAL replay carries no rootPgno — the WAL stores only
-  ** the leaf pgno (see sqlite3BfCacheReplayWal's KNOWN GAP) — and the replay
-  ** cursor must be opened on the owning table root.  Keep refusing those; the
-  ** root is re-established by bfTagLeafRoot when a query next descends that
-  ** table.  Counted, because "M1 never fires" and "M1 fires and does nothing"
-  ** must be distinguishable in the campaign. */
+  /* WAL v2 restores rootPgno during recovery. Keep this guard as corruption
+  ** containment: a replay cursor must never open on an unknown root, since
+  ** treating the owner leaf as a root creates a nested malformed B-tree when
+  ** that leaf splits. Count refusals so an invalid recovery root is visible. */
   if( pMini->rootPgno<=1 ){
     pBf->nDirtyEvictRefused++;
     return 0;

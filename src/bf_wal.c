@@ -113,8 +113,9 @@ static int bfGetVarint(const u8 *p, int avail, u32 *pv){
 
 /* Encoded byte cost of a single record. */
 int sqlite3BfWalRecSize(const BfWalRec *pRec){
-  return 4                              /* pgno */
-       + 1                              /* op   */
+  return 4                              /* leaf pgno */
+       + 4                              /* root pgno */
+       + 1                              /* op        */
        + bfVarintLen(pRec->nKey)
        + bfVarintLen(pRec->nVal)
        + (int)pRec->nKey
@@ -144,6 +145,7 @@ int sqlite3BfWalBatchAppend(BfWalBatch *p, const BfWalRec *pRec){
 
   /* nRec is a u16 field; keyLen must fit the mini-page 14-bit key field. */
   if( p->nRec>=0xFFFF ) return BFWAL_FULL;
+  if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_FULL;
   if( pRec->nKey>0x3FFF ) return BFWAL_FULL;
 
   need = sqlite3BfWalRecSize(pRec);
@@ -151,6 +153,7 @@ int sqlite3BfWalBatchAppend(BfWalBatch *p, const BfWalRec *pRec){
 
   q = p->aBuf + p->nUsed;
   bfPut32(q, pRec->pgno);        q += 4;
+  bfPut32(q, pRec->rootPgno);    q += 4;
   *q++ = pRec->op;
   q += bfPutVarint(q, pRec->nKey);
   q += bfPutVarint(q, pRec->nVal);
@@ -210,19 +213,20 @@ int sqlite3BfWalIterInit(BfWalIter *it, const u8 *aBuf, int szBuf){
 int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   const u8 *p;
   int off, avail, n;
-  u32 pgno, nKey, nVal;
+  u32 pgno, rootPgno, nKey, nVal;
   u8 op;
 
   if( it->iRec >= it->nRec ) return BFWAL_DONE;
 
   off = it->off;
   avail = it->nUsed - off;
-  if( avail < 5 ) return BFWAL_CORRUPT;      /* pgno(4) + op(1) */
+  if( avail < 9 ) return BFWAL_CORRUPT; /* leaf(4) + root(4) + op(1) */
   p = it->aBuf + off;
 
-  pgno = bfGet32(p);  p += 4;  off += 4;
-  op = *p++;          off += 1;
-  if( pgno==0 ) return BFWAL_CORRUPT;
+  pgno = bfGet32(p);      p += 4;  off += 4;
+  rootPgno = bfGet32(p);  p += 4;  off += 4;
+  op = *p++;              off += 1;
+  if( pgno==0 || rootPgno<=1 ) return BFWAL_CORRUPT;
   if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE ) return BFWAL_CORRUPT;
 
   n = bfGetVarint(p, it->nUsed - off, &nKey);
@@ -239,6 +243,7 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   if( nVal > (u32)(it->nUsed - off) ) return BFWAL_CORRUPT;
 
   pRec->pgno = pgno;
+  pRec->rootPgno = rootPgno;
   pRec->op   = op;
   pRec->nKey = nKey;
   pRec->nVal = nVal;
@@ -260,6 +265,7 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
 ****************************************************************************/
 typedef struct BfWalIdxOp BfWalIdxOp;
 struct BfWalIdxOp {
+  u32  rootPgno;            /* owning rowid-table root */
   u8   op;                  /* BFWAL_OP_INSERT / BFWAL_OP_DELETE */
   u32  nKey;                /* key length */
   u32  nVal;                /* value length */
@@ -353,7 +359,7 @@ int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec){
   BfWalIdxOp *pOp;
   u8 *pBody;
 
-  if( pRec->pgno==0 ) return BFWAL_CORRUPT;
+  if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_CORRUPT;
 
   pP = bfIdxFind(p, pRec->pgno);
   if( pP==0 ){
@@ -387,6 +393,7 @@ int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec){
   if( pRec->nVal ) memcpy(pBody + pRec->nKey, pRec->pVal, pRec->nVal);
 
   pOp = &pP->aOp[pP->nOp++];
+  pOp->rootPgno = pRec->rootPgno;
   pOp->op = pRec->op;
   pOp->nKey = pRec->nKey;
   pOp->nVal = pRec->nVal;
@@ -405,6 +412,7 @@ int sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec){
   if( pP==0 || i<0 || i>=pP->nOp ) return BFWAL_DONE;
   pOp = &pP->aOp[i];
   pRec->pgno = pgno;
+  pRec->rootPgno = pOp->rootPgno;
   pRec->op   = pOp->op;
   pRec->nKey = pOp->nKey;
   pRec->nVal = pOp->nVal;

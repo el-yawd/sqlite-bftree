@@ -1040,12 +1040,12 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
 ** once — harmless because replay is idempotent and order-preserving — which is
 ** simpler than reconstructing the exactly-once marks across a crash.
 **
-** KNOWN GAP (leaf->root): a mini-page created here has no rootPgno (the WAL
-** stores only the leaf pgno).  Reads work (they key by leaf), but a checkpoint
-** that must flush a purely-recovered record to base needs the owning table root
-** — which is re-established when a query descends that table (bfTagLeafRoot in
-** the btree hooks).  Post-recovery checkpoint of never-touched pages is future
-** work (see [[phase2-progress]] task 6).
+** WAL format v2 persists both the target leaf and the owning table root.  The
+** leaf remains the cache-map key; rootPgno is restored onto the mini-page so a
+** checkpoint can open its replay cursor on the real table root even if no query
+** has descended the table since recovery.  Treating the leaf as the root is not
+** a harmless fallback: once replay splits that leaf, it creates a second tree
+** beneath a child of the real root and leaves the B-tree structurally corrupt.
 **
 ** Returns SQLITE_OK, or SQLITE_NOMEM if a write ran out of memory.
 */
@@ -1068,6 +1068,12 @@ static int bfReplayOnePage(void *pCtx, u32 pgno){
     op = (rec.op==BFWAL_OP_DELETE) ? BFOP_DELETE : BFOP_INSERT;
     wr = sqlite3BfRecordWrite(ctx->pCache, pgno, rec.pKey, (int)rec.nKey,
                               rec.pVal, (int)rec.nVal, op);
+    if( wr==BF_OK ){
+      BfMapEntry *pEntry = sqlite3BfMapLookup(ctx->pCache, pgno);
+      if( pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage ){
+        ((BfMiniPage*)pEntry->pPage)->rootPgno = rec.rootPgno;
+      }
+    }
     if( wr==SQLITE_NOMEM ){
       ctx->rc = SQLITE_NOMEM;
       return BFWAL_NOMEM;   /* stop the walk */

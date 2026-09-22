@@ -485,7 +485,7 @@ struct WalCkptInfo {
 ** already rejects page number 0, and the largest real page number is
 ** 0xfffffffe, so 0xffffffff is a page number that can never occur naturally.
 ** We reuse it as a sentinel meaning "this frame's payload is a record batch
-** (a list of [pgno,op,key,val] leaf mutations) rather than a single page
+** (a list of [leafPgno,rootPgno,op,key,val] mutations) rather than a single page
 ** image".  The real target page numbers live inside the payload; the frame's
 ** checksum still covers the payload exactly as for a page-image frame, so the
 ** WAL checksum chain, salt matching, and the nTruncate commit marker are all
@@ -1075,8 +1075,9 @@ static int walDecodeFrame(
 #ifndef SQLITE_OMIT_BF_CACHE
 /*
 ** A record-batch frame (page number == WAL_BF_RECORD_PGNO) has just been
-** decoded during a WAL scan.  Feed its payload of [pgno,op,key,val] leaf
-** mutations into pWal->pBfWal, the in-memory pgno -> ordered-record-ops index
+** decoded during a WAL scan. Feed its payload of
+** [leafPgno,rootPgno,op,key,val] mutations into pWal->pBfWal, the in-memory
+** leaf-pgno -> ordered-record-ops index
 ** that the reader/checkpoint path replays onto base pages.  The index is
 ** allocated lazily on the first record frame seen.  aData points at the
 ** szPage-byte frame payload.  Returns SQLITE_OK, or SQLITE_NOMEM_BKPT /
