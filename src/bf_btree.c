@@ -155,6 +155,9 @@ struct BfApplyRecCtx {
   BtCursor *pCur;    /* write cursor positioned on the target table */
   int nApplied;      /* records successfully written */
   int nErrors;       /* records that failed (non-fatal) */
+#ifdef SQLITE_BF_RECOVERY_TRACE
+  Pgno ownerPgno;    /* logged leaf identity being diagnosed */
+#endif
 };
 
 /*
@@ -176,7 +179,23 @@ static int bfApplyOneRecord(void *pCtx, const u8 *pKey, int nKey,
     BtreePayload payload;
     i64 rowid = 0;
     int ki;
+#ifdef SQLITE_BF_RECOVERY_TRACE
+    int probeLoc = 0;
+    Pgno probeLeaf = 0;
+#endif
     for(ki=0; ki<8; ki++) rowid = (rowid<<8) | pKey[ki];
+
+#ifdef SQLITE_BF_RECOVERY_TRACE
+    rc = sqlite3BtreeTableMoveto(pCur, rowid, 0, &probeLoc);
+    if( rc==SQLITE_OK ) probeLeaf = bfCursorLeafPgno(pCur);
+    fprintf(stderr, "BFAPPLY owner=%u rowid=%lld exists=%d leaf=%u depth=%d nPage=%u rc=%d\n",
+            ctx->ownerPgno, rowid, probeLoc==0, probeLeaf, pCur->iPage,
+            pCur->pBt->nPage, rc);
+    if( rc!=SQLITE_OK ){
+      ctx->nErrors++;
+      return 0;
+    }
+#endif
 
     memset(&payload, 0, sizeof(payload));
     payload.nKey  = rowid;
@@ -223,6 +242,11 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
   int rc;
 
   if( !pBf || !pBtree || pgnoRoot==0 || !pMini ) return SQLITE_OK;
+#ifdef SQLITE_BF_RECOVERY_TRACE
+  fprintf(stderr, "BFFLUSH owner=%u root=%u records=%d stale=%d nPage=%u\n",
+          pMini->ownerPgno, pgnoRoot, sqlite3BfMiniPageCount(pMini),
+          (pMini->flags & BF_MINI_F_STALE)!=0, pBtree->pBt->nPage);
+#endif
   if( !sqlite3BfMiniPageIsDirty(pMini) ) return SQLITE_OK;
   /* A flush WRITES base pages, so it needs a write transaction.  Under a read
   ** transaction the bypass cursor's inserts all fail, yet the records would be
@@ -265,6 +289,9 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
                           &tmpCur);
   if( rc==SQLITE_OK ){
     ctx.pCur = &tmpCur;
+#ifdef SQLITE_BF_RECOVERY_TRACE
+    ctx.ownerPgno = pMini->ownerPgno;
+#endif
     sqlite3BfMiniPageIterate(pMini, bfApplyOneRecord, &ctx);
     sqlite3BtreeCloseCursor(&tmpCur);
   }
