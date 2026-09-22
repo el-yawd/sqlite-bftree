@@ -946,6 +946,13 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
 
       sqlite3BfCircularBufferDealloc(&pCache->cb, pMini);
 
+      /* Restore locType as well as pPage.  The evict-and-retry above can have
+      ** unlinked this entry (locType = BF_LOC_NULL); re-pointing pPage alone
+      ** then leaves a live mini-page that every read skips at its locType
+      ** check.  pEvictProtect now stops that sweep, so this is belt and braces
+      ** — but the two must be written together or the invariant is only true by
+      ** accident. */
+      pEntry->locType = BF_LOC_MINI;
       pEntry->pPage = pNew;
       pMini = (BfMiniPage*)pNew;
       pCache->nUpgrades++;
@@ -990,6 +997,7 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
                                    BF_COPY_DIRTY);
         if( rc==BF_OK ){
           sqlite3BfCircularBufferDealloc(&pCache->cb, pMini);
+          pEntry->locType = BF_LOC_MINI;   /* see the upgrade path above */
           pEntry->pPage = pNew;
           pMini = (BfMiniPage*)pNew;
           pCache->nCompactions++;
@@ -1157,12 +1165,36 @@ static int evictCallback(void *pCtx, void *ptr){
   ** The entry may since have been re-pointed at a newer slab (size upgrade) or
   ** unlinked (ClearCache); only the entry that still points AT this exact slab
   ** owns it.  Any other outcome means the slab is orphaned. */
+  /* Case 0: the slab a caller is mid-copy of.  sqlite3BfRecordWrite's upgrade
+  ** and compaction paths set pEvictProtect before their evict-and-retry
+  ** precisely so this sweep cannot take the page they are copying FROM — and
+  ** until 2026-09-21 this function never looked at it, so the protection did
+  ** nothing.  The consequence was silent data loss, not just a wasted copy: the
+  ** sweep unlinks a CLEAN mini-page by setting locType = BF_LOC_NULL, the
+  ** caller then re-points pEntry->pPage at its new slab WITHOUT restoring
+  ** locType, and every later sqlite3BfRecordRead on that pgno returns
+  ** BF_NOT_FOUND at its locType check — the record is present and invisible.
+  **
+  ** Reproduced by a cross-table differential against stock (12 tables, 256 KiB
+  ** ring): exactly one INSERT lost, and sqlite3BfRecordRead returning
+  ** BF_NOT_FOUND one instruction after sqlite3BfRecordWrite returned BF_OK for
+  ** the same leaf and key.  It needs a CLEAN mini-page (a dirty one is refused
+  ** below) that is being written into while the ring is full, which is why the
+  ** single-table oracles never produced it. */
+  if( (void*)pMini == pCache->pEvictProtect ) return BF_ERROR;
+
   pEntry = sqlite3BfMapLookup(pCache, pMini->ownerPgno);
   if( pEntry == 0 || pEntry->locType != BF_LOC_MINI || pEntry->pPage != pMini ){
     return BF_OK;            /* Case 1: orphaned */
   }
   if( sqlite3BfMiniPageIsDirty(pMini) ){
-    return BF_ERROR;         /* Case 3: dirty — refuse, never drop data */
+    /* Case 3: dirty — refuse, never drop data.  Record WHICH leaf stalled the
+    ** sweep so the btree layer can flush it and let the next sweep past; see
+    ** sqlite3BfBtreeRelieveEvictStall().  Recording it here is free and cannot
+    ** affect this call's outcome — we still refuse. */
+    pCache->pgnoEvictStall = pMini->ownerPgno;
+    pCache->nEvictStallSeen++;
+    return BF_ERROR;
   }
 
   /* Case 2: clean — unlink, then allow the reclaim */
@@ -1174,6 +1206,14 @@ static int evictCallback(void *pCtx, void *ptr){
 
 int sqlite3BfCacheEvict(BfCache *pCache, int nTarget){
   int nEvicted = 0;
+
+  /* Scope pgnoEvictStall to THIS sweep (M1).  Leaving it set across calls made
+  ** it sticky, and the counters showed the cost: a stall recorded by one sweep
+  ** was consumed by a later, unrelated refusal -- a mini-page already at the
+  ** maximum size class, which no flush can help -- so 52 flushes bought 4
+  ** rescued inserts.  Cleared here, a non-zero stall afterwards means the sweep
+  ** that just ran was genuinely blocked by a dirty slab. */
+  pCache->pgnoEvictStall = 0;
 
   nEvicted = sqlite3BfCircularBufferEvictN(&pCache->cb, nTarget,
       evictCallback, pCache);
