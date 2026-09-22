@@ -792,6 +792,35 @@ void sqlite3BfBtreeCopyOnAccessStat(Btree *p, u64 *pnMoved, u64 *pnShed){
   if( pnShed )  *pnShed  = pBf ? pBf->nCopyOnAccessShed : 0;
 }
 
+/*
+** Count an insert that only succeeded because sqlite3BfBtreeRelieveEvictStall
+** freed the ring for it.  Separate from nDirtyEvictFlush: a flush that frees
+** space the retry then fails to use is a flush that bought nothing.
+*/
+void sqlite3BfBtreeNoteDirtyEvictRetry(BtCursor *pCur){
+  BfCache *pBf;
+  if( !pCur || !pCur->pBt ) return;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( pBf ) pBf->nDirtyEvictRetryOk++;
+}
+
+/*
+** Flush-capable dirty eviction counters (M1).  nFlush and nRefused together
+** answer the question the differential oracles structurally cannot: whether the
+** mechanism ever executes.  Both zero means it never fired -- at the default
+** ring size nothing evicts, so that is the expected reading outside the
+** small-ring oracle, and it is a finding rather than a pass.
+*/
+void sqlite3BfBtreeDirtyEvictStat(Btree *p, u64 *pnFlush, u64 *pnRetryOk,
+                                  u64 *pnRefused, u64 *pnSeen){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  if( pnFlush )   *pnFlush   = pBf ? pBf->nDirtyEvictFlush : 0;
+  if( pnRetryOk ) *pnRetryOk = pBf ? pBf->nDirtyEvictRetryOk : 0;
+  if( pnRefused ) *pnRefused = pBf ? pBf->nDirtyEvictRefused : 0;
+  if( pnSeen )    *pnSeen    = pBf ? pBf->nEvictStallSeen : 0;
+}
+
 /* Cold cache records shed by size upgrades -- the frequent copy, and the one
 ** that actually returns ring space.  Read it beside `upgrades`. */
 void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
@@ -1267,6 +1296,117 @@ int sqlite3BfBtreePrepareForScan(BtCursor *pCur){
   ** merge-iterate instead (Stage 2.2); range seeks, LAST and COUNT keep it.
   ** Safe with any cursor state — saveAllCursors is a no-op for CURSOR_INVALID. */
   return bfFlushTableDirty(pBf, pCur->pBtree, pCur->pgnoRoot)>0 ? 1 : 0;
+}
+
+/*
+** Flush-capable dirty eviction (M1).
+**
+** The ring's FIFO sweep refuses to reclaim a mini-page that still holds
+** unapplied BFOP_INSERT/BFOP_DELETE records (evictCallback, case 3) — it has no
+** Btree handle, no write transaction, and it runs INSIDE the allocator, so it
+** cannot flush there without re-entering the allocator.  The sweep therefore
+** aborts at the first dirty slab and the allocation fails; before this, the
+** caller simply fell back to a base-page write and the ring stayed stuck behind
+** that one leaf for the rest of the transaction.
+**
+** evictCallback records the offending leaf in pBf->pgnoEvictStall.  This is the
+** drain, and it is called from sqlite3BtreeInsert — which has a cursor, a Btree,
+** and a write transaction, and is outside any cache iteration.  Flushing a leaf
+** of a DIFFERENT table than the cursor's is fine and is exactly what commit
+** already does (bfFlushAllCallback walks every dirty leaf using each slab's own
+** rootPgno).
+**
+** Returns 1 if a mini-page was flushed, in which case the CALLER MUST RE-SEEK:
+** bfFlushOneMiniPage replays through its own cursor and can rebalance.  That is
+** the same contract sqlite3BfBtreeFlushTableForMutation already has.
+**
+** Note the cost: flushing converts buffered records into base-page writes, so
+** this spends WAL page frames to buy ring capacity.  It is close to neutral —
+** the fallback it replaces also wrote a base page, just for the current record
+** instead of the stalled leaf, and left every later insert paying too — but
+** `pg frames/commit` moves, so report it beside these counters.
+*/
+int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur){
+#if defined(SQLITE_BF_NO_DIRTY_EVICT)
+  UNUSED_PARAMETER(pCur);
+  return 0;
+#else
+  BfCache *pBf;
+  BfMapEntry *pEntry;
+  BfMiniPage *pMini;
+  u32 pgnoStall;
+
+  if( !pCur || !pCur->pBt || !pCur->pBtree ) return 0;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf || pBf->pgnoEvictStall==0 ) return 0;
+
+  /* Take and clear the stall up front: every path below must consume it, or a
+  ** leaf we cannot flush would be retried on every single insert. */
+  pgnoStall = pBf->pgnoEvictStall;
+  pBf->pgnoEvictStall = 0;
+
+  /* bfFlushOneMiniPage writes base pages, so it needs a write transaction, and
+  ** it must not run inside another flush replay or a merge scan. */
+  if( pCur->pBtree->inTrans!=TRANS_WRITE
+   || pBf->bBypassActive || pBf->bMergingActive ){
+    pBf->nDirtyEvictRefused++;
+    return 0;
+  }
+
+  pEntry = sqlite3BfMapLookup(pBf, pgnoStall);
+  if( pEntry==0 || pEntry->locType!=BF_LOC_MINI || pEntry->pPage==0 ){
+    return 0;                       /* already reclaimed or re-pointed */
+  }
+  pMini = (BfMiniPage*)pEntry->pPage;
+  if( !sqlite3BfMiniPageIsDirty(pMini) ) return 0;   /* flushed meanwhile */
+
+  /* The slab the caller is mid-copy of must never be flushed out from under it
+  ** (same hazard pEvictProtect exists for). */
+  if( (void*)pMini == pBf->pEvictProtect ) return 0;
+
+  /* Do not flush the leaf the cursor is about to buffer INTO: that writes its
+  ** records to base and then immediately dirties it again.  M1 exists to
+  ** unstick the ring when it is wedged behind SOME OTHER leaf.
+  **
+  ** This is an efficiency choice, NOT a correctness one.  It began as a
+  ** workaround: the same-leaf case lost an INSERT outright, with
+  ** sqlite3BfRecordWrite returning BF_OK and sqlite3BfRecordRead returning
+  ** BF_NOT_FOUND for the same key one instruction later.  The cause was a
+  ** PRE-EXISTING bug this path merely reached first — evictCallback ignored
+  ** pEvictProtect — and it is fixed at its root in bf_cache.c.  The workload
+  ** is byte-identical to stock with or without this guard now. */
+  if( pgnoStall==bfCursorLeafPgno(pCur) ){
+    pBf->nDirtyEvictRefused++;
+    return 0;
+  }
+
+  /* A mini-page built by WAL replay carries no rootPgno — the WAL stores only
+  ** the leaf pgno (see sqlite3BfCacheReplayWal's KNOWN GAP) — and the replay
+  ** cursor must be opened on the owning table root.  Keep refusing those; the
+  ** root is re-established by bfTagLeafRoot when a query next descends that
+  ** table.  Counted, because "M1 never fires" and "M1 fires and does nothing"
+  ** must be distinguishable in the campaign. */
+  if( pMini->rootPgno<=1 ){
+    pBf->nDirtyEvictRefused++;
+    return 0;
+  }
+
+  /* Flush the stalled leaf's whole TABLE, not just that one leaf.
+  **
+  ** Measured, 12 tables interleaved under a 256 KiB ring: flushing the single
+  ** leaf relieved 52 stalls but rescued only 4 inserts.  The reason is that the
+  ** ring head holds a RUN of dirty slabs from the other tables, so cleaning one
+  ** lets the sweep advance exactly one slab and stall on the next.  Flushing the
+  ** table clears the run, which is also what the fallback path already does for
+  ** the cursor's own table (sqlite3BfBtreeFlushTableForMutation) -- this is the
+  ** same move applied to the table that actually blocked the ring. */
+  if( bfFlushTableDirty(pBf, pCur->pBtree, (Pgno)pMini->rootPgno)<=0 ){
+    pBf->nDirtyEvictRefused++;      /* nothing applied; still stuck */
+    return 0;
+  }
+  pBf->nDirtyEvictFlush++;
+  return 1;
+#endif
 }
 
 #if defined(SQLITE_BF_INSERT_BUFFERING)

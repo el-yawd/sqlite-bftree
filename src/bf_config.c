@@ -324,6 +324,30 @@ void sqlite3PragmaBfCacheStats(
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
     }
 
+    {
+      u64 nDeFlush = 0, nDeRetry = 0, nDeRefused = 0, nDeSeen = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreeDirtyEvictStat(Btree*, u64*, u64*, u64*, u64*);
+        sqlite3BfBtreeDirtyEvictStat(pBt, &nDeFlush, &nDeRetry, &nDeRefused,
+                                     &nDeSeen);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "evict_stall_seen", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nDeSeen, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "dirty_evict_flush", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nDeFlush, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "dirty_evict_retry", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nDeRetry, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "dirty_evict_refused", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nDeRefused,P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+
     sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "upgrades", P4_STATIC);
     sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nUpgrade, P4_INT64);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);

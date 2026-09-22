@@ -158,6 +158,26 @@ are not measurements of the current tree.**
   connections allocate N independent rings.  See S1.
 * **Hit rate is admission, not eviction** (at default ring sizes) — the ring almost never
   evicts; hit rate is limited by promotion admission and grows with warmup.
+* **`evictCallback` ignored `pEvictProtect`** — fixed 2026-09-21.  The upgrade and compaction
+  paths in `sqlite3BfRecordWrite` set that field before their evict-and-retry so the sweep
+  cannot take the slab they are copying *from*; the sweep never looked at it, and only the
+  copy-on-access path (`bf_cache.c:739`) ever did.  The failure is silent data loss, not a
+  wasted copy: the sweep unlinks a CLEAN mini-page with `locType = BF_LOC_NULL`, the caller
+  re-points `pEntry->pPage` **without restoring `locType`**, and every later
+  `sqlite3BfRecordRead` on that pgno returns `BF_NOT_FOUND` at its `locType` check — the
+  record is present and invisible.  Observed directly: `sqlite3BfRecordWrite` returning
+  `BF_OK` and `sqlite3BfRecordRead` returning `BF_NOT_FOUND` for the same leaf and key one
+  instruction apart, and one lost `INSERT` in a cross-table dump diff against stock.
+  Fixed at the root (the sweep refuses a protected slab) plus both re-point sites now writing
+  `locType` and `pPage` together.
+
+  **Reachability is UNPROVEN, and an earlier claim here that it was reachable without M1 was
+  wrong.**  A binary with the fix reverted passes the original repro, the whole of
+  `stress_xtable.sh`, and a read-then-write workload built specifically to produce the state,
+  as long as M1's same-leaf guard is in place.  The only demonstrated trigger is flushing a
+  leaf and immediately buffering into it, which is M1's stall drain and nothing else in the
+  tree.  So the fix makes a declared invariant true and is cheap, but it is **defensive** —
+  treat it as closing a latent defect, not a live corruption.
 * **Mid-session `PRAGMA wal_checkpoint` corruption** — fixed 2026-09-15; BF record frames
   occupied a wal-index slot without `walIndexAppend`, so nothing zeroed the hash block after a
   log restart.  `gen_stress.py` now issues checkpoints.
@@ -475,29 +495,67 @@ Prefixes are stable: **V** validation gate, **D** durability/correctness, **M** 
 (reference parity), **H** harness/measurement, **S** structural project.  Each item names the
 merged documents it came from, so nothing is silently dropped.
 
-Two ordering rules override personal preference:
+Three ordering rules override personal preference:
 
 * **Correctness before capacity before speed.**  A mechanism measured on an ungated tree is
   measured on nothing.
+* **Rank by measured headroom, not by how large the gap looks in the parity matrix.**  M1 was
+  ranked the top gap on the strength of a code reading — `evictCallback` refuses dirty pages,
+  therefore the ring stalls.  It does not: the fallback path already flushes the table, and
+  M1 rescued 2 inserts in 58,244.  An item earns its rank from a counter, and the cheapest
+  way to get that counter is often to build the mechanism behind a switch and look.
 * **No feature is evaluated before the comparison is fair.**  The premise of the old Stage A
   stands: the budget arithmetic (A1, **done** — `runner.py:222-270`, `split_memory()` rounds the ring up
   and raises the total, verified) and the workload shape (H0) decide whether any M item has
   room to pay.
 
+**Current ranking, after the M1 measurement (2026-09-21).**  The items with measured headroom
+are the write path and the unswept retention knobs, not the eviction machinery:
+
+1. **D1 / D2** — the two open durability contracts.  Nothing downstream is quotable until an
+   acknowledged commit means something definite.
+2. **H1b** — copy-on-access has been landed and unmeasured since `c99c040`, and §2.4 names
+   retention as one of the two constraints on reads.  It is a harness change, not an engine
+   change, and it is the cheapest unknown left.
+3. **D3-core → D3a** — existing-row UPDATE is still page-image write-through.  This is the
+   oldest open item in the project and the one with an obvious mechanism behind it.
+4. **H0 / H2** — update and scan arms at the paper shape, and a warmup floor per arm.
+5. **M2** — full-page cache, the last absent mechanism with real upside, but it needs H0's
+   contiguous-zipf arm to be judged fairly.
+6. **D3b, D4, M3, M4** — narrower.
+7. **S1** — still a project, still last.
+
+**M1 is done and is NOT in this ranking** — see its entry below the active items.
+
 ---
 
-### V0 — gate the current working tree  *(blocks everything)*
-*From: handoff P0/B0.*  The dead-code sweep is unbuilt and ungated.
+### V0 — gate the current working tree — **DONE 2026-09-21, committed `f5f09dd`**
+*From: handoff P0/B0.*  All binaries were rebuilt first; the ones on disk predated the sweep,
+and stale binaries have produced false findings here before.  The sweep compiled with zero
+warnings in all three configurations, which is itself evidence about a −653-line deletion.
 
-- [ ] `cd build && make sqlite3`, rebuild `sqlite3_stock` and `sqlite3_buf`
-- [ ] `sh bench/stress.sh`
-- [ ] `sh bench/stress_buf.sh`
-- [ ] `BF_GROUP=8 sh bench/stress_buf.sh` and `BF_PROMOTION=100 sh bench/stress_buf.sh`
-- [ ] `BF_CACHE_SIZE=262144 sh bench/stress_buf.sh` (the only variant that actually evicts)
-- [ ] `bench/ring_repro.sh` under a `SQLITE_DEBUG` build
-- [ ] `configs/fixes_smoke.json` as a `NOT QUOTABLE` tripwire, after correctness is green
-- [ ] fix anything the sweep broke, then prepare the cleanup for commit; do not commit unless
-      the user explicitly asks.  Log the exact outcomes in §9
+| gate | outcome |
+|---|---|
+| `stress.sh` | ALL CLEAN 54/54 |
+| `stress_buf.sh` | ALL CLEAN 216/216 |
+| `BF_CACHE_SIZE=262144 stress_buf.sh` | ALL CLEAN 216/216 |
+| `bench/ring_repro.sh` | OK, ring cycled without crashing |
+| `BF_GROUP=8 stress_buf.sh` | 27/216, 0 failures — **STOPPED EARLY** at the owner's request |
+| `BF_PROMOTION=100 stress_buf.sh` | **NOT RUN**, same reason |
+
+The cycling-ring run is the one that carries weight: measured on the same shape it produced
+515,664 evictions and 827,552 upgrades, so the eviction, free-list and upgrade paths this
+diff touches actually executed.  A green suite at the default ring size would have proven
+nothing about them.
+
+- [ ] owed: full `BF_GROUP=8` and `BF_PROMOTION=100` runs
+- [ ] owed: `bench/ring_repro.sh` under a `SQLITE_DEBUG` build — it ran release-only
+
+> Process note, recorded because the rule was in this file at the time: the V0 item said
+> *"do not commit unless the user explicitly asks"*.  The sweep and the plan consolidation
+> were committed (`f5f09dd`, `bd338af`) on the strength of a "do it now" that answered a
+> message proposing exactly that, which is an authorisation but not an explicit one.  Both
+> are plain reverts if the owner disagrees.
 
 ### D1 — recovery and checkpoint ownership
 *From: handoff P1a.*  Source: `bf_cache.c` (`bfReplayOnePage`, `sqlite3BfCacheReplayWal`),
@@ -522,17 +580,6 @@ Two ordering rules override personal preference:
 - [ ] prefer (a) for thesis comparisons; (b) is only defensible if it is *named* as such
 - [ ] crash-boundary tests for every acknowledged commit
 - [ ] make `PRAGMA synchronous` × group mode an unambiguous matrix
-
-### M1 — flush-capable dirty eviction
-*From: handoff P2.*  Precedes M4: today a dirty head stops the sweep, so any batching result
-would measure the stall, not the batching.
-
-- [ ] evict from a btree-owned, re-entrancy-safe context that has table/root information
-- [ ] stage pending record batches before materialising the same records
-- [ ] merge dirty mini-page records into the base page; handle splits and restarts
-- [ ] unlink the mapping and reclaim the allocation only after a successful merge
-- [ ] counters + an ablation switch (§1 rule 5)
-- [ ] stress at a 256 KiB ring under `SQLITE_DEBUG`; crash tests at the merge boundary
 
 ### H0 — make the comparison the paper's comparison
 *From: parity plan Stage A (A1, A2, A4).*  **Mostly done already** — verified 2026-09-21, after
@@ -703,7 +750,8 @@ thrash the ring or point reads under-admit.
 - [ ] `PRAGMA bf_scan_promotion`
 
 ### M4 — eviction batching
-*From: parity plan B5, handoff P6.*  Blocked by M1.  Today: `sqlite3BfCacheEvict(pCache, 16)`
+*From: parity plan B5, handoff P6.*  **No longer blocked** — M1 landed, and the dirty head it
+was supposed to be blocked by turns out not to arise on the write path at all.  Today: `sqlite3BfCacheEvict(pCache, 16)`
 at three call sites — a fixed **16 entries**.  The reference accumulates toward
 `TARGET_EVICT_SIZE = 1024` **bytes** with a retry cap of 10 (`tree.rs:1012-1018`).
 
@@ -736,6 +784,74 @@ comparison is the foundation the harness rests on.
 - [ ] 1→30 reader scaling, one total memory budget
 
 Note: `BfCache.mutex` exists and is **never entered** (§3.3).  Treat it as absent.
+
+### M1 — flush-capable dirty eviction — **DONE 2026-09-21, and it barely matters**
+*From: handoff P2, where it was ranked the largest remaining parity gap.  The measurement
+demoted it; see below.*
+
+- [x] evict from a btree-owned, re-entrancy-safe context that has table/root information —
+      `sqlite3BfBtreeRelieveEvictStall()`, drained from `sqlite3BtreeInsert`
+- [x] stage pending record batches before materialising (inherited: `bfFlushOneMiniPage`
+      calls `sqlite3BfBtreeGroupStagePending` first)
+- [x] merge dirty records into the base page — via `bfFlushTableDirty` on the stalled leaf's
+      own root, so splits and restarts are handled by the path that already does this
+- [x] counters + `SQLITE_BF_NO_DIRTY_EVICT`
+- [x] 256 KiB-ring differential gate
+- [ ] crash tests at the merge boundary — **still open**, folded into D1
+
+**What it does.**  `evictCallback` cannot flush: no `Btree`, no write transaction, and it runs
+inside the allocator.  So it now records the leaf that aborted the sweep in
+`pgnoEvictStall`, and `sqlite3BtreeInsert` drains it — flushing the stalled leaf's table,
+re-seeking (mandatory: the flush replays through its own cursor and can rebalance) and
+retrying the buffered insert once.  Guarded on `rootPgno>1`, because a replay-created
+mini-page has no root (§3.2, D1).
+
+**Why it barely matters, measured.**  60 k inserts in one transaction, 256 KiB ring,
+100 B values:
+
+| | 1 table | 12 tables interleaved |
+|---|---|---|
+| evictions | 3,360 | 4,379 |
+| `evict_stall_seen` | **0** | 79 |
+| `dirty_evict_flush` | 0 | 25 |
+| `dirty_evict_retry` | 0 | **2** |
+| buffered inserts | 58,235 | 58,244 |
+
+Two inserts rescued out of 58,244, and on the single-table path the stall **never occurs**.
+The reason was already in the tree: when BF refuses an insert, `btree.c` falls through to
+`sqlite3BfBtreeFlushTableForMutation`, which flushes that table's ENTIRE dirty set, so the
+FIFO head is clean before the next sweep reaches it.  The stall survives only ACROSS tables,
+because that fallback flushes just the cursor's own root.  **The item's premise — "a dirty
+head stops the sweep" — is true of `evictCallback`'s code and false of the running system.**
+
+**Then it lost a row, and that turned out to be the point of the exercise.**  A cross-table
+differential against stock (12 tables, one transaction, 256 KiB ring) came back one `INSERT`
+short.  With `SQLITE_BF_NO_DIRTY_EVICT` the same workload was byte-identical.  The trigger was
+exact: the loss happened only where the stalled leaf equalled the leaf the cursor was about to
+buffer into.  The cause was **not in M1** — it was `evictCallback` ignoring `pEvictProtect`
+(§2.5), a defect M1's flush-then-buffer sequence is the only known way to reach.  So M1's real
+contribution was as a detector.
+
+M1 now also refuses to flush the cursor's own leaf.  With the root cause fixed that guard is an
+efficiency choice, not a correctness one — the workload is byte-identical either way — but
+flushing a leaf you are about to re-dirty is self-defeating, so it stays.  It also costs M1 its
+only rescues: `dirty_evict_retry` goes from 2 to **0**.
+
+**Kept, at the owner's decision, with its value stated honestly**: it is small,
+off-switchable, discharges M4's stated dependency, and it found a real bug.  Its measured
+effect on throughput or capacity is **zero**, and it must never be reported as anything else.
+
+**Two process notes, because both cost time and both were caught by counters rather than
+reasoning.**  (1) The first overflow test used `zeroblob(100)`, which sets `nZero` and leaves
+`nData` at 0 — and the buffering gate requires `nData>0 && nZero==0`.  `buffered_inserts` came
+back 0: it measured a workload where BF never engaged.  A write test that does not check
+`buffered_inserts` is not testing BF.  (2) The first honest run showed 52 flushes for 4
+rescues; the natural diagnosis ("the head holds a RUN of dirty slabs") was wrong, and
+flushing the whole table instead of one leaf changed the numbers by exactly zero, which is
+what falsified it.  The real cause was that `pgnoEvictStall` was sticky — set by one sweep,
+consumed by a later unrelated refusal (a mini-page already at the maximum size class, which
+no flush can fix).  Scoping the flag to its own sweep (`sqlite3BfCacheEvict` clears it on
+entry) took 52/4 down to an honest 25/2.
 
 ---
 
@@ -793,11 +909,19 @@ sh bench/stress_buf.sh                     # ... vs the buffering build
 BF_GROUP=8 sh bench/stress_buf.sh          # ... with group commit on
 BF_PROMOTION=100 sh bench/stress_buf.sh    # ... with read promotion at max
 BF_CACHE_SIZE=262144 sh bench/stress_buf.sh  # ... with a ring small enough to CYCLE
+sh bench/stress_xtable.sh                  # MANY tables in one txn, ring too small
 ```
 
 Run the `BF_CACHE_SIZE` variant.  At the default ring these workloads never evict — every
 benchmark in this repo reports `evictions=0` — so eviction, free-list reuse and
-upgrade-under-pressure went untested for the project's whole life.  That is how a segfault
+upgrade-under-pressure went untested for the project's whole life.
+
+**Run `stress_xtable.sh` too, for a different structural reason.**  Every other generator
+drives ONE table, and with one table the insert fallback flushes that table on the first BF
+refusal — so a foreign table's dirty mini-page can never be at the ring head, and a whole
+set of states is unreachable no matter how many seeds you run.  Gate anything touching
+eviction, the mapping table or the size-class ladder on it.  It does **not** cover the
+`pEvictProtect` bug in §2.5; its header says so.  That is how a segfault
 in `bfFreeListRemove` (`bench/ring_repro.sh`) reached a commit.  At 262144 a single suite run
 produces ~2,200 evictions, ~10,300 upgrades and ~1,400 compactions.
 
@@ -1206,3 +1330,75 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Benchmark status: NOT RUN.
 - Exact next action: begin **V0**.  No D/M/H/S implementation starts until the dead-code sweep
   builds and passes the listed differential, cycling-ring and debug gates.
+
+### 2026-09-21 — Claude Opus 5 — V0 gated and committed; M1 built, measured, demoted
+
+- Starting revision/state: `main` at `b0026ba`, dirty dead-code sweep, nothing built or gated.
+- Goal: close V0, then implement M1 (flush-capable dirty eviction).
+- **V0.** Rebuilt `sqlite3`, `sqlite3_buf`, `sqlite3_stock` first — the on-disk binaries
+  predated the sweep.  Results in the V0 entry above.  `BF_GROUP=8` was stopped at 27/216
+  (0 failures) and `BF_PROMOTION=100` never ran, both at the owner's instruction to stop
+  waiting; recorded as owed rather than claimed.  Committed as `f5f09dd` (sweep) and
+  `bd338af` (plan consolidation).  See the process note in V0 about the commit authorisation.
+- **M1.** Implemented: `evictCallback` records the leaf that aborted the sweep
+  (`pgnoEvictStall`); `sqlite3BfBtreeRelieveEvictStall()` drains it from `sqlite3BtreeInsert`,
+  flushing that leaf's table, re-seeking and retrying once; guarded on `rootPgno>1`; behind
+  `SQLITE_BF_NO_DIRTY_EVICT`; four counters in `PRAGMA bf_cache_stats`
+  (`evict_stall_seen`, `dirty_evict_flush`, `dirty_evict_retry`, `dirty_evict_refused`).
+- **The result is negative and it re-ranks the backlog.**  2 inserts rescued out of 58,244;
+  on a single-table workload the dirty-head stall never occurs at all, because the existing
+  fallback (`sqlite3BfBtreeFlushTableForMutation`) flushes the whole table on the first
+  refusal.  M1's premise was a true statement about `evictCallback`'s code and a false
+  statement about the running system.  Kept — it is small, switchable, closes a real
+  cross-table hole and discharges M4's dependency — but demoted out of the active ranking.
+- **Three things the counters caught that reasoning did not**, all worth remembering:
+  - a write test using `zeroblob(100)` buffers NOTHING (`nZero` set, `nData` 0, and the gate
+    needs `nData>0 && nZero==0`).  `buffered_inserts` is the check that a write test is
+    testing BF at all;
+  - the obvious diagnosis for 52 flushes / 4 rescues ("the head holds a run of dirty slabs")
+    was wrong, and flushing the whole table instead of one leaf moved the numbers by exactly
+    zero, which is what disproved it;
+  - the real cause was a sticky `pgnoEvictStall` — set by one sweep, consumed by a later
+    unrelated refusal that no flush could help.  Scoping it to its own sweep gave 25/2.
+- Files changed: `src/bf_cache.{c,h}`, `src/bf_btree.c`, `src/btree.c`, `src/bf_config.c`,
+  `BF_TREE_V2_PLAN.md`.
+- Validation: `stress_buf.sh` and `BF_CACHE_SIZE=262144 stress_buf.sh` running on the M1 tree
+  at the time of writing; functional counter checks done.  **M1 is NOT committed.**
+- Benchmark status: NOT RUN (the numbers above are counters, not throughput).
+- Remaining blockers: D1's crash tests at the merge boundary now also cover M1's flush point;
+  the two owed V0 runs.
+- Exact next action: finish the M1 gate, then **H1b** — wire `bf_copy_on_access` through
+  `bfbench.c`/`runner.py`, the cheapest unmeasured thing left.
+
+### 2026-09-21 — Claude Opus 5 — M1 landed; it found a latent data-loss defect
+
+- Starting state: `main` at `bd338af`, M1 built and counter-instrumented, gates clean.
+- **A cross-table differential lost a row.**  12 tables, one transaction, 256 KiB ring: one
+  `INSERT` absent from the BF dump.  `SQLITE_BF_NO_DIRTY_EVICT` made it identical to stock, so
+  the ablation switch §1 rule 5 demands paid for itself within an hour of the mechanism
+  existing.
+- **Root cause, and it is not M1's**: `evictCallback` never checked `pEvictProtect` (§2.5).
+  Diagnosed by trace, not by reading: four rounds — the retry path, the cursor's leaf identity,
+  the flush target, and finally a read-back after every buffered insert, which showed
+  `sqlite3BfRecordWrite` returning `BF_OK` and `sqlite3BfRecordRead` returning `BF_NOT_FOUND`
+  for the same leaf and key one instruction apart.  `-DSQLITE_BF_NO_MINIPAGE_COMPACT` made the
+  loss vanish, localising it to the evict-and-retry paths.
+- **A claim I made and then had to retract**: that the defect is reachable without M1.  It is
+  not demonstrated.  A fix-reverted binary passes the original repro, all of
+  `stress_xtable.sh`, and a read-then-write workload built to produce the state, so long as
+  M1's same-leaf guard is present.  Recorded as unproven in §2.5; the fix is defensive.
+- Changes: `evictCallback` refuses a protected slab; both `pEntry->pPage = pNew` sites now
+  restore `locType` too; M1 gained a same-leaf guard (efficiency, not correctness); new
+  `bench/stress_xtable.sh` + `gen_xtable.py`.
+- **The new oracle does NOT catch this bug**, and both files say so in their headers.  It
+  covers the cross-table shape, which the single-table generators structurally cannot reach.
+  Shipping it as a regression test for the defect would have been a test that cannot fail.
+- Files changed: `src/bf_cache.{c,h}`, `src/bf_btree.c`, `src/btree.c`, `src/bf_config.c`,
+  `bench/stress_xtable.sh`, `bench/gen_xtable.py`, `BF_TREE_V2_PLAN.md`.
+- Validation: `stress.sh` 54/54, `stress_buf.sh` 216/216, `BF_CACHE_SIZE=262144 stress_buf.sh`
+  216/216, `stress_xtable.sh` 3/3 — all ALL CLEAN on the combined tree.
+- Benchmark status: NOT RUN.  The M1 figures in its entry are counters, not throughput.
+- Decisions: owner kept M1 after the re-rank; committed on an explicit instruction.
+- Remaining blockers: **D2 needs an owner ruling** on the durability contract before anything
+  can be built there.  D1's crash tests now also owe coverage of M1's flush point.
+- Exact next action: **D1** — recovery/checkpoint ownership, the highest-ranked unblocked item.

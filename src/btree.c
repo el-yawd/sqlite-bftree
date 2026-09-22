@@ -10621,7 +10621,29 @@ int sqlite3BtreeInsert(
       return SQLITE_OK;
     }
     if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
-    /* BF refused (full / not on a usable leaf) — fall through to base write. */
+
+    /* BF refused.  One common reason is that the ring is full and its FIFO
+    ** head is a DIRTY mini-page, which the sweep will not reclaim — so the ring
+    ** is stuck behind that one leaf and every later insert is refused too.
+    ** Flush it here, where we have a cursor, a Btree and a write transaction
+    ** (M1), then re-seek and retry once.  The re-seek is mandatory: the flush
+    ** replays through its own cursor and can rebalance. */
+    if( sqlite3BfBtreeRelieveEvictStall(pCur) ){
+      rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, (flags & BTREE_APPEND)!=0,
+                                   &loc);
+      if( rc ) return rc;
+      if( loc!=0 && pCur->eState==CURSOR_VALID ){
+        bfrc = sqlite3BfBtreeInsertCell(pCur, keyBuf, 8, pX->pData, pX->nData);
+        if( bfrc==SQLITE_OK ){
+          sqlite3BfBtreeNoteDirtyEvictRetry(pCur);
+          pCur->eState = CURSOR_INVALID;
+          pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+          return SQLITE_OK;
+        }
+      }
+      if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+    }
+    /* Still refused (full / not on a usable leaf) — fall through to base write. */
   }
 
   /* Accounting for the write-amplification study: this insert is about to cost

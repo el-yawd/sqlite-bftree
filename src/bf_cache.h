@@ -525,6 +525,20 @@ struct BfCache {
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
+
+  /* Flush-capable dirty eviction (M1).  evictCallback cannot flush a dirty
+  ** mini-page -- it has no Btree, no write transaction, and it runs inside the
+  ** allocator -- so instead it RECORDS the leaf that aborted the sweep here and
+  ** the btree layer drains it from a call point that has all three.  See
+  ** sqlite3BfBtreeRelieveEvictStall(). */
+  u32 pgnoEvictStall;       /* Leaf whose dirty mini-page aborted the last sweep */
+  u64 nEvictStallSeen;      /* Times the sweep hit a mapped DIRTY slab and gave up.
+                            ** This is the one that says whether M1 has a target
+                            ** at all: if it is 0, no flush was ever possible and
+                            ** the other three counters are 0 for that reason. */
+  u64 nDirtyEvictFlush;     /* Stalls relieved by flushing that leaf to base */
+  u64 nDirtyEvictRetryOk;   /* Buffered inserts rescued by such a flush */
+  u64 nDirtyEvictRefused;   /* Stalls seen but unflushable (no root, no write txn) */
 };
 
 /*
@@ -783,6 +797,9 @@ SQLITE_PRIVATE int sqlite3BfBtreeLogAllDirty(Btree *p);
 ** or free its leaves (Phase 1 per-leaf survival).  Returns non-zero if work
 ** was done (caller should re-seek its cursor). */
 SQLITE_PRIVATE int sqlite3BfBtreeFlushTableForMutation(BtCursor *pCur);
+SQLITE_PRIVATE int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur);
+SQLITE_PRIVATE void sqlite3BfBtreeNoteDirtyEvictRetry(BtCursor *pCur);
+SQLITE_PRIVATE void sqlite3BfBtreeDirtyEvictStat(Btree*, u64*, u64*, u64*, u64*);
 /* Discard all BF state for a B-tree (called at rollback). */
 SQLITE_PRIVATE void sqlite3BfBtreeClearCache(Btree *p);
 
