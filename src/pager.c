@@ -3189,7 +3189,13 @@ static int pagerWalFrames(
   PgHdr *p;                       /* For looping over pages */
 
   assert( pPager->pWal );
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* pList may be empty for a record-only commit: the last staged BF record
+  ** frame carries the commit marker, so there is no page to write at all. */
+  assert( pList || pagerBfHasStaged(pPager) );
+#else
   assert( pList );
+#endif
 #ifdef SQLITE_DEBUG
   /* Verify that the page list is in ascending order */
   for(p=pList; p && p->pDirty; p=p->pDirty){
@@ -3197,8 +3203,10 @@ static int pagerWalFrames(
   }
 #endif
 
-  assert( pList->pDirty==0 || isCommit );
-  if( isCommit ){
+  assert( pList==0 || pList->pDirty==0 || isCommit );
+  if( pList==0 ){
+    nList = 0;
+  }else if( isCommit ){
     /* If a WAL transaction is being committed, there is no point in writing
     ** any pages with page numbers greater than nTruncate into the WAL file.
     ** They will never be read by any client. So remove them from the pDirty
@@ -3217,7 +3225,7 @@ static int pagerWalFrames(
   }
   pPager->aStat[PAGER_STAT_WRITE] += nList;
 
-  if( pList->pgno==1 ) pager_write_changecounter(pList);
+  if( pList && pList->pgno==1 ) pager_write_changecounter(pList);
   rc = sqlite3WalFrames(pPager->pWal,
       pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags
   );
@@ -6700,8 +6708,18 @@ int sqlite3PagerCommitPhaseOne(
     PgHdr *pList;
     if( pagerUseWal(pPager) ){
       PgHdr *pPageOne = 0;
+      int bRecCommit = 0;
       pList = sqlite3PcacheDirtyList(pPager->pPCache);
-      if( pList==0 ){
+#ifndef SQLITE_OMIT_BF_CACHE
+      /* A commit whose only content is BF record frames does not need a page
+      ** at all: the last record frame carries nTruncate.  Skipping page 1 here
+      ** halves the cost of a small commit -- a record frame plus a page-1
+      ** commit frame is two page-sized WAL frames where stock writes one. */
+      bRecCommit = (pList==0 && pagerBfHasStaged(pPager)
+                    && sqlite3WalBfCommitOnRecordOk(pPager->pWal,
+                                                    pPager->walSyncFlags));
+#endif
+      if( pList==0 && !bRecCommit ){
         /* Must have at least one page for the WAL commit flag.
         ** Ticket [2d1a5c67dfc2363e44f29d9bbd57f] 2011-05-18 */
         rc = sqlite3PagerGet(pPager, 1, &pPageOne, 0);
@@ -6709,7 +6727,7 @@ int sqlite3PagerCommitPhaseOne(
         pList->pDirty = 0;
       }
       assert( rc==SQLITE_OK );
-      if( ALWAYS(pList) ){
+      if( pList || bRecCommit ){
         rc = pagerWalFrames(pPager, pList, pPager->dbSize, 1);
       }
       sqlite3PagerUnref(pPageOne);

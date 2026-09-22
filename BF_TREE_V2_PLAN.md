@@ -79,7 +79,7 @@ a comment array was repointed.  **No benchmark configuration changed** — in pa
 | **1** — read cache + write-through | **DONE** (`8dba75c`) — lifecycle, config/pragmas, `pcache2` activation, btree read hooks, descent shortcut |
 | **2** — record-granular physiological WAL | **DONE** (`3bf3fb2`), **ON by default** (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`) — write-back insert and **delete**, commit-time record logging, recovery replay, checkpoint materialisation, forward and reverse merge scans, merged `Count`, transaction grouping, mini-page compaction.  **Existing-row UPDATE is NOT buffered** (§3.2, D3a).  Two contracts remain open: **D1** (recovery/checkpoint edge cases) and **D2** (what an acknowledged commit guarantees) |
 | **3** — measurement campaign + reference parity | **IN PROGRESS** — this is where all remaining work in §5 lives |
-| **4** — the faithful file-incompatible branch | not started; §7.2 |
+| **4** — the faithful file-incompatible branch | not started; §7.3 |
 
 ### 2.3 The numbers that are currently defensible
 
@@ -1099,14 +1099,54 @@ bundle.
   record-granular physiological WAL is the deliberate replacement.
 * **Write concurrency.**  `BtShared` serialization stays.  Read concurrency is in scope (S1).
 * **Native mini/base leaf split.**  SQLite materialises fixed pages and runs its own
-  balancing; see §7.2.
+  balancing; see §7.3.
 * **Secondary-index record buffering** — *deferred, not rejected.*  v1 scope keeps indexes
   write-through so a committing transaction still emits one ordered WAL stream with one commit
   marker, which makes atomicity trivial.  It becomes a candidate phase of its own **if** the
   measurement campaign shows the primary-table win is large enough to be worth re-opening the
   atomicity question.
 
-### 7.2 The faithful branch (after this one is measured)
+### 7.2 Multi-writer, and what it would buy — **parked, revisit only after everything else**
+
+Group commit does not transfer to this fork, and the reason is SQLite's, not ours:
+`sqlite3WalBeginWriteTransaction` (`wal.c`) takes an exclusive `WAL_WRITE_LOCK` — *"Only one
+writer allowed at a time"*.  WAL mode gives reader/writer concurrency, not writer/writer.  The
+lock is held for the whole transaction, so a second writer cannot even produce its records
+until the first has committed; there is never more than one transaction at the commit-flush
+point, and a flush with nothing to amortise against is just an fsync.
+
+**With serialized writers, "batch across transactions" and "wait until durable" are mutually
+exclusive.**  That is why the current `bf_group_commit` defers rather than waits: deferral is
+the only batching available to a single-writer engine, and it buys throughput with durability.
+
+**The enabler exists**: SQLite's `begin-concurrent` branch (the basis of Expensify's Bedrock)
+lets write transactions run concurrently and validates page-level conflicts at COMMIT.  Bodies
+overlap, commits still serialize — which is exactly what group commit needs.
+
+**And there is a genuine contribution hiding in it.**  `BEGIN CONCURRENT` detects conflicts at
+PAGE granularity, so two transactions inserting different rowids into the same leaf conflict
+although they do not overlap logically.  BF does not modify the page; it appends to a mini-page
+delta, and two disjoint record sets on one leaf merge deterministically.  So:
+
+> Bf-Tree's mini-page representation lowers SQLite's optimistic-concurrency conflict detection
+> from page granularity to record granularity, converting a class of false conflicts into
+> successful concurrent commits.
+
+That is testable, novel, and a property of THIS fork rather than of the paper.
+
+**Cost, ranked.**  (1) fix the recovery defect first — concurrency over an unsound recovery
+path is not worth building; (2) merge `begin-concurrent` into a fork that has already rewritten
+`wal.c` and `pager.c`, the same files it touches; (3) **S1 becomes mandatory**, because the
+record cache is per pager and a record buffered in connection A is invisible to B; (4)
+record-level conflict detection, including replay ordering for interleaved transactions; (5)
+group commit itself, days once the rest exists.  Multi-month; out of scope for the TFG as
+implementation, strong as a Future Work chapter.
+
+**Before any of it, one cheap experiment bounds the whole thing**: group commit can only ever
+recover the fsync cost of a commit, so measure insert throughput at `synchronous=off` versus
+`full` at `bf_group_commit=0`.  That gap is the entire prize.
+
+### 7.3 The faithful branch (after this one is measured)
 
 This fork keeps SQLite's fixed-page `btree.c` and inserts Bf-Tree as a record cache *beside*
 it: pragmatic, incrementally correct, and oracle-friendly.  It therefore leaves performance on
