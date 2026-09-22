@@ -512,6 +512,9 @@ Three ordering rules override personal preference:
 **Current ranking, after the M1 measurement (2026-09-21).**  The items with measured headroom
 are the write path and the unswept retention knobs, not the eviction machinery:
 
+0. **D1's post-recovery tree corruption** — found 2026-09-21, ours, reproducible in one
+   command.  Ahead of everything: a fork whose crash recovery produces a malformed B-tree
+   cannot make a durability claim at all.
 1. **D1 / D2** — the two open durability contracts.  Nothing downstream is quotable until an
    acknowledged commit means something definite.
 2. **H1b** — copy-on-access has been landed and unmeasured since `c99c040`, and §2.4 names
@@ -557,13 +560,48 @@ nothing about them.
 > message proposing exactly that, which is an authorisation but not an explicit one.  Both
 > are plain reverts if the owner disagrees.
 
-### D1 — recovery and checkpoint ownership
+### D1 — recovery and checkpoint ownership — **A BUG IS OPEN HERE, 2026-09-21**
 *From: handoff P1a.*  Source: `bf_cache.c` (`bfReplayOnePage`, `sqlite3BfCacheReplayWal`),
 `btree.c` (`bfCheckpointMaterialize`), `bf_btree.c` (`bfTagLeafRoot`), `wal.c`.
+Repro: **`sh bench/recover_repro.sh`** (its header carries the full evidence).
 
-- [ ] reproduce recovery into a mini-page that reaches `BF_FULL`
-- [ ] checkpoint immediately after recovery, without first descending the table
-- [ ] prove recovered records with a missing `rootPgno` cannot be skipped or lost
+> **BF crash recovery leaves a structurally corrupt B-tree.**  After SIGKILL with committed
+> record frames still in the WAL, `PRAGMA integrity_check` reports
+> *"Tree 2 page 2 cell 24: Child page depth differs"*.
+>
+> Three controls make it ours, and narrow it:
+> * every committed row is present and readable — the count is exact — so this is a
+>   **tree-shape defect, not data loss**;
+> * **stock SQLite under the identical crash pattern is clean** in all three scenarios;
+> * the same workload with a **clean close is clean**, in-session and on reopen, so the crash
+>   is necessary;
+> * it is present **immediately after recovery, before any checkpoint**, so the checkpoint is
+>   not the cause.
+>
+> Root cause not yet identified.  `bfReplayOnePage` writes recovered records into the *cache*
+> and never touches base, so the suspect is the state of the base tree the crash left on disk:
+> BF's commit writes record frames and **no** base pages, and the base tree only advances
+> through incremental flushes, so a crash can catch it at a shape no committed state should
+> be able to observe.  That is a durability-model question, which is why it lands squarely on
+> **D2** as well.
+>
+> **This blocks every durability claim in the thesis.**  It is now the top item in the
+> project, ahead of the ranking below.
+
+The gap this probe was originally written for — the documented leaf→root hole, where a
+replay-created mini-page has no `rootPgno` and `bfFlushAllCallback` skips `rootPgno<=1` — is
+**answered and is NOT the problem**: no rows are lost to it in any of the three checkpoint
+orders.
+
+- [ ] **root-cause the post-recovery tree corruption above** — the blocking item
+- [x] checkpoint immediately after recovery, without first descending the table —
+      `recover_repro.sh` scenarios B and C; no rows lost
+- [x] prove recovered records with a missing `rootPgno` cannot be skipped or lost — no loss in
+      any order; the leaf→root gap is not the defect
+- [ ] reproduce recovery into a mini-page that reaches `BF_FULL` (`bfReplayOnePage` tolerates
+      it on the grounds that the record "stays durable in the WAL and is re-applied at the
+      next checkpoint from the base path" — unverified, and worth checking now that the
+      recovery path is known to be unsound)
 - [ ] multiple table roots
 - [ ] crash during checkpoint; compare against the allowed committed states
 - [ ] **decide the checkpoint architecture** (§4.3): direct replay of durable record frames to
@@ -1402,3 +1440,29 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Remaining blockers: **D2 needs an owner ruling** on the durability contract before anything
   can be built there.  D1's crash tests now also owe coverage of M1's flush point.
 - Exact next action: **D1** — recovery/checkpoint ownership, the highest-ranked unblocked item.
+
+### 2026-09-21 — Claude Opus 5 — D1 opened; crash recovery corrupts the B-tree
+
+- Starting state: `main` at `c8e7046`, M1 and the `pEvictProtect` fix committed.
+- Goal: D1, the highest-ranked unblocked item — prove or disprove the recovery/checkpoint path.
+- Built `bench/recover_repro.sh`: SIGKILL after a committed transaction with
+  `wal_autocheckpoint=0`, then three checkpoint orders (descend-first, checkpoint-first,
+  checkpoint-in-a-separate-process), each gated on row count **and** `integrity_check`.
+- **Finding: BF crash recovery leaves a structurally corrupt B-tree** —
+  *"Tree 2 page 2 cell 24: Child page depth differs"*, in all three orders.  See D1 above for
+  the three controls that make it ours and narrow it to the recovery path.
+- The hole this probe was written for — the documented leaf→root `rootPgno` gap — turns out
+  **not** to be the defect: no rows are lost in any order.  Worth recording, because that gap
+  has been carried as "future work" since Phase 2 and the real problem was elsewhere.
+- **A flaw in my own first version, worth keeping as a lesson**: it gated on row count only,
+  printed `ALL CLEAN`, and displayed the corruption in passing.  A test that reports success
+  while showing corruption is worse than no test.  Both halves gate now.
+- Files changed: `bench/recover_repro.sh` (new), `BF_TREE_V2_PLAN.md`.
+- Validation: the probe itself; stock control clean in all three; clean-close control clean.
+- Benchmark status: NOT RUN.
+- Exact next action: root-cause the corruption.  First moves: run the probe under a
+  `SQLITE_DEBUG` build (the project's fastest diagnostic — the 2026-09-15 wal-index bug fired
+  `walIndexAppend`'s own assert immediately); compare the base tree's page structure before the
+  crash and after recovery; and check whether a crash with BF's insert buffering compiled out
+  (`-DSQLITE_OMIT_BF_CACHE` is not enough — use the Phase-1 `bf_ro` shape) still corrupts,
+  which separates the record-WAL from the flush path.
