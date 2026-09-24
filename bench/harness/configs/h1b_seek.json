@@ -1,0 +1,54 @@
+{
+  "name": "h1b_seek",
+  "_comment": [
+    "H1b confirmation (2026-09-24): the h1b coa axis re-run with the per-seek",
+    "counters (seek_served/seek_leaf, e153ea9) so the record hit rate is per read, not",
+    "per lookup.  bf only; the h1b campaign itself has the bf_shed and promotion axes."
+  ],
+  "datasets": {
+    "v100": {
+      "records": 4000000,
+      "value_len": 100,
+      "key_spacing": 16
+    }
+  },
+  "defaults": {
+    "dataset": "v100",
+    "suts": [
+      "bf"
+    ],
+    "repeats": 2,
+    "seconds": 60,
+    "warmup_seconds": 120,
+    "workload": "read=100",
+    "dist": "zipf",
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "read_txn": true,
+    "drop_cache": true,
+    "budget_bytes": "32M",
+    "memmax": "auto",
+    "bf_page_cache_floor": "16M",
+    "promotion": 30,
+    "copy_on_access": 10
+  },
+  "experiments": [
+    {
+      "name": "coa",
+      "suts": [
+        "bf"
+      ],
+      "axes": {
+        "copy_on_access": [
+          0,
+          10,
+          20,
+          40,
+          100
+        ]
+      }
+    }
+  ]
+}
