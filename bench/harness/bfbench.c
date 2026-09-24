@@ -419,6 +419,7 @@ typedef struct Config {
   int nGroupCommit;
   int nPromotion;
   int nMinRecord;             /* PRAGMA bf_min_record; -1 leaves the default */
+  int nCopyOnAccess;          /* PRAGMA bf_copy_on_access, percent; -1 = default */
   int bfEnable;              /* -1 = leave alone, 0/1 = PRAGMA bf_cache */
   int nOpsPerTxn;
   int nAutoCheckpoint;
@@ -440,6 +441,7 @@ static void configDefaults(Config *p){
   p->aMix[OP_READ] = 100;
   p->dist = DIST_ZIPF;
   p->nMinRecord = -1;
+  p->nCopyOnAccess = -1;
   p->theta = 0.9;
   p->seconds = 0;
   p->nOps = 0;
@@ -877,6 +879,9 @@ static int cmdRun(Config *p){
   ** capacity, so it has to see the capacity this run actually wants. */
   if( p->nMinRecord > 0 )    execFmt(db, "PRAGMA bf_min_record=%d;", p->nMinRecord);
   if( p->nPromotion >= 0 )   execFmt(db, "PRAGMA bf_promotion_rate=%d;", p->nPromotion);
+  /* A global the ring re-reads on every (re)initialisation, so its order
+  ** relative to bf_cache_size / bf_min_record does not matter. */
+  if( p->nCopyOnAccess >= 0 ) execFmt(db, "PRAGMA bf_copy_on_access=%d;", p->nCopyOnAccess);
   if( p->nGroupCommit >= 0 ) execFmt(db, "PRAGMA bf_group_commit=%d;", p->nGroupCommit);
   execOrDie(db, "PRAGMA temp_store=MEMORY;");
 
@@ -1041,8 +1046,10 @@ static int cmdRun(Config *p){
   fprintf(out, "    \"bf_cache_bytes\": %lld, \"page_cache_bytes\": %lld,\n",
           p->bfCacheBytes, p->pageCacheBytes);
   fprintf(out, "    \"synchronous\": \"%s\", \"journal_mode\": \"%s\", "
-               "\"group_commit\": %d, \"promotion_rate\": %d,\n",
-          p->zSync, p->zJournal, p->nGroupCommit, p->nPromotion);
+               "\"group_commit\": %d, \"promotion_rate\": %d, "
+               "\"copy_on_access\": %d, \"min_record\": %d,\n",
+          p->zSync, p->zJournal, p->nGroupCommit, p->nPromotion,
+          p->nCopyOnAccess, p->nMinRecord);
   fprintf(out, "    \"ops_per_txn\": %d, \"seed\": %llu, "
                "\"read_txn\": %d, \"drop_cache\": %d\n",
           p->nOpsPerTxn, (unsigned long long)p->seed, p->bReadTxn,
@@ -1163,6 +1170,8 @@ static const char zUsage[] =
 "  --bf-cache-bytes N           --page-cache-bytes N\n"
 "  --synchronous off|normal|full  --journal wal|delete\n"
 "  --group-commit N             --promotion N    --bf-cache on|off\n"
+"  --copy-on-access N           PRAGMA bf_copy_on_access, percent of the ring\n"
+"                               (reference cb_copy_on_access_ratio; -1 default)\n"
 "  --min-record N               PRAGMA bf_min_record: base of the derived\n"
 "                               size-class ladder (reference cb_min_record_size)\n"
 "  --ops-per-txn N              --autocheckpoint N   --mmap N\n"
@@ -1204,6 +1213,7 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--group-commit")==0 ){ NEEDVAL; cfg.nGroupCommit = atoi(zVal); }
     else if( strcmp(z,"--promotion")==0 ){ NEEDVAL; cfg.nPromotion = atoi(zVal); }
     else if( strcmp(z,"--min-record")==0 ){ NEEDVAL; cfg.nMinRecord = atoi(zVal); }
+    else if( strcmp(z,"--copy-on-access")==0 ){ NEEDVAL; cfg.nCopyOnAccess = atoi(zVal); }
     else if( strcmp(z,"--bf-cache")==0 ){ NEEDVAL;
       cfg.bfEnable = (strcmp(zVal,"on")==0 || strcmp(zVal,"1")==0) ? 1 : 0; }
     else if( strcmp(z,"--ops-per-txn")==0 ){ NEEDVAL; cfg.nOpsPerTxn = atoi(zVal); }

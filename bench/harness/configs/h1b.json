@@ -1,0 +1,58 @@
+{
+  "name": "h1b",
+  "_comment": [
+    "H1b (BF_TREE_V2_PLAN.md): the copy-on-access second chance landed in",
+    "c99c040 and was never swept.  Axes are the reference's own",
+    "(benchmark/bench_bftree.toml): copy-on-access 0..100 percent of the ring,",
+    "read promotion 1..100 percent.  The full cross product would take over a",
+    "day at the 900 s steady-state warmup, so this runs two one-dimensional",
+    "sweeps through the defaults (copy-on-access 10, promotion 30) on a shape",
+    "where steady state is cheap: a 32 MiB budget against 4M rows cycles the",
+    "ring within seconds (evictions > 0 inside a 4 s warmup, 2026-09-24",
+    "liveness check), so a 120 s warmup is saturated.  Verify that per cell:",
+    "read cached_records and evictions beside every hit rate (rule 9).",
+    "",
+    "bf_shed (-DSQLITE_BF_UPGRADE_SHED, opt-in) crosses the copy-on-access",
+    "axis: shedding cold records on size upgrades is the other half of the",
+    "reference's cold discard.  stock runs once per experiment as the fixed",
+    "reference (it ignores both knobs).",
+    "",
+    "Promotion is deterministic since 2dc8f8c (fixed-seed xorshift), so the",
+    "two repeats differ only by machine noise, not by promotion draws.",
+    "",
+    "Tripwire, NOT QUOTABLE (8 s runs, v100, 32 MiB ring): copy-on-access",
+    "0/10/40/100 -> mini_page_hits 1.51M/1.73M/1.77M/1.21M, cached_records",
+    "179k/159k/120k/44k, evictions 156k/208k/402k/1.66M.  Prediction to test:",
+    "an interior optimum; strict LRU (100) churns the ring."
+  ],
+  "datasets": {
+    "v100": { "records": 4000000, "value_len": 100, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "v100",
+    "suts": ["bf"],
+    "repeats": 2,
+    "seconds": 60,
+    "warmup_seconds": 120,
+    "workload": "read=100",
+    "dist": "zipf",
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "read_txn": true,
+    "drop_cache": true,
+    "budget_bytes": "32M",
+    "memmax": "auto",
+    "bf_page_cache_floor": "16M",
+    "promotion": 30,
+    "copy_on_access": 10
+  },
+  "experiments": [
+    { "name": "stock_ref", "suts": ["stock"] },
+    { "name": "coa", "suts": ["bf", "bf_shed"],
+      "axes": { "copy_on_access": [0, 5, 10, 15, 20, 40, 60, 80, 100] } },
+    { "name": "promotion",
+      "axes": { "promotion": [1, 5, 10, 20, 40, 60, 80, 100] } }
+  ]
+}

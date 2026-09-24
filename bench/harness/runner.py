@@ -371,6 +371,8 @@ def build_argv(run, dbpath, jsonpath, page_floor):
             argv += ["--promotion", str(run["promotion"])]
         if run.get("min_record") is not None:
             argv += ["--min-record", str(run["min_record"])]
+        if run.get("copy_on_access") is not None:
+            argv += ["--copy-on-access", str(run["copy_on_access"])]
     return argv
 
 

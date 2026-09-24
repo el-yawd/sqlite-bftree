@@ -18,6 +18,7 @@
 #   bf_nowbdel    -DSQLITE_BF_NO_WRITEBACK_DELETE
 #   bf_noshortcut -DSQLITE_BF_NO_DESCENT_SHORTCUT
 #   bf_nocompact  -DSQLITE_BF_NO_MINIPAGE_COMPACT
+#   bf_shed       -DSQLITE_BF_UPGRADE_SHED        opt-in: upgrades shed cold records
 #
 # Usage:
 #   sh bench/harness/build_suts.sh            # core variants (stock, bf, bf_ro)
@@ -86,6 +87,9 @@ if [ "$ALL" = 1 ]; then
   build_one bf_nowbdel    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_WRITEBACK_DELETE"
   build_one bf_noshortcut "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_DESCENT_SHORTCUT"
   build_one bf_nocompact  "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MINIPAGE_COMPACT"
+  # Opt-IN, unlike the ablations above: size upgrades shed cold cache records
+  # (the reference's copy-on-access cold discard, applied on the upgrade copy).
+  build_one bf_shed       "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_UPGRADE_SHED"
 fi
 
 # bf_off is the same binary as bf; the runner passes --bf-cache off.
