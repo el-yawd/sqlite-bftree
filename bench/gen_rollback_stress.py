@@ -17,7 +17,9 @@ This one asks, in every shape: committed transactions interleaved with
   * COMMIT with no transaction open (fails),
   * autocommit statements that fail a constraint, and failing statements
     inside a transaction that then commits,
-  * savepoints rolled back to and then the whole transaction rolled back,
+  * savepoints rolled back to and then the whole transaction rolled back, and a
+    top-level SAVEPOINT that BEGINS the transaction -- ROLLBACK TO it is a
+    whole-transaction rollback that keeps the transaction open (bug D1-7),
   * mid-session checkpoints (output discarded: engine-dependent frame counts),
 with reads after every transaction.  Error messages are part of the compared
 output, so both engines must fail the same statements the same way.
@@ -148,6 +150,18 @@ def main():
             write_op()
             w("COMMIT;")
         elif r < 0.86:                                 # savepoint, then abandon it all
+            top = rng.random() < 0.5
+            if top:
+                # A top-level SAVEPOINT begins the transaction itself; ROLLBACK TO
+                # it is a whole-transaction rollback that keeps the txn open
+                # (sqlite3BtreeSavepoint(ROLLBACK,-1)) -- bug D1-7.
+                w("SAVEPOINT s0;")
+                write_op()
+                w("ROLLBACK TO s0;")
+                write_op()
+                w("RELEASE s0;" if rng.random() < 0.5 else "ROLLBACK;")
+                reads()
+                continue
             w("BEGIN;")
             write_op()
             w("SAVEPOINT s1;")

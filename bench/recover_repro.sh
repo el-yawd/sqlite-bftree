@@ -148,8 +148,10 @@ else
   fail=$((fail+1))
 fi
 
-rm -f /tmp/bf_rec_A.*.db* /tmp/bf_rec_B.*.db* /tmp/bf_rec_C.*.db* \
-      /tmp/bf_rec_*.sql /tmp/bf_rec_*.out /tmp/bf_rec_*.ic 2>/dev/null
+# Only this run's files: a glob here would delete a concurrent run's databases.
+for d in "$DBA" "$DBB" "$DBC"; do
+  rm -f "$d" "$d-wal" "$d-shm" "$d.sql" "$d.load.out" "$d.ic"
+done
 
 echo
 if [ "$fail" -eq 0 ]; then

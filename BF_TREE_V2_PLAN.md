@@ -1133,6 +1133,23 @@ The accepted cost: a regression is found later, with more changes between it and
 known-good point.  The ablation axis is what keeps that bisectable, which is why the switch is
 a hard requirement (§1 rule 5) and not a nicety.
 
+### 6.1b The gate is one parallel command (2026-09-24)
+
+`python3 bench/gate.py` (quick, ~1 min) and `--full` (~3–4 min) run every checker —
+`difftest.py` (stress + stress_buf × {base, ring, group8, promo100} + xtable, 1,149 cases at
+full seeds), the crash oracle sharded by seed (default, ring, group 8, promotion 100,
+`SQLITE_DEBUG`), the power-loss oracle, the repro scripts and the codec test — on all cores,
+against a snapshot of `build/` in a tmpfs dir.  The same work took about two hours through the
+sequential shell scripts, and forbade touching `build/` or `bench/` while it ran.  Where the
+time went, measured: one test at a time on 12 cores (≈10×); btrfs-on-LUKS fsyncs under the
+default `synchronous=FULL` (2.75× per test — power loss has its own oracle now); stock
+recomputed per knob variant although it ignores the BF pragmas (1.6×).
+
+**Determinism is part of the gate.**  Read promotion drew from `sqlite3_randomness`, seeded by
+the OS, so one script promoted different rows on every run: a real bug appeared in 9 of 40 runs
+of the same script and could not be minimised.  Promotion now uses a per-cache xorshift with a
+fixed seed (`promoteRng`, `bf_cache.h`); any failure the gate reports reproduces exactly.
+
 ### 6.2 The debug build is the fastest diagnostic here
 
 ```sh
@@ -1810,3 +1827,28 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Remaining: none of D2's boxes; drive write caches and directory fsync are out of the
   oracle's model.  §2.3's "~30× less WAL" is a deferred-durability number and must be
   labelled so wherever it is reported (harness report labels still owed).
+
+### 2026-09-24 (cont.) — Claude Opus 5.5 — the gate in minutes, and three bugs the speed exposed
+
+- Owner asked why the suite is slow.  Measured (above, §6.1b) and rebuilt: `bench/difftest.py`
+  (parallel, tmpfs, binary snapshot, stock once per script) and `bench/gate.py` (every checker,
+  two tiers).  Full gate: 50/50 tasks green in **~3.5 min**; quick tier **~50 s**.  The old
+  scripts stay as the reference definitions; `recover_repro.sh`'s cleanup glob was narrowed so
+  concurrent runs cannot delete each other's files.
+- **Found by the first fast runs, all fixed:**
+  1. *My own D1 regression* — rollback rehydration replayed the group-commit batch and then
+     reset it, so a SECOND rollback before any commit lost deferred-committed rows
+     (`bf_deferred_commit=8`, `gen_rollback_stress`).  Fixed with a carry list on the group
+     (`struct BfGroup`): replayed by every rollback, staged ahead of the open batch, never
+     consumed by a rollback; the deferral count is preserved so the N−1 window still holds.
+  2. *Pre-existing lost update* — the write-through cache refresh returned early for a value
+     too big for a mini-page (or refused), leaving the previously PROMOTED clean copy to serve
+     the old value.  Now it drops the leaf's clean records (`nStaleCacheDrop`).  Repro: an
+     index-driven UPDATE to an ~6 KB value after the row was read and promoted.
+  3. *Nondeterministic promotion* (above) — which is why (2) survived: it needed a particular
+     promotion pattern and appeared in ~22% of runs.
+- `gen_rollback_stress` now also issues top-level `SAVEPOINT`s (bug D1-7's shape).
+- Validation: full gate green on the final build (difftest 1,149/1,149; crash oracle 1,320
+  runs; power-loss 240 runs; repros; codec; ring_repro).
+- Benchmark status: NOT RUN.  Note for the campaign: promotion is now deterministic, so repeat
+  runs of a benchmark cell are no longer independent draws of the promotion coin.

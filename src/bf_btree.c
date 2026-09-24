@@ -443,7 +443,36 @@ struct BfGroup {
   int         nTxn;     /* transactions merged into the current batch */
   u64         nStaged;  /* stats: batches handed to the WAL */
   u64         nDeferred;/* stats: commits that wrote nothing (grouped) */
+  /* Carry: finished batches of COMMITTED records that exist nowhere else --
+  ** a rollback took them out of the WAL stage or the open batch while
+  ** rebuilding the cache (sqlite3BfBtreeRollbackRehydrate).  They are replayed
+  ** by every later rollback and staged ahead of the open batch at the next
+  ** staging point.  A first version replayed and dropped them, so a SECOND
+  ** rollback before any commit lost the rows: found by bench/difftest.py,
+  ** group 8, gen_rollback_stress. */
+  u8        **apCarry;
+  int         nCarry;
+  int         nCarryAlloc;
 };
+
+static void bfGroupCarryFree(BfGroup *g){
+  int i;
+  for(i=0; i<g->nCarry; i++) sqlite3_free(g->apCarry[i]);
+  g->nCarry = 0;
+}
+
+/* Take ownership of payload a (szPage bytes) onto the end of the carry. */
+static int bfGroupCarryAdd(BfGroup *g, u8 *a){
+  if( g->nCarry>=g->nCarryAlloc ){
+    int nNew = g->nCarryAlloc ? g->nCarryAlloc*2 : 4;
+    u8 **ap = (u8**)sqlite3_realloc64(g->apCarry, (u64)nNew*sizeof(u8*));
+    if( ap==0 ){ sqlite3_free(a); return SQLITE_NOMEM_BKPT; }
+    g->apCarry = ap;
+    g->nCarryAlloc = nNew;
+  }
+  g->apCarry[g->nCarry++] = a;
+  return SQLITE_OK;
+}
 
 typedef struct BfLogAllCtx BfLogAllCtx;
 struct BfLogAllCtx {
@@ -471,8 +500,19 @@ static BfGroup *bfGroupGet(BfCache *pBf, int szPage){
 
 /* Finish and stage the open batch (if non-empty), then re-open it empty. */
 static void bfGroupStage(BfGroup *g, Pager *pPager, int *pRc){
+  /* Carried batches are older than the open one: they go first. */
+  if( *pRc==SQLITE_OK && g->nCarry>0 ){
+    int i;
+    for(i=0; i<g->nCarry && *pRc==SQLITE_OK; i++){
+      *pRc = sqlite3PagerBfStage(pPager, g->apCarry[i], g->szPage);
+    }
+    if( *pRc==SQLITE_OK ){
+      g->nStaged += (u64)g->nCarry;
+      bfGroupCarryFree(g);     /* the stage holds its own copies */
+    }
+  }
   if( *pRc!=SQLITE_OK || g->nOpen==0 ){
-    g->nTxn = 0;
+    if( *pRc==SQLITE_OK ) g->nTxn = 0;
     return;
   }
   sqlite3BfWalBatchFinish(&g->batch);
@@ -516,7 +556,7 @@ void sqlite3BfBtreeGroupStagePending(Btree *p){
   pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
   if( !pBf ) return;
   g = (BfGroup*)pBf->pGroupCommit;
-  if( g==0 || g->nOpen==0 ) return;
+  if( g==0 || (g->nOpen==0 && g->nCarry==0) ) return;
   bfGroupStage(g, p->pBt->pPager, &rc);
   /* A staging failure here cannot fail the caller (flush paths return void),
   ** but it is not a correctness problem: the records are still DIRTY, so the
@@ -531,6 +571,8 @@ void sqlite3BfBtreeGroupFree(BfCache *pBf){
   BfGroup *g;
   if( !pBf || !pBf->pGroupCommit ) return;
   g = (BfGroup*)pBf->pGroupCommit;
+  bfGroupCarryFree(g);
+  sqlite3_free(g->apCarry);
   sqlite3_free(g->aBuf);
   sqlite3_free(g);
   pBf->pGroupCommit = 0;
@@ -1025,10 +1067,11 @@ static int bfMarkLoggedCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
 **      commits' group batches, which the rollback would otherwise free unwritten;
 **   3. the open group-commit batch, still in memory.
 **
-** Records rebuilt from the WAL are marked logged again -- they are in the log --
-** unless the rollback discarded frames that carried some of them; records from
-** (2) and (3) are not in the log and stay unlogged for the next commit.  apStage
-** is consumed (freed) in every case.
+** (2) and (3) move into the group's CARRY (see struct BfGroup), which later
+** rollbacks replay again and the next staging point writes ahead of the open
+** batch.  Rebuilt records are then marked logged -- each is in the WAL or the
+** carry -- unless the rollback discarded WAL frames that carried some of them.
+** apStage is consumed in every case.
 */
 int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage, int nStage){
   BfCache *pBf = 0;
@@ -1044,46 +1087,57 @@ int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage, int nStage){
     pBf->nFlushed = 0;       /* every flush of this txn was rolled back too */
     pBf->bFlushedOom = 0;
     rc = sqlite3PagerBfReplayLog(p->pBt->pPager, pBf, &bAllDurable);
+    g = (BfGroup*)pBf->pGroupCommit;
+    if( rc==SQLITE_OK && g==0 && nStage>0 ){
+      g = bfGroupGet(pBf, pBf->szPage);
+      if( g==0 ) rc = SQLITE_NOMEM_BKPT;
+    }
+    if( rc==SQLITE_OK && g ){
+      /* Everything committed that lives only in memory joins the carry, in log
+      ** order: what was already carried, then this transaction's stage, then
+      ** the open batch.  The carry is kept, not consumed: a later rollback
+      ** needs it again, and the next staging point writes it. */
+      for(i=0; rc==SQLITE_OK && i<nStage; i++){
+        rc = bfGroupCarryAdd(g, apStage[i]);
+        apStage[i] = 0;
+      }
+      if( rc==SQLITE_OK && g->nOpen>0 ){
+        u8 *aCopy = (u8*)sqlite3_malloc(g->szPage);
+        if( aCopy==0 ){
+          rc = SQLITE_NOMEM_BKPT;
+        }else{
+          BfWalBatch b = g->batch;
+          memcpy(aCopy, g->aBuf, g->szPage);
+          b.aBuf = aCopy;
+          sqlite3BfWalBatchFinish(&b);
+          rc = bfGroupCarryAdd(g, aCopy);
+          /* nTxn is kept: these are still deferred commits, and the window
+          ** (N-1 acknowledged commits at most) counts them. */
+          g->nOpen = 0;
+          sqlite3BfWalBatchInit(&g->batch, g->aBuf, g->szPage);
+        }
+      }
+      if( rc==SQLITE_OK && g->nCarry>0 ){
+        pTmp = sqlite3BfWalIndexNew();
+        if( pTmp==0 ) rc = SQLITE_NOMEM_BKPT;
+        for(i=0; rc==SQLITE_OK && i<g->nCarry; i++){
+          if( sqlite3BfWalIndexAddFrame(pTmp, g->apCarry[i], g->szPage,
+                                        0xffffffffu)!=BFWAL_OK ){
+            rc = SQLITE_CORRUPT_BKPT;
+          }
+        }
+        if( rc==SQLITE_OK ){
+          rc = sqlite3BfCacheReplayWal(pBf, pTmp, 0xffffffffu, 1);
+        }
+      }
+    }
+    /* Every record now in the cache is in the WAL or in the carry, both of
+    ** which will be written without the cache's help -- unless the rollback
+    ** discarded WAL frames that carried some ops (then they exist only in the
+    ** cache and must be logged again by the next commit). */
     if( rc==SQLITE_OK && bAllDurable ){
       sqlite3BfMapIterate(pBf, bfMarkLoggedCallback, NULL);
       sqlite3BfUnlogListReset(pBf);
-    }
-    g = (BfGroup*)pBf->pGroupCommit;
-    if( rc==SQLITE_OK && (nStage>0 || (g && g->nOpen>0)) ){
-      pTmp = sqlite3BfWalIndexNew();
-      if( pTmp==0 ) rc = SQLITE_NOMEM_BKPT;
-    }
-    for(i=0; rc==SQLITE_OK && pTmp && i<nStage; i++){
-      if( sqlite3BfWalIndexAddFrame(pTmp, apStage[i], pBf->szPage,
-                                    0xffffffffu)!=BFWAL_OK ){
-        rc = SQLITE_CORRUPT_BKPT;
-      }
-    }
-    if( rc==SQLITE_OK && pTmp && g && g->nOpen>0 ){
-      u8 *aCopy = (u8*)sqlite3_malloc(g->szPage);
-      if( aCopy==0 ){
-        rc = SQLITE_NOMEM_BKPT;
-      }else{
-        BfWalBatch b = g->batch;       /* finish a COPY: the batch stays open */
-        memcpy(aCopy, g->aBuf, g->szPage);
-        b.aBuf = aCopy;
-        sqlite3BfWalBatchFinish(&b);
-        if( sqlite3BfWalIndexAddFrame(pTmp, aCopy, g->szPage,
-                                      0xffffffffu)!=BFWAL_OK ){
-          rc = SQLITE_CORRUPT_BKPT;
-        }
-        sqlite3_free(aCopy);
-      }
-    }
-    if( rc==SQLITE_OK && pTmp ){
-      rc = sqlite3BfCacheReplayWal(pBf, pTmp, 0xffffffffu, 1);
-    }
-    if( rc==SQLITE_OK && g ){
-      /* Its records are dirty-unlogged in the cache again and will be logged
-      ** by the next commit; keeping the batch too would log them twice. */
-      g->nOpen = 0;
-      g->nTxn = 0;
-      sqlite3BfWalBatchInit(&g->batch, g->aBuf, g->szPage);
     }
     pBf->nRollbackRehydrate++;
   }
@@ -2051,8 +2105,9 @@ int sqlite3BfBtreePromoteRecord(
     int rate = sqlite3BfCachePromotionRate();
     if( rate<=0 ) return SQLITE_OK;
     if( rate<100 ){
-      u32 r=0;
-      sqlite3_randomness(4, &r);
+      u32 r = pBf->promoteRng ? pBf->promoteRng : 0x9E3779B9u;
+      r ^= r<<13; r ^= r>>17; r ^= r<<5;          /* xorshift32 */
+      pBf->promoteRng = r;
       if( (r%100)>=(u32)rate ) return SQLITE_OK;
     }
   }
@@ -2140,14 +2195,34 @@ int sqlite3BfBtreeCacheRecord(
   u8  keyBuf[8];
 
   if( !pCur || !pCur->pBt || !pCur->curIntKey ) return SQLITE_OK;
-  if( pData==0 || nData<=0 || nData>(int)BF_MAX_MINI_PAGE ) return SQLITE_OK;
   pBf = btreeGetBfCache(pCur->pBt);
   if( !pBf ) return SQLITE_OK;
   leaf = bfCursorLeafPgno(pCur);
   if( leaf==0 ) return SQLITE_OK;
-
   bfEncodeRowid(rowid, keyBuf);
-  (void)sqlite3BfRecordWrite(pBf, leaf, keyBuf, 8, pData, nData, BFOP_CACHE);
+
+  /* A value the cache cannot hold (too big for any mini-page, or refused
+  ** below) must still EVICT the old cached copy.  This used to return early
+  ** and leave it, so an UPDATE to an overflow-sized value kept serving the
+  ** previous value from a promoted clean record: a lost update on plain SQL,
+  ** found 2026-09-24 by bench/difftest.py once read promotion became
+  ** deterministic (it had shown up in 9 of 40 runs of one script). */
+  if( pData==0 || nData<=0 || nData>(int)BF_MAX_MINI_PAGE
+   || sqlite3BfRecordWrite(pBf, leaf, keyBuf, 8, pData, nData, BFOP_CACHE)!=BF_OK
+  ){
+    BfMapEntry *pEntry = sqlite3BfMapLookup(pBf, leaf);
+    u8 op = 0;
+    if( pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage
+     && sqlite3BfMiniPageLookupOp((BfMiniPage*)pEntry->pPage, keyBuf, 8, &op)
+     && (op==BFOP_CACHE || op==BFOP_PHANTOM)
+    ){
+      /* No single-record removal exists; dropping the leaf's clean records
+      ** (dirty ones are kept) is correct and this path is rare. */
+      (void)sqlite3BfMiniPageDropClean((BfMiniPage*)pEntry->pPage);
+      pBf->nStaleCacheDrop++;
+    }
+    return SQLITE_OK;
+  }
   bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
   return SQLITE_OK;
 }

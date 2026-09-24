@@ -129,7 +129,14 @@ The three findings this file used to list as unexplained:
 cd build && ../configure --quiet && make sqlite3          # BF build, Phase 2 ON
 cc -O2 -DSQLITE_OMIT_BF_CACHE -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE \
    -I. -I../src -o sqlite3_stock shell.c sqlite3.c -lm -lz   # stock (no BF)
-cd ../bench && sh stress.sh                                # differential oracle -> ALL CLEAN
+cc -O0 -g -DSQLITE_DEBUG -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_ENABLE_FTS4 \
+   -DSQLITE_ENABLE_RTREE -I. -I../src -o sqlite3_dbg shell.c sqlite3.c -lm -lz
+cd .. && python3 bench/gate.py        # THE GATE, quick tier: ~1 min, every checker in parallel
+python3 bench/gate.py --full          # pre-commit tier: ~3-4 min (was ~2 h sequential)
+python3 bench/difftest.py --suite buf --variant ring --seeds 7 --keep   # one slice, keep files
+# gate.py snapshots build/ binaries into a tmpfs dir: rebuilding or editing bench/ while it
+# runs is safe.  The shell scripts below remain the reference definitions of each suite.
+cd bench && sh stress.sh                                   # differential oracle -> ALL CLEAN
 sh stress_buf.sh                                           # same, vs ../build/sqlite3_buf
 BF_GROUP=8 sh stress_buf.sh                                # ... with group commit on
 BF_PROMOTION=100 sh stress_buf.sh                          # ... with read promotion at max

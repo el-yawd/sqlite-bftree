@@ -530,6 +530,15 @@ struct BfCache {
   ** the cache refuses is counted as dropped, which must stay 0.
   ** nRollbackRehydrate counts rollbacks that rebuilt the cache that way
   ** instead of just emptying it; nClearLogged the CLEAR ops written. */
+  /* Read-promotion coin (xorshift32).  Deterministic on purpose: it used to
+  ** be sqlite3_randomness, seeded from the OS, so the SAME script promoted
+  ** different rows on every run -- a cache-state-dependent bug then showed up
+  ** in 9 of 40 runs, could not be minimised, and a green differential run
+  ** proved less than it seemed.  0 means "not seeded yet". */
+  u32 promoteRng;
+  u64 nStaleCacheDrop;      /* write-through could not cache the new value,
+                            ** so the leaf's clean records were dropped */
+
   u64 nReplayApplied;
   u64 nReplaySuperseded;
   u64 nReplayTorn;
