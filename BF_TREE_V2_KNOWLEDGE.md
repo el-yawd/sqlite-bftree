@@ -115,6 +115,13 @@ See `BF_TREE_V2_PLAN.md` for the full target. Essentials:
   marker; **rollback/savepoint** truncate the WAL tail + drop matching dirty records (no
   flush-at-savepoint-open dance — records were never on the leaf).
 - **Durability configurable** via `PRAGMA synchronous`: group-commit (~1 ms) vs strict per-commit.
+- **As built (2026-09-24), where it differs from the above.**  Records live in the mini-page
+  cache until a flush; the log is read only at recovery and at ROLLBACK, which rebuilds the
+  cache from it (clear, then replay WAL ops → staged batches → open group batch).  Replay order
+  against page images is explicit: a flush's commit logs `CLEAR(leaf)` and replay starts each
+  leaf after its last CLEAR.  It cannot be inferred from page images, because a flush writes a
+  leaf's records wherever their keys live *now*, which after a split is another leaf.  Ops
+  carry their frame number, so a torn tail is pruned.  Savepoints still flush on open.
 - **v1 scope:** rowid tables, primary B-tree only. Secondary indexes etc. stay write-through.
 
 ---

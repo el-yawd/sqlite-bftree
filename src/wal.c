@@ -558,6 +558,7 @@ struct Wal {
   u64 nBfRecFrame;          /* Record-batch frames written to the WAL */
   u64 nBfPageFrame;         /* Page-image frames written to the WAL */
   u64 nBfCommit;            /* Commit frames (transactions) written to the WAL */
+  u8 bBfPrune;              /* pBfWal may hold ops past mxFrame (after undo) */
 #endif
 #ifdef SQLITE_USE_SEH
   u32 lockMask;              /* Mask of locks held */
@@ -1080,16 +1081,19 @@ static int walDecodeFrame(
 ** leaf-pgno -> ordered-record-ops index
 ** that the reader/checkpoint path replays onto base pages.  The index is
 ** allocated lazily on the first record frame seen.  aData points at the
-** szPage-byte frame payload.  Returns SQLITE_OK, or SQLITE_NOMEM_BKPT /
+** szPage-byte frame payload, iFrame is the frame that carries it: that is how
+** an op past the committed end of the log (a torn tail, or frames a rollback
+** discarded) is recognised and pruned.  Returns SQLITE_OK, or SQLITE_NOMEM_BKPT /
 ** SQLITE_CORRUPT_BKPT on an unallocatable or malformed payload.
 */
-static int walBfIngestRecordFrame(Wal *pWal, const u8 *aData){
+static int walBfIngestRecordFrame(Wal *pWal, const u8 *aData, u32 iFrame){
   int rc;
   if( pWal->pBfWal==0 ){
     pWal->pBfWal = sqlite3BfWalIndexNew();
     if( pWal->pBfWal==0 ) return SQLITE_NOMEM_BKPT;
   }
-  rc = sqlite3BfWalIndexAddFrame(pWal->pBfWal, aData, (int)pWal->szPage);
+  rc = sqlite3BfWalIndexAddFrame(pWal->pBfWal, aData, (int)pWal->szPage,
+                                 iFrame);
   if( rc==BFWAL_NOMEM ) return SQLITE_NOMEM_BKPT;
   if( rc!=BFWAL_OK ) return SQLITE_CORRUPT_BKPT;
   return SQLITE_OK;
@@ -1567,7 +1571,7 @@ static int walIndexRecover(Wal *pWal){
           ** be entered into the pgno->frame hash; its ops feed the BF record
           ** index instead.  The frame still counts toward mxFrame and can carry
           ** the nTruncate commit marker, handled below. */
-          rc = walBfIngestRecordFrame(pWal, aData);
+          rc = walBfIngestRecordFrame(pWal, aData, iFrame);
           if( rc!=SQLITE_OK ) break;
         }else
 #endif
@@ -1631,6 +1635,12 @@ finished:
   if( rc==SQLITE_OK ){
     volatile WalCkptInfo *pInfo;
     int i;
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* The scan ingested every VALID record frame, including a torn tail: the
+    ** record frames of a commit whose final frame never reached the disk.  That
+    ** transaction did not commit, so its ops must not be replayed. */
+    sqlite3BfWalIndexPrune(pWal->pBfWal, pWal->hdr.mxFrame);
+#endif
     pWal->hdr.aFrameCksum[0] = aFrameCksum[0];
     pWal->hdr.aFrameCksum[1] = aFrameCksum[1];
     walIndexWriteHdr(pWal);
@@ -2219,6 +2229,16 @@ static void walRestartHdr(Wal *pWal, u32 salt1){
   u32 *aSalt = pWal->hdr.aSalt;   /* Big-endian salt values */
   pWal->nCkpt++;
   pWal->hdr.mxFrame = 0;
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* A restart happens only once every frame is backfilled, and BF's checkpoint
+  ** materialised every logged record into a page image first, so the record
+  ** ops describe nothing the database file lacks.  Keeping them would be worse
+  ** than useless: the next generation reuses frame numbers from 1, so a
+  ** rollback's replay would order these old ops against unrelated new frames. */
+  sqlite3BfWalIndexFree(pWal->pBfWal);
+  pWal->pBfWal = 0;
+  pWal->bBfPrune = 0;
+#endif
   sqlite3Put4byte((u8*)&aSalt[0], 1 + sqlite3Get4byte((u8*)&aSalt[0]));
   memcpy(&pWal->hdr.aSalt[1], &salt1, 4);
   walIndexWriteHdr(pWal);
@@ -3778,6 +3798,9 @@ int sqlite3WalBeginWriteTransaction(Wal *pWal){
   /* Cannot start a write transaction without first holding a read
   ** transaction. */
   assert( pWal->readLock>=0 );
+#ifndef SQLITE_OMIT_BF_CACHE
+  sqlite3WalBfPrune(pWal);   /* before any frame number can be reused */
+#endif
   assert( pWal->writeLock==0 && pWal->iReCksum==0 );
 
   if( pWal->readOnly ){
@@ -3868,6 +3891,15 @@ int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
         rc = xUndo(pUndoCtx, walFramePgno(pWal, iFrame));
       }
       if( iMax!=pWal->hdr.mxFrame ) walCleanupHash(pWal);
+#ifndef SQLITE_OMIT_BF_CACHE
+      /* Record ops carried by the discarded frames are no longer in the log.
+      ** Do not drop them yet: they came from the group-commit batch, i.e. from
+      ** transactions that DID commit, and the btree rollback rehydrates the
+      ** record cache from them before calling sqlite3WalBfPrune.  If nothing
+      ** does, the next write transaction prunes them before a frame number
+      ** can be reused. */
+      if( iMax!=pWal->hdr.mxFrame && pWal->pBfWal ) pWal->bBfPrune = 1;
+#endif
     }
     SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
     pWal->iReCksum = 0;
@@ -3921,6 +3953,12 @@ int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
     if( pWal->iReCksum>pWal->hdr.mxFrame ){
       pWal->iReCksum = 0;
     }
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* Unlike a full rollback, nothing needs these ops afterwards: the
+    ** savepoint's opening flush put every dirty record into base pages the
+    ** savepoint does not undo, so ops staged after it are already there. */
+    sqlite3BfWalIndexPrune(pWal->pBfWal, pWal->hdr.mxFrame);
+#endif
   }
 
   return rc;
@@ -4258,6 +4296,46 @@ static int walFrames(
   szFrame = szPage + WAL_FRAME_HDRSIZE;
 
 #ifndef SQLITE_OMIT_BF_CACHE
+  /* Clear the remnants of a dead writer BEFORE writing, not in the middle.
+  **
+  ** walIndexAppend() detects an uncommitted tail left in the wal-index by a
+  ** writer that died (recovery indexes every valid frame, torn tail included)
+  ** by finding the slot it is about to fill already set, and then runs
+  ** walCleanupHash(), which drops every entry past hdr.mxFrame.  That works for
+  ** stock SQLite because such a tail is contiguous, so the FIRST frame of the
+  ** next transaction always finds its slot set.  Record frames break the
+  ** premise: they occupy a slot without indexing it.  When the dead writer's
+  ** first frame was a record frame, the next transaction's first page frame
+  ** finds an empty slot and appends; its SECOND frame finds the stale entry and
+  ** cleans -- with hdr.mxFrame not yet advanced, so the cleanup also deletes the
+  ** entry just appended.  A checkpoint then backfills that page from an older
+  ** frame.  Found by the crash oracle: a crash mid-commit, recovery, and the
+  ** close-time checkpoint left page 1 one version stale ("invalid page number
+  ** 151" against a 150-page header).
+  **
+  ** So probe exactly the slots this call will write (record frames, pages, and
+  ** a margin for sync padding) and clean first if any holds a stale entry.  Only
+  ** the block holding hdr.mxFrame can be affected: a later block is zeroed by
+  ** whichever frame lands on its first slot. */
+  if( iFrame>0 ){
+    WalHashLoc sLoc;
+    u32 nNew = (u32)pWal->nBfStage + 32;
+    for(p=pList; p; p=p->pDirty) nNew++;
+    rc = walHashGet(pWal, walFramePage(iFrame), &sLoc);
+    if( rc!=SQLITE_OK ) return rc;
+    {
+      u32 f;
+      u32 iBlockEnd = sLoc.iZero + (walFramePage(iFrame)==0 ?
+                                    HASHTABLE_NPAGE_ONE : HASHTABLE_NPAGE);
+      for(f=iFrame+1; f<=iFrame+nNew && f<=iBlockEnd; f++){
+        if( sLoc.aPgno[f - sLoc.iZero - 1] ){
+          walCleanupHash(pWal);
+          break;
+        }
+      }
+    }
+  }
+
   /* Emit any staged BF record-batch frames first, as non-commit frames of this
   ** same WAL transaction (the trailing page-image frame from pList carries the
   ** nTruncate commit marker; sqlite3PagerCommitPhaseOne guarantees at least one
@@ -4296,7 +4374,7 @@ static int walFrames(
         rc = walWriteToLog(&w, aBody, szPage, iOffset+sizeof(aRecHdr));
       }
       if( rc==SQLITE_OK ){
-        rc = walBfIngestRecordFrame(pWal, aBody);
+        rc = walBfIngestRecordFrame(pWal, aBody, iFrame);
         pWal->nBfRecFrame++;
         if( nRecTrunc ) pWal->nBfCommit++;   /* this frame IS the commit */
       }
@@ -4575,6 +4653,40 @@ void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit){
 */
 BfWalIndex *sqlite3WalBfIndex(Wal *pWal){
   return pWal ? pWal->pBfWal : 0;
+}
+
+/* The last frame of this connection's snapshot (committed log end). */
+u32 sqlite3WalBfMxFrame(Wal *pWal){
+  return pWal ? pWal->hdr.mxFrame : 0;
+}
+
+/* True iff a rollback left record ops past mxFrame that are not pruned yet. */
+int sqlite3WalBfPrunePending(Wal *pWal){
+  return pWal!=0 && pWal->bBfPrune;
+}
+
+/* Drop record ops left past mxFrame by a rollback (sqlite3WalUndo). */
+void sqlite3WalBfPrune(Wal *pWal){
+  if( pWal==0 || !pWal->bBfPrune ) return;
+  sqlite3BfWalIndexPrune(pWal->pBfWal, pWal->hdr.mxFrame);
+  pWal->bBfPrune = 0;
+}
+
+/*
+** Hand the staged-but-unwritten record payloads to the caller, who now owns
+** them (each szPage bytes, freed with sqlite3_free) and must free the array.
+** Used by rollback: these are group-commit batches of transactions that DID
+** commit, which the rollback is about to discard with its own frames.
+*/
+void sqlite3WalBfStageTake(Wal *pWal, u8 ***papStage, int *pnStage){
+  *papStage = 0;
+  *pnStage = 0;
+  if( pWal==0 || pWal->nBfStage==0 ) return;
+  *papStage = pWal->apBfStage;
+  *pnStage = pWal->nBfStage;
+  pWal->apBfStage = 0;
+  pWal->nBfStage = 0;
+  pWal->nBfStageAlloc = 0;
 }
 #endif /* SQLITE_OMIT_BF_CACHE */
 

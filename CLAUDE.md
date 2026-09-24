@@ -27,11 +27,14 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
 ## Locked design decisions
 - **One** record-granular **physiological WAL** (extend SQLite's WAL frame format): BF
   rowid-table leaf mutations log as `[leafPgno, rootPgno, op, key, val]`; everything else stays page-image
-  frames. No sidecar / two-log design.
+  frames. No sidecar / two-log design.  Payload **v3** (2026-09-24) adds op `CLEAR`: the commit
+  whose page images absorbed a leaf's buffered records says so, and replay starts that leaf
+  after it.  Never infer that from page images instead -- see `BF_TREE_V2_PLAN.md` D1.
 - **Configurable durability**: group-commit (~1 ms, paper-faithful) *and* strict per-commit
   fsync via `PRAGMA synchronous`; measure both.  **Not yet what the code does** --
-  `bf_group_commit=N` is bounded *deferred* durability (`bf_btree.c:583`: the first N-1
-  commits stage nothing and return).  See `BF_TREE_V2_PLAN.md` item D2.
+  `bf_group_commit=N` is bounded *deferred* durability (`bf_btree.c:705`: the first N-1
+  *record-only* commits stage nothing and return; a commit that writes pages never defers).
+  See `BF_TREE_V2_PLAN.md` item D2.
 - **Single-writer** (keep `BtShared` serialization); concurrency is a documented non-transfer.
 - v1 scope: rowid tables, primary B-tree only; secondary indexes etc. stay write-through.
 
@@ -54,6 +57,13 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
     single-row commits.  Counters live in `PRAGMA bf_cache_stats`.  Mind the denominator:
     `wal_commits` counts WAL commit EVENTS, not SQL transactions — at group 32 that run's
     983 WAL commits absorbed 30,720 transactions.  See `BF_TREE_V2_PLAN.md` §2.3.
+- **2026-09-24 correctness fixes (uncommitted at time of writing)**: eight D1 bugs, several of
+  them committed-data loss on ordinary SQL -- any full `ROLLBACK` (and `ROLLBACK TO` the
+  savepoint that began the transaction) destroyed committed buffered rows, recovery re-applied
+  flushed ops, recovery replayed torn commits, group commit tore transactions that wrote pages --
+  plus a wal-index torn-tail corruption, reverse range seeks skipping buffered rows, and a
+  `SQLITE_CORRUPT` on index-driven UPDATEs.  Every benchmark number below predates them.
+  `BF_TREE_V2_PLAN.md` D1.
 - **Phase 3 IN PROGRESS**: the measurement campaign.  `bench/harness/` is the
   proper benchmark — a C driver linked against the amalgamation (prepared
   statements, per-op latency histograms, `/proc/self/io` block-layer bytes), a
@@ -122,6 +132,10 @@ BF_GROUP=8 sh stress_buf.sh                                # ... with group comm
 BF_PROMOTION=100 sh stress_buf.sh                          # ... with read promotion at max
 BF_CACHE_SIZE=262144 sh stress_buf.sh                      # ... with a ring small enough to CYCLE
 sh wal_write_amp.sh 5000 200 1                             # write-amplification report
+python3 crash_oracle.py 1 2 3 4 5 6                        # crash-differential oracle (D1)
+BF_GROUP=8 python3 crash_oracle.py 1 2 3                   # ... under group commit
+BF_PRAGMAS="PRAGMA bf_cache_size=262144;" python3 crash_oracle.py 1 2 3   # ... cycling ring
+sh torn_tail_repro.sh; sh recover_repro.sh; sh ckpt_repro.sh   # deterministic crash repros
 
 # Benchmark campaign (bench/harness/README.md documents the methodology)
 sh bench/harness/build_suts.sh --all                       # every SUT, one amalgamation

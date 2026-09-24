@@ -188,7 +188,7 @@ int sqlite3PCachePercentDirty(PCache*);
 ** as the global pcache2 provider. */
 sqlite3_pcache *sqlite3PcacheGetUnderlying(PCache *p);
 
-#ifdef SQLITE_DIRECT_OVERFLOW_READ
+#if defined(SQLITE_DIRECT_OVERFLOW_READ) || !defined(SQLITE_OMIT_BF_CACHE)
 int sqlite3PCacheIsDirty(PCache *pCache);
 #endif
 

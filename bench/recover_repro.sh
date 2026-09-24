@@ -1,39 +1,25 @@
 #!/bin/sh
 # D1 oracle: what does BF crash recovery leave behind?
 #
-# RESULT, 2026-09-21 -- THIS FINDS A REAL BUG.  BF crash recovery leaves a
-# STRUCTURALLY CORRUPT B-TREE:
+# STATUS: CLEAN since 2026-09-22.  Kept as a regression test for the bug it
+# found on 2026-09-21: BF crash recovery left a STRUCTURALLY CORRUPT B-tree
 #
-#   PRAGMA integrity_check  ->  *** in database main ***
-#                               Tree 2 page 2 cell 24: Child page depth differs
+#   PRAGMA integrity_check  ->  Tree 2 page 2 cell 24: Child page depth differs
 #
-# and it is ours, established by three controls:
+# with every committed row present (a tree-shape defect, not data loss); stock
+# SQLite under the identical crash pattern, and the same workload with a clean
+# close, were both clean.  Root cause: WAL payload v1 logged only the target
+# leaf, so a recovered mini-page took the LEAF as its table root and the
+# checkpoint's materialisation opened a write cursor on it; the first split then
+# built a second tree beneath a child of the real root.  Fixed by payload v2,
+# which logs [leafPgno, rootPgno, op, key, val] (BF_TREE_V2_PLAN.md D1).
 #
-#   * every committed row is present and readable (count is exact), so this is
-#     a tree-shape defect, not data loss;
-#   * stock SQLite under the IDENTICAL crash pattern is clean in all three
-#     scenarios -- run this script with ../build/sqlite3_stock to see it;
-#   * the same workload with a CLEAN close is clean, in-session and on reopen.
-#     The crash is necessary.
+# (An earlier version of this header said the corruption was present before any
+# checkpoint.  That was wrong: it is the checkpoint's materialisation that
+# performs the bad split.)
 #
-# The corruption is present immediately after recovery, BEFORE any checkpoint,
-# so the checkpoint is not the cause.  Root cause not yet identified; the
-# replay path is sqlite3BfCacheReplayWal -> bfReplayOnePage (src/bf_cache.c),
-# which writes recovered records into the CACHE and never touches base, so the
-# suspect is the state of the base tree the crash left on disk -- BF's commit
-# writes record frames and no base pages, and the base tree only advances
-# through incremental flushes.
-#
-# It also answers the question this script was originally written to ask -- the
-# documented leaf->root gap at sqlite3BfCacheReplayWal:
-#
-#   KNOWN GAP (leaf->root): a mini-page created here has no rootPgno (the WAL
-#   stores only the leaf pgno) ... a checkpoint that must flush a
-#   purely-recovered record to base needs the owning table root
-#
-# with bfFlushAllCallback refusing exactly that (`if( pMini->rootPgno<=1 )`).
-# Answer: no rows are lost to it in any of the three orders below.  That gap is
-# NOT the problem; the tree shape is.
+# Broader crash coverage -- multiple tables, rollbacks, torn commits, a crash
+# DURING the checkpoint, group commit -- lives in bench/crash_oracle.py.
 #
 # Three scenarios, each a separate database, each gated on row count AND
 # integrity_check:

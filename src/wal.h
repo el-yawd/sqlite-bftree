@@ -51,6 +51,10 @@
 #  define sqlite3WalBfIndex(x)                   0
 #  define sqlite3WalBfFrameStats(w,x,y,z)
 #  define sqlite3WalBfHasStaged(x)               0
+#  define sqlite3WalBfMxFrame(x)                 0
+#  define sqlite3WalBfPrune(x)
+#  define sqlite3WalBfPrunePending(x)            0
+#  define sqlite3WalBfStageTake(x,y,z)           (*(y)=0, *(z)=0)
 # endif
 # undef SQLITE_USE_SEH
 #else
@@ -120,6 +124,11 @@ BfWalIndex *sqlite3WalBfIndex(Wal *pWal);
 void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
 /* True iff record payloads are staged for the pending commit. */
 int sqlite3WalBfHasStaged(Wal *pWal);
+/* Record-op ordering and rollback support (see wal.c). */
+u32  sqlite3WalBfMxFrame(Wal *pWal);
+void sqlite3WalBfPrune(Wal *pWal);
+int  sqlite3WalBfPrunePending(Wal *pWal);
+void sqlite3WalBfStageTake(Wal *pWal, u8 ***papStage, int *pnStage);
 #endif
 
 /* Copy pages from the log to the database file */ 

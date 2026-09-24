@@ -235,6 +235,28 @@ static int bfApplyOneRecord(void *pCtx, const u8 *pKey, int nKey,
 ** Returns SQLITE_OK on success (even if some records couldn't be applied —
 ** those remain dirty and will be retried on the next flush).
 */
+/*
+** Remember that a flush applied leaf `leaf`'s buffered records to base pages in
+** this transaction, so its commit logs a BFWAL_OP_CLEAR (bf_wal.h) and replay
+** never re-applies them over the pages that now hold them.  WAL mode only:
+** without a record log there is nothing to supersede.  If the list cannot
+** grow, bFlushedOom makes the commit fail (sqlite3BfBtreeLogAllDirty): a commit
+** that logged only SOME of its CLEARs would leave replayable ops behind a flush.
+*/
+static void bfNoteFlushed(BfCache *pBf, Btree *pBtree, u32 leaf, u32 root){
+  if( leaf==0 || root<=1 ) return;
+  if( !sqlite3PagerIsWal(pBtree->pBt->pPager) ) return;
+  if( pBf->nFlushed+2 > pBf->nFlushedAlloc ){
+    int nNew = pBf->nFlushedAlloc ? pBf->nFlushedAlloc*2 : 32;
+    u32 *aNew = (u32*)sqlite3_realloc64(pBf->aFlushed, (u64)nNew*sizeof(u32));
+    if( aNew==0 ){ pBf->bFlushedOom = 1; return; }
+    pBf->aFlushed = aNew;
+    pBf->nFlushedAlloc = nNew;
+  }
+  pBf->aFlushed[pBf->nFlushed++] = leaf;
+  pBf->aFlushed[pBf->nFlushed++] = root;
+}
+
 static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
                                BfMiniPage *pMini){
   BtCursor tmpCur;
@@ -301,6 +323,7 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
 
   /* Mark applied records clean; leave failed ones dirty for retry. */
   if( ctx.nErrors==0 ){
+    bfNoteFlushed(pBf, pBtree, pMini->ownerPgno, (u32)pgnoRoot);
     sqlite3BfMiniPageMarkClean(pMini);
     pBf->nMergeToBase += (u64)ctx.nApplied;
     if( pMini->flags & BF_MINI_F_STALE ){
@@ -565,6 +588,58 @@ static int bfLogAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
 }
 
 /*
+** Append a BFWAL_OP_CLEAR for every leaf this transaction flushed, and empty
+** the list.  Returns how many were appended (0 on error: ctx->rc is set).
+**
+** They go into the batch AHEAD of the commit's own dirty records: a record
+** buffered after the flush, in the same transaction, is newer than the page
+** image and must survive replay, while every op already in the log -- earlier
+** commits, and group batches a flush staged into this commit -- is older.
+*/
+static int bfLogClears(BfCache *pBf, BfLogAllCtx *ctx){
+  int i, n = 0;
+  for(i=0; i+1<pBf->nFlushed && ctx->rc==SQLITE_OK; i+=2){
+    BfWalRec rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.pgno = pBf->aFlushed[i];
+    rec.rootPgno = pBf->aFlushed[i+1];
+    rec.op = BFWAL_OP_CLEAR;
+    bfLogAppendRec(ctx, &rec);
+    n++;
+  }
+  pBf->nFlushed = 0;
+  if( ctx->rc!=SQLITE_OK ) return 0;
+  pBf->nClearLogged += (u64)n;
+  return n;
+}
+
+/*
+** The checkpoint's materialisation commit (bfForceBaseFlush) takes the flush
+** branch, not sqlite3BfBtreeLogAllDirty, yet its flush supersedes every logged
+** op just the same -- and if the checkpoint then cannot reset the log (a
+** reader pins it, or the process dies before backfill) those ops are still
+** replayable.  So it logs its CLEARs too, staged immediately.
+*/
+int sqlite3BfBtreeLogFlushMarks(Btree *p){
+  BfCache *pBf;
+  BfLogAllCtx ctx;
+  BfGroup *g;
+  if( !p || !p->pBt ) return SQLITE_OK;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( !pBf || pBf->nFlushed==0 ) return SQLITE_OK;
+  if( pBf->bFlushedOom ) return SQLITE_NOMEM_BKPT;
+  g = bfGroupGet(pBf, pBf->szPage);
+  if( !g ) return SQLITE_NOMEM_BKPT;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.pPager = p->pBt->pPager;
+  ctx.pGroup = g;
+  ctx.rc     = SQLITE_OK;
+  bfLogClears(pBf, &ctx);
+  bfGroupStage(g, ctx.pPager, &ctx.rc);
+  return ctx.rc;
+}
+
+/*
 ** Gather every dirty-but-unlogged BF record across all mini-pages into WAL
 ** record-batch payloads and stage them for the pending commit.  Does NOT touch
 ** the base B-tree.  Returns SQLITE_OK, or an error (NOMEM/CORRUPT) in which case
@@ -579,11 +654,14 @@ int sqlite3BfBtreeLogAllDirty(Btree *p){
   BfLogAllCtx ctx;
   BfGroup *g;
   int nGroup;
+  int nClear;
 
   if( !p || !p->pBt ) return SQLITE_OK;
   pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
   if( !pBf ) return SQLITE_OK;
-  if( !pBf->bDirtyInserts ) return SQLITE_OK;    /* nothing buffered to log */
+  /* Nothing buffered and nothing flushed: nothing to log. */
+  if( !pBf->bDirtyInserts && pBf->nFlushed==0 ) return SQLITE_OK;
+  if( pBf->bFlushedOom ) return SQLITE_NOMEM_BKPT;   /* see bfNoteFlushed */
 
   g = bfGroupGet(pBf, pBf->szPage);
   if( !g ) return SQLITE_NOMEM_BKPT;
@@ -592,6 +670,9 @@ int sqlite3BfBtreeLogAllDirty(Btree *p){
   ctx.pPager = p->pBt->pPager;
   ctx.pGroup = g;
   ctx.rc     = SQLITE_OK;
+
+  nClear = bfLogClears(pBf, &ctx);
+  if( ctx.rc!=SQLITE_OK ) return ctx.rc;
 
   /* Three tiers, narrowest first.  The unlogged list holds what THIS
   ** transaction dirtied; the dirty list holds every mini-page not yet in its
@@ -607,10 +688,22 @@ int sqlite3BfBtreeLogAllDirty(Btree *p){
 
   /* Group commit: hold the batch open across up to nGroup transactions.  A
   ** deferred commit stages nothing, so sqlite3PagerCommitPhaseOne sees no
-  ** staged payload and no dirty page and writes zero bytes for it. */
+  ** staged payload and no dirty page and writes zero bytes for it.
+  **
+  ** Only a RECORD-ONLY commit may be deferred.  One that also dirtied pages
+  ** (a secondary index -- write-through by design -- an overflow payload, any
+  ** page-path write) writes those pages NOW; deferring its records would split
+  ** the transaction across two durability points, and a crash in between kept
+  ** the page half.  The crash oracle measured exactly that at group 8: 22 of 40
+  ** runs recovered a state no commit prefix produces, most with
+  ** "wrong # of entries in index".  So such a commit takes the whole open batch
+  ** with it, which also keeps every earlier deferred commit ahead of it.  A
+  ** commit carrying CLEARs flushed pages by definition, possibly already
+  ** spilled, so it is never deferred either. */
   nGroup = sqlite3BfGroupCommitTxns();
   g->nTxn++;
-  if( nGroup<=1 || g->nTxn>=nGroup ){
+  if( nGroup<=1 || g->nTxn>=nGroup || nClear>0
+   || sqlite3PagerBfHasDirty(ctx.pPager) ){
     bfGroupStage(g, ctx.pPager, &ctx.rc);
   }else{
     g->nDeferred++;
@@ -851,6 +944,18 @@ void sqlite3BfBtreeDirtyEvictStat(Btree *p, u64 *pnFlush, u64 *pnRetryOk,
 
 /* Cold cache records shed by size upgrades -- the frequent copy, and the one
 ** that actually returns ring space.  Read it beside `upgrades`. */
+/* D1 replay-ordering counters, in the order of the stats rows. */
+void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  aOut[0] = pBf ? pBf->nReplayApplied : 0;
+  aOut[1] = pBf ? pBf->nReplaySuperseded : 0;
+  aOut[2] = pBf ? pBf->nReplayTorn : 0;
+  aOut[3] = pBf ? pBf->nReplayDropped : 0;
+  aOut[4] = pBf ? pBf->nRollbackRehydrate : 0;
+  aOut[5] = pBf ? pBf->nClearLogged : 0;
+}
+
 void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
   BfCache *pBf = 0;
   if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
@@ -865,7 +970,127 @@ void sqlite3BfBtreeClearCache(Btree *p){
   sqlite3BfMapIterate(pBf, bfClearOneEntry, NULL);
   pBf->bDirtyInserts = 0;  /* rolled-back inserts discarded */
   sqlite3BfUnlogListReset(pBf);   /* the pages it named no longer exist */
+  /* NOT the flushed-leaf list: a SAVEPOINT rollback also lands here, and the
+  ** flushes it recorded before the savepoint opened are still in base pages
+  ** the savepoint does not revert, so their CLEARs must still be logged.
+  ** Dropping them let a later page-path write of the same row reach the log
+  ** with no CLEAR ahead of it, and the next ROLLBACK's replay resurrected
+  ** the pre-flush value.  Only a whole-transaction rollback resets the list
+  ** (sqlite3BfBtreeRollbackRehydrate). */
 }
+
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+/* Mark every dirty record logged: used right after a replay of ops that are all
+** still in the WAL, so the next commit does not write them a second time. */
+static int bfMarkLoggedCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
+  BfMiniPage *pMini;
+  int i, n;
+  UNUSED_PARAMETER(pCtx);
+  if( pgno<=1 || pEntry->locType!=BF_LOC_MINI ) return 0;
+  pMini = (BfMiniPage*)pEntry->pPage;
+  if( !pMini ) return 0;
+  n = sqlite3BfMiniPageCount(pMini);
+  for(i=0; i<n; i++){
+    if( sqlite3BfMiniPageDirtyUnloggedAt(pMini, i, 0, 0, 0, 0, 0) ){
+      sqlite3BfMiniPageMarkLoggedAt(pMini, i);
+    }
+  }
+  pMini->flags &= ~BF_MINI_F_UNLOGGED;
+  return 0;
+}
+
+/*
+** Full-transaction ROLLBACK in WAL mode (D1).
+**
+** Emptying the cache, which is all sqlite3BfBtreeClearCache does, was right in
+** Phase 1, when the cache only ever duplicated base pages.  Since Phase 2 a
+** COMMITTED record lives in its mini-page and its WAL record frame until a
+** checkpoint materialises it, so every ROLLBACK -- including BEGIN;ROLLBACK
+** with no writes, a failed COMMIT, and an autocommit statement that fails a
+** constraint -- silently discarded committed rows: invisible at once, and gone
+** for good at the next clean close, whose checkpoint materialises the now-empty
+** cache and resets the log.
+**
+** The rolled-back transaction may have changed the mini-pages in any way (new
+** records, overwritten committed ones, flushes that marked committed records
+** clean in base pages the rollback just reverted), and nothing records what
+** they held before it.  The log does.  So: empty the cache, then rebuild its
+** committed dirty state from the three places committed records live, in log
+** order:
+**
+**   1. the WAL's record ops, minus those a newer page image supersedes;
+**   2. payloads staged in THIS transaction by a mid-transaction flush -- earlier
+**      commits' group batches, which the rollback would otherwise free unwritten;
+**   3. the open group-commit batch, still in memory.
+**
+** Records rebuilt from the WAL are marked logged again -- they are in the log --
+** unless the rollback discarded frames that carried some of them; records from
+** (2) and (3) are not in the log and stay unlogged for the next commit.  apStage
+** is consumed (freed) in every case.
+*/
+int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage, int nStage){
+  BfCache *pBf = 0;
+  BfGroup *g;
+  BfWalIndex *pTmp = 0;
+  int rc = SQLITE_OK;
+  int i;
+
+  if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf ){
+    int bAllDurable = 0;
+    sqlite3BfBtreeClearCache(p);
+    pBf->nFlushed = 0;       /* every flush of this txn was rolled back too */
+    pBf->bFlushedOom = 0;
+    rc = sqlite3PagerBfReplayLog(p->pBt->pPager, pBf, &bAllDurable);
+    if( rc==SQLITE_OK && bAllDurable ){
+      sqlite3BfMapIterate(pBf, bfMarkLoggedCallback, NULL);
+      sqlite3BfUnlogListReset(pBf);
+    }
+    g = (BfGroup*)pBf->pGroupCommit;
+    if( rc==SQLITE_OK && (nStage>0 || (g && g->nOpen>0)) ){
+      pTmp = sqlite3BfWalIndexNew();
+      if( pTmp==0 ) rc = SQLITE_NOMEM_BKPT;
+    }
+    for(i=0; rc==SQLITE_OK && pTmp && i<nStage; i++){
+      if( sqlite3BfWalIndexAddFrame(pTmp, apStage[i], pBf->szPage,
+                                    0xffffffffu)!=BFWAL_OK ){
+        rc = SQLITE_CORRUPT_BKPT;
+      }
+    }
+    if( rc==SQLITE_OK && pTmp && g && g->nOpen>0 ){
+      u8 *aCopy = (u8*)sqlite3_malloc(g->szPage);
+      if( aCopy==0 ){
+        rc = SQLITE_NOMEM_BKPT;
+      }else{
+        BfWalBatch b = g->batch;       /* finish a COPY: the batch stays open */
+        memcpy(aCopy, g->aBuf, g->szPage);
+        b.aBuf = aCopy;
+        sqlite3BfWalBatchFinish(&b);
+        if( sqlite3BfWalIndexAddFrame(pTmp, aCopy, g->szPage,
+                                      0xffffffffu)!=BFWAL_OK ){
+          rc = SQLITE_CORRUPT_BKPT;
+        }
+        sqlite3_free(aCopy);
+      }
+    }
+    if( rc==SQLITE_OK && pTmp ){
+      rc = sqlite3BfCacheReplayWal(pBf, pTmp, 0xffffffffu, 1);
+    }
+    if( rc==SQLITE_OK && g ){
+      /* Its records are dirty-unlogged in the cache again and will be logged
+      ** by the next commit; keeping the batch too would log them twice. */
+      g->nOpen = 0;
+      g->nTxn = 0;
+      sqlite3BfWalBatchInit(&g->batch, g->aBuf, g->szPage);
+    }
+    pBf->nRollbackRehydrate++;
+  }
+  sqlite3BfWalIndexFree(pTmp);
+  for(i=0; i<nStage; i++) sqlite3_free(apStage[i]);
+  sqlite3_free(apStage);
+  return rc;
+}
+#endif /* SQLITE_BF_INSERT_BUFFERING */
 
 /* -------------------------------------------------------------------------
 ** Public btree hooks

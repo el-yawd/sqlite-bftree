@@ -522,6 +522,31 @@ struct BfCache {
                             ** the rest were excluded by the buffering gate in
                             ** sqlite3BtreeInsert before BF was even asked */
   u64 nUpgradeShed;         /* Cold cache records dropped by size upgrades */
+
+  /* Record-op replay ordering (D1).  Replay rebuilds the cache from the WAL's
+  ** record ops at recovery and after a rollback.  An op is skipped when a later
+  ** CLEAR of its leaf says a flush already put it in base pages (superseded),
+  ** or when its frame is past the committed end of the log (torn tail); an op
+  ** the cache refuses is counted as dropped, which must stay 0.
+  ** nRollbackRehydrate counts rollbacks that rebuilt the cache that way
+  ** instead of just emptying it; nClearLogged the CLEAR ops written. */
+  u64 nReplayApplied;
+  u64 nReplaySuperseded;
+  u64 nReplayTorn;
+  u64 nReplayDropped;       /* replayed ops the cache REFUSED (full mini-page):
+                            ** nonzero means a committed record was lost */
+  u64 nRollbackRehydrate;
+  u64 nClearLogged;
+
+  /* Leaves whose buffered records a flush applied to base pages in the
+  ** CURRENT write transaction, as (leaf, root) pairs; the commit logs a
+  ** BFWAL_OP_CLEAR for each (sqlite3BfBtreeLogAllDirty) and empties the list,
+  ** a rollback just empties it.  WAL mode only.  bFlushedOom: the list could
+  ** not grow, so the commit must fail rather than log an incomplete set. */
+  u32 *aFlushed;
+  int nFlushed;
+  int nFlushedAlloc;
+  u8 bFlushedOom;
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
@@ -619,10 +644,13 @@ SQLITE_PRIVATE int sqlite3BfRecordRead(BfCache *pCache, u32 pgno,
     const void *pKey, int nKey, void *pBuf, int *pnBuf);
 SQLITE_PRIVATE int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     const void *pKey, int nKey, const void *pVal, int nVal, u8 opType);
-/* Phase 2 (WAL) recovery: replay the WAL's rebuilt pgno->ops index back into
-** the mini-page cache (records written back dirty, unlogged).  See bf_cache.c. */
+/* Phase 2 (WAL) recovery / rollback: replay a pgno->ops index back into the
+** mini-page cache (records written back dirty, unlogged).  Each leaf starts
+** after its last CLEAR; ops past mxFrame are skipped unless bKeepBeyond.  See
+** bf_cache.c. */
 typedef struct BfWalIndex BfWalIndex;
-SQLITE_PRIVATE int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx);
+SQLITE_PRIVATE int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx,
+    u32 mxFrame, int bKeepBeyond);
 
 /*
 ** Pluggable cache interface for SQLite integration.
@@ -802,6 +830,12 @@ SQLITE_PRIVATE void sqlite3BfBtreeNoteDirtyEvictRetry(BtCursor *pCur);
 SQLITE_PRIVATE void sqlite3BfBtreeDirtyEvictStat(Btree*, u64*, u64*, u64*, u64*);
 /* Discard all BF state for a B-tree (called at rollback). */
 SQLITE_PRIVATE void sqlite3BfBtreeClearCache(Btree *p);
+/* Full ROLLBACK in WAL mode: empty the cache, then rebuild its committed dirty
+** state from the log (consumes apStage).  See bf_btree.c. */
+SQLITE_PRIVATE int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage,
+                                                   int nStage);
+/* Checkpoint's forced-flush commit: log the CLEARs its flush produced. */
+SQLITE_PRIVATE int sqlite3BfBtreeLogFlushMarks(Btree *p);
 
 /*
 ** P1: Record application during merge (Core behavioral alignment).

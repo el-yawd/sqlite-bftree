@@ -45,10 +45,17 @@
 /* Batch-payload header: magic(4) version(2) nRec(2) nUsed(4) = 12 bytes.  op
 ** values reuse the mini-page BFOP_* space; only the dirty ops are ever logged. */
 #define BFWAL_MAGIC     0x42465731u   /* "BFW1" */
-#define BFWAL_VERSION   2
+#define BFWAL_VERSION   3             /* v3: BFWAL_OP_CLEAR (2026-09-24) */
 #define BFWAL_HDRSIZE   12
 #define BFWAL_OP_INSERT 0             /* == BFOP_INSERT */
 #define BFWAL_OP_DELETE 1             /* == BFOP_DELETE (valLen==0) */
+/* "Every earlier op of this leaf is now in base pages": logged by the commit
+** whose page images applied the leaf's buffered records (a flush).  Carries no
+** key and no value.  Replay starts each leaf after its last CLEAR -- the only
+** sound way to order a record op against page images, because a flush writes
+** a leaf's records wherever their keys now live, which after a split need not
+** be that leaf at all. */
+#define BFWAL_OP_CLEAR  2
 
 /* One logical record, as appended by the encoder or yielded by the iterator.
 ** On decode, pKey/pVal point INTO the source buffer (no copy). */
@@ -61,6 +68,8 @@ struct BfWalRec {
   u32       nVal;    /* Value length in bytes (0 for DELETE) */
   const u8 *pKey;    /* Key bytes */
   const u8 *pVal;    /* Value bytes (may be 0 when nVal==0) */
+  u32       iFrame;  /* WAL frame that carried it: set by sqlite3BfWalIndexGet,
+                     ** 0 from the iterator; ignored by the encoder */
 };
 
 /* Encoder over a caller-owned, page-sized buffer. */
@@ -112,14 +121,23 @@ typedef struct BfWalIndex BfWalIndex;
 
 BfWalIndex *sqlite3BfWalIndexNew(void);
 void        sqlite3BfWalIndexFree(BfWalIndex *p);
-int         sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec);
+int         sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec,
+                                    u32 iFrame);
 int         sqlite3BfWalIndexPageCount(BfWalIndex *p, u32 pgno);
 int         sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec);
 
 /* Feed every op of one record-batch frame payload into the index (recovery /
 ** reader walk convenience).  Returns BFWAL_OK, BFWAL_CORRUPT (bad payload), or
 ** BFWAL_NOMEM. */
-int         sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf);
+int         sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf,
+                                      u32 iFrame);
+
+/* Drop every op carried by a frame after mxFrame.  Those frames are no longer
+** part of the log -- a rollback or savepoint undo discarded them, or they are
+** the torn tail of a crashed commit -- and their numbers will be reused by the
+** next frames written, so an op left behind would later be ordered against the
+** wrong page image.  Pages left with no ops keep their (empty) node. */
+void        sqlite3BfWalIndexPrune(BfWalIndex *p, u32 mxFrame);
 
 /* Visit each distinct target pgno held in the index (any order).  The callback
 ** may then walk that page's ops via PageCount/Get.  Iteration stops early if a

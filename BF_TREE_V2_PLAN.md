@@ -41,6 +41,18 @@ tables, bugs to avoid by construction), not a plan, and it is read first.
 
 ## 2. Current state — verified 2026-09-21
 
+> **2026-09-24 — read this box first; it supersedes the D1 state below it.**  A new
+> crash-differential oracle (`bench/crash_oracle.py`) and a full-ROLLBACK generator
+> (`bench/gen_rollback_stress.py`) found **eight correctness bugs, five of them committed-data
+> loss or torn transactions**, all in code committed before today and all invisible to every
+> existing oracle.  All eight are fixed in the **uncommitted** working tree (WAL payload **v3**,
+> `BFWAL_OP_CLEAR`).
+> See the 2026-09-24 entry in §9 for evidence, the D1 item for the per-bug list, and §3.2 for
+> what the write path now does.  **Every throughput and WAL-volume number in this file predates
+> these fixes and is unverified against them** — rollbacks now replay the log, flushes log a
+> CLEAR per leaf, and group commit no longer defers a commit that writes pages.  Nothing has
+> been re-measured (correctness-only gate, §6.1).
+
 ### 2.1 Repository
 
 * Branch `main` at **`b0026ba`** *"ring: file a freed block under a class it actually fits,
@@ -77,7 +89,7 @@ a comment array was repointed.  **No benchmark configuration changed** — in pa
 |---|---|
 | **0** — port the 3 durability-agnostic leaf modules | **DONE** — `bf_mini_page.c`, `bf_circular_buffer.c`, `bf_mapping.c`, `bf_cache.h`, whole-file guarded by `SQLITE_OMIT_BF_CACHE`, inlined into the amalgamation |
 | **1** — read cache + write-through | **DONE** (`8dba75c`) — lifecycle, config/pragmas, `pcache2` activation, btree read hooks, descent shortcut |
-| **2** — record-granular physiological WAL | **DONE** (`3bf3fb2`), **ON by default** (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`) — write-back insert and **delete**, commit-time record logging, recovery replay, checkpoint materialisation, forward and reverse merge scans, merged `Count`, transaction grouping, mini-page compaction. WAL payload v2 persists both leaf and table-root pgno, fixing the 2026-09-22 recovery corruption. **Existing-row UPDATE is NOT buffered** (§3.2, D3a). Two contracts remain open: **D1** (remaining recovery/checkpoint edge cases) and **D2** (what an acknowledged commit guarantees) |
+| **2** — record-granular physiological WAL | **DONE** (`3bf3fb2`), **ON by default** (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`) — write-back insert and **delete**, commit-time record logging, recovery replay, checkpoint materialisation, forward and reverse merge scans, merged `Count`, transaction grouping, mini-page compaction. WAL payload v2 persists both leaf and table-root pgno, fixing the 2026-09-22 recovery corruption; **v3 (2026-09-24, uncommitted)** adds `BFWAL_OP_CLEAR` so replay never re-applies a flushed op, and ROLLBACK rebuilds the cache from the log instead of emptying it. **Existing-row UPDATE is NOT buffered** (§3.2, D3a). Two contracts remain open: **D1** (remaining recovery/checkpoint edge cases) and **D2** (what an acknowledged commit guarantees) |
 | **3** — measurement campaign + reference parity | **IN PROGRESS** — this is where all remaining work in §5 lives |
 | **4** — the faithful file-incompatible branch | not started; §7.3 |
 
@@ -297,6 +309,40 @@ both target leaf and owning table root · a recovery-time pgno→ops index retai
 transaction grouping · checkpoint-time materialisation into page-image frames · record/page
 frame and cache counters.
 
+**Replay ordering and rollback, as of 2026-09-24 (payload v3, uncommitted):**
+
+* **`BFWAL_OP_CLEAR`.**  Every successful mini-page flush in WAL mode records its leaf
+  (`bfNoteFlushed`, `bf_btree.c`); the commit carrying the flush's page images logs a CLEAR per
+  leaf *ahead of* its own dirty records (`bfLogClears`), including the checkpoint's forced-flush
+  commit (`sqlite3BfBtreeLogFlushMarks`).  Replay starts each leaf after its last CLEAR
+  (`bfReplayOnePage`, `bf_cache.c`).  A first design inferred supersession from page images
+  instead and was broken by the crash oracle (§9): a flush writes a leaf's records wherever
+  their keys live *now*, which after a split is another leaf.
+* **Every indexed op carries its WAL frame number.**  Ops past `mxFrame` are the torn tail of a
+  crashed commit and are pruned after recovery (`walIndexRecover`); at a rollback they are
+  committed group batches a spill wrote and are kept, then pruned before any frame number can
+  be reused (`sqlite3WalBfPrune`).  `pBfWal` is cleared at log restart and pruned at savepoint
+  undo.
+* **ROLLBACK rebuilds, it does not empty.**  `sqlite3BfBtreeRollbackRehydrate`: clear the cache,
+  then replay (1) the WAL's ops, (2) payloads staged in the rolled-back transaction, (3) the
+  open group batch — for a full ROLLBACK and for `ROLLBACK TO` the savepoint that began the
+  transaction (`iSavepoint<0`).  Records from (1) are marked logged again unless the rollback
+  discarded frames carrying some; (2) and (3) are re-logged by the next commit.  A rollback of
+  a read transaction touches nothing.  Cost: O(ops in the WAL) per write-transaction rollback.
+  **Unmeasured.**
+* **Group commit defers only record-only commits.**  A commit that dirtied pages, or carries a
+  CLEAR, stages the whole open batch with it (`sqlite3PagerBfHasDirty`).
+* **wal-index**: `walFrames` clears a dead writer's stale hash entries *before* writing when
+  any slot it is about to fill holds one, because record frames leave holes that defeat
+  `walIndexAppend`'s lazy cleanup (`bench/torn_tail_repro.sh`).
+* **Reverse range seeks merge** (`bfMergeSeekRev`, `btree.c`).  They used to fall back to a
+  flush that a read transaction refuses, so `WHERE id<=K ORDER BY id DESC` skipped buffered rows.
+
+These are correctness mechanisms, and they deliberately have **no off switch** — disabling any
+of them re-enables a measured data-loss bug.  Each has a counter in `PRAGMA bf_cache_stats`
+(`replay_applied`, `replay_superseded`, `replay_torn`, `replay_dropped`, `rollback_rehydrate`,
+`clear_logged`); `replay_dropped` must stay 0.
+
 Stops at:
 
 * **existing-row UPDATE is not buffered.**  `btree.c:10604` gates buffering on `loc!=0`, and
@@ -306,11 +352,13 @@ Stops at:
   `BF_ERROR` on a dirty mini-page rather than merging it to base.
 * checkpoint materialises cached records into page-image frames before normal backfill; it
   does not replay record frames directly to their target pages.
-* **`bf_group_commit=N` is bounded deferred durability, not group commit.**  Verified at
-  `bf_btree.c:583-589`: the first N−1 commits increment `nDeferred` and return **without
-  staging anything**, so a crash loses acknowledged transactions in the open group.  This
-  contradicts §4.2's locked decision ("group commit, ~1 ms, paper-faithful"), which specifies
-  a shared flush every committer *waits* for.  Resolving that contradiction is item **D2**.
+* **`bf_group_commit=N` is bounded deferred durability, not group commit.**  The first N−1
+  *record-only* commits increment `nDeferred` and return **without staging anything**, so a
+  crash loses acknowledged transactions in the open group.  This contradicts §4.2's locked
+  decision ("group commit, ~1 ms, paper-faithful"), which specifies a shared flush every
+  committer *waits* for.  Resolving that contradiction is item **D2**.  (Until 2026-09-24 it also
+  deferred the records of commits that wrote pages, tearing those transactions on a crash;
+  fixed, see D1.)
 
 ### 3.3 Reference parity matrix
 
@@ -519,6 +567,9 @@ are the write path and the unswept retention knobs, not the eviction machinery:
    table root, so recovery treated a leaf as a root; the first replay split nested a new tree
    below the real one. Payload v2 persists and restores `rootPgno`; `recover_repro.sh` is clean
    at 250 and 2000 rows in all three checkpoint orders.
+0b. **Eight more D1 correctness bugs — FIXED 2026-09-24, UNCOMMITTED** (several were
+   committed-data loss on ordinary SQL; see D1).  Committing them is the next action once the gate in §9 is
+   green; nothing downstream is quotable on a tree that loses rows on `ROLLBACK`.
 1. **D1 / D2** — the remaining durability contracts. Nothing downstream is quotable until an
    acknowledged commit means something definite.
 2. **H1b** — copy-on-access has been landed and unmeasured since `c99c040`, and §2.4 names
@@ -564,7 +615,7 @@ nothing about them.
 > message proposing exactly that, which is an authorisation but not an explicit one.  Both
 > are plain reverts if the owner disagrees.
 
-### D1 — recovery and checkpoint ownership — **BLOCKING CORRUPTION FIXED 2026-09-22; EDGE COVERAGE OPEN**
+### D1 — recovery and checkpoint ownership — **EIGHT MORE BUGS FOUND AND FIXED 2026-09-24 (UNCOMMITTED); CHECKPOINT DECISION OPEN**
 *From: handoff P1a.*  Source: `bf_cache.c` (`bfReplayOnePage`, `sqlite3BfCacheReplayWal`),
 `btree.c` (`bfCheckpointMaterialize`), `bf_btree.c` (`bfTagLeafRoot`), `wal.c`.
 Repro: **`sh bench/recover_repro.sh`** (its header carries the full evidence).
@@ -593,17 +644,54 @@ Repro: **`sh bench/recover_repro.sh`** (its header carries the full evidence).
 > the root and `bfReplayOnePage` restores it onto the mini-page. The 250- and 2000-row crash
 > reproducers pass all three checkpoint orders.
 
+**2026-09-24: eight more, found by `bench/crash_oracle.py` and `bench/gen_rollback_stress.py`.**
+Every one was in committed code and invisible to every existing oracle.  Each has a
+reproducer that fails on the session-start binary and passes on the fixed one.
+
+| # | bug | severity | reproducer | fix |
+|---|---|---|---|---|
+| 1 | **any full ROLLBACK destroyed committed buffered rows** — `sqlite3BtreeRollback` emptied the record cache; `BEGIN;ROLLBACK` with no writes, a failed `COMMIT`, or an autocommit statement failing a constraint was enough.  Rows vanished at once and for good at the next clean close | **committed-data loss** | 3 rows committed, `BEGIN;ROLLBACK`, reopen → 1 row (the oracles never ran a full ROLLBACK, only `ROLLBACK TO`) | `sqlite3BfBtreeRollbackRehydrate` rebuilds the cache from the log; read-txn rollback touches nothing |
+| 2 | **recovery replayed ops a flush had already put in base** — an UPDATE/DELETE that reached base through the page path came undone at the next checkpoint; `count(*)` double-counted in between | **committed-data loss** after a crash | buffered rows, a bulk insert that flushes them, page-path UPDATE + DELETE, SIGKILL → update reverted, deleted row back, count 2924 for 2903 | `BFWAL_OP_CLEAR` (payload v3), §3.2 |
+| 3 | **recovery replayed the record frames of a torn commit** | atomicity after a crash | `bench/torn_tail_repro.sh` on the old binary: 420 rows for 400 | ops carry their frame; prune past `mxFrame` |
+| 4 | **group commit deferred the records of a commit that also wrote pages** — a crash kept the page half ("wrong # of entries in index") | atomicity, group mode | `BF_GROUP=8 crash_oracle.py`: 22/40 failed | defer only record-only commits |
+| 5 | **a torn tail whose first frame is a record frame** made the next write delete its own wal-index entry; a checkpoint then backfilled a stale page 1 ("invalid page number 151") | file corruption after a crash | `bench/torn_tail_repro.sh` (deterministic; fails without the fix) | stale-slot probe before `walFrames` writes |
+| 6 | **reverse range seeks skipped buffered rows** under a read transaction — `WHERE id<=K ORDER BY id DESC` | wrong query results | 2 autocommit inserts, `id<=239 DESC` → only 6 | `bfMergeSeekRev` |
+| 7 | **`ROLLBACK TO` the savepoint that began the transaction destroyed committed buffered rows** — it is `sqlite3BtreeSavepoint(ROLLBACK, -1)`, no pager savepoint was ever opened for it, so the flush-before-savepoint invariant never ran, and the cache was emptied | **committed-data loss** (WAL) | `INSERT … 412; SAVEPOINT s1; INSERT INTO u …; ROLLBACK TO s1;` → 412 gone | treat `iSavepoint<0` as a full rollback: rehydrate |
+| 8 | **an UPDATE with `BTREE_SAVEPOSITION` of a row still in the mini-page** (e.g. driven through an index) took the same-size overwrite on a cursor serving the row from a scratch buffer → `SQLITE_CORRUPT` | statement fails ("malformed") | 2 inserts into an indexed table, `UPDATE u SET b='' WHERE a=30` | materialise + re-seek whenever `bfOnMini` survives the write-back block |
+
+Found along the way and **not** fixed: `PRAGMA integrity_check` *inside* a write transaction with
+buffered rows reports `wrong # of entries in index` (its physical cell count does not see
+buffered rows; queries do, and it is clean once the transaction ends) — a false positive, both
+journal modes, pre-existing.  And the buffered max-rowid is monotonic (`bf_cache.h`,
+"never cleared"), so after a rollback or a delete of the top rows BF assigns larger rowids than
+stock — documented as allowed, observable, not data loss; and `bfReplayOnePage`'s old claim that
+a refused (`BF_FULL`) op "is re-applied at the next checkpoint from the base path" is false —
+nothing reads record frames at checkpoint — so a refusal is now counted (`replay_dropped`).
+
+My own first attempt at #2 (supersede an op when a newer *page image* of its leaf exists, plus
+two flushes to keep that exact) was wrong twice over: a one-leaf flush rebalanced dirty siblings
+and a scan returned rows out of order, and even with whole-table flushes the crash oracle found a
+lost update, because a flush can land a leaf's records on another leaf.  CLEAR replaced the
+design.  A third mistake of mine: resetting the flushed-leaf list on *every* cache clear, which
+includes a savepoint rollback whose pre-savepoint flushes survive; the next full rollback then
+resurrected a pre-flush value.  The list is now reset only by a whole-transaction rollback.  All
+three were caught by the new oracles before landing — and the same oracles showed that the
+overwrite flush of the first design had been *masking* bug #8.
+
 - [x] **root-cause and fix the post-recovery tree corruption above** — fixed 2026-09-22
 - [x] checkpoint immediately after recovery, without first descending the table —
       `recover_repro.sh` scenarios B and C; no rows lost
 - [x] persist and restore `rootPgno` across recovery — WAL payload v2; the leaf→root gap was
       the structural defect even though the old row-count-only control showed no loss
-- [ ] reproduce recovery into a mini-page that reaches `BF_FULL` (`bfReplayOnePage` tolerates
-      it on the grounds that the record "stays durable in the WAL and is re-applied at the
-      next checkpoint from the base path" — unverified, and worth checking now that the
-      recovery path is known to be unsound)
-- [ ] multiple table roots
-- [ ] crash during checkpoint; compare against the allowed committed states
+- [ ] reproduce recovery into a mini-page that reaches `BF_FULL` — the "re-applied from the base
+      path" claim is **false** (2026-09-24); such a refusal loses the record.  Now counted
+      (`replay_dropped`); a reproducer that makes it non-zero is still owed
+- [x] multiple table roots — `crash_oracle.py` runs four tables, one created mid-stream, one
+      with a secondary index (2026-09-24)
+- [x] crash during checkpoint; compare against the allowed committed states —
+      `crash_oracle.py` mode `killckpt` (2026-09-24)
+- [x] full ROLLBACK, torn commits, group commit under crash — bugs 1, 3, 4, 5 above
+- [ ] crash oracle under `SQLITE_DEBUG` at scale (6 seeds run, §9) and with `BF_PROMOTION=100`
 - [ ] **decide the checkpoint architecture** (§4.3): direct replay of durable record frames to
       their target pages, or materialisation via `bfCheckpointMaterialize()` as today.  If this
       work finds a state rehydration cannot reconstruct, the question answers itself; otherwise
@@ -1042,10 +1130,24 @@ ASan, and a static mini-page reference model.  We mirror it and extend:
   still *correct*, so the oracles cannot see a dead mechanism.  That is why every mechanism
   ships a counter (§1 rule 5) — `BF_COPY_REFERENCED` and `sqlite3BfMiniPageConsolidate` were
   dead for the project's whole life and 864 oracle runs never noticed.
-* **Crash-injection oracle.**  A test VFS that records writes and fsyncs and cuts power at
-  each fsync boundary; reopen → recover → `integrity_check` + match an allowed committed
-  state.  This is what proves WAL replay and checkpoint correctness, and it is what D1 and D2
-  are gated on.  Current pass/fail state: **unknown, nothing has been run recently.**
+* **Crash-differential oracle — `bench/crash_oracle.py` (2026-09-24).**  Random multi-table
+  workloads (one table created mid-stream, one with a secondary index, overflow values,
+  rolled-back transactions); stock computes the state hash after every commit; BF is
+  SIGKILLed after a random acknowledged commit; recovery must equal *some* committed prefix at
+  or after the last acknowledgement (minus the group window under `BF_GROUP`) and pass
+  `integrity_check`, under four recovery orders including a crash **during** the checkpoint;
+  then the remaining transactions must reach stock's final state.  Found five of the six bugs
+  in D1 on its first runs.  Its limit: SIGKILL keeps the OS page cache, so it tests process
+  crashes, not power loss.
+* **Crash-injection oracle (power loss).**  A test VFS that records writes and fsyncs and cuts
+  power at each fsync boundary.  **Still not built**; D2's strict-durability claim needs it,
+  because a SIGKILL cannot lose a write that reached the kernel.
+* **Deterministic crash reproducers.**  `bench/recover_repro.sh` (root-pgno recovery, 3 orders),
+  `bench/torn_tail_repro.sh` (torn record-frame tail), `bench/ckpt_repro.sh`.
+* **Full-ROLLBACK generator.**  `bench/gen_rollback_stress.py`, the fifth generator in
+  `stress_buf.sh`: the only one that issues full ROLLBACK, empty and failed transactions and
+  failing statements.  The other four never reach `sqlite3BtreeRollback` with committed records
+  buffered, which is how bug D1-1 lived.
 * **Fuzzing** (`.claude/agents/libfuzzer-tester.md`).  clang libFuzzer + ASan/UBSan on (a) the
   record-frame decoder and recovery path fed malformed WALs — must reject or recover, never
   UB — and (b) SQL with BF on, following `test/dbfuzz2.c` / `test/ossfuzz.c`.
@@ -1542,3 +1644,75 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   checkpoint coverage; D2's acknowledged-commit contract remains open.
 - Exact next action: run the differential, small-ring and crash gates, then continue D1 edge
   coverage.
+
+### 2026-09-24 — Claude Opus 5.5 — D1: a crash-differential oracle, and eight bugs it and a ROLLBACK generator found
+
+- Starting state: `main` at `df84190`, clean except untracked `tfg/`.  All binaries on disk
+  predated `df84190`'s merge or were built before it; rebuilt everything first (stale binaries
+  have produced false findings here before).
+- Goal: the previous entry's next action — gate the root-persistence fix, then D1 edge coverage
+  (multiple roots, crash during checkpoint, `BF_FULL`).
+- Built `bench/crash_oracle.py`: random 40–100-transaction workloads over four tables (one
+  created mid-stream, one with a secondary index, overflow values, rolled-back transactions);
+  stock hashes the logical state after every commit; BF is SIGKILLed after a random
+  acknowledged commit and must recover to a committed prefix at or after it (minus the group
+  window under `BF_GROUP`), pass `integrity_check`, and then reach stock's final state; four
+  recovery orders including a SIGKILL *during* the checkpoint.  Verified to have teeth: the
+  session-start binary fails 8/8 runs of the first two seeds.
+- **It found, on its first run, that the BF load itself fails with "malformed" — no crash
+  needed.**  Minimised to: committed buffered rows, then an empty `BEGIN;ROLLBACK`, then any
+  read → the rows are gone, and gone for good after a clean close.  `sqlite3BtreeRollback`
+  emptied the record cache, which since Phase 2 holds committed rows that exist only there and
+  in the WAL.  Every ROLLBACK, including a failed COMMIT and an autocommit statement failing a
+  constraint.  The four differential generators never issue a full ROLLBACK (only
+  `ROLLBACK TO`), so this lived for the project's whole Phase 2.
+- The complete list, with reproducers and fixes, is in D1 (bugs 1–8).  In brief: rollback
+  destroyed committed rows (1, and 7 via a transaction-level `ROLLBACK TO`); recovery re-applied
+  ops a flush had already put in base (2); recovery replayed torn commits (3); group commit tore
+  transactions that also wrote pages (4); a torn tail starting with a record frame made the next
+  write drop its own wal-index entry (5); reverse range seeks skipped buffered rows (6); an
+  index-driven same-size UPDATE of a buffered row returned SQLITE_CORRUPT (8).  Each reproducer
+  fails on the session-start binary and passes on the fixed one.
+- Design decisions:
+  * **Replay order is logged, not inferred.**  WAL payload v3 adds `BFWAL_OP_CLEAR`; a flush's
+    commit logs one per flushed leaf ahead of its own records; replay starts each leaf after its
+    last CLEAR.  My first design inferred supersession from page images (plus a per-leaf flush
+    before in-place overwrites and at commit to keep that exact).  The oracles broke it twice —
+    the per-leaf flush rebalanced dirty siblings (scan returned rows out of order), and even
+    table-wide, a flush lands a leaf's records on whatever leaf holds their keys now, so a
+    newer image of the *original* leaf may never exist.  With CLEAR, an op no CLEAR covers was
+    never applied to base and no page-path write can have touched its key, so the extra flushes
+    were removed again — which in turn exposed bug 8, which they had been masking.
+  * **Rollback rebuilds the cache from the log** (WAL ops, then staged batches, then the open
+    group batch) instead of emptying it.  The alternative — preserving committed records across
+    a rollback in place — needs undo information the mini-pages do not keep.
+  * These correctness mechanisms have counters but **no off switch**; §3.2 says why.
+- Files changed: `src/{bf_btree.c, bf_cache.c, bf_cache.h, bf_config.c, bf_wal.c, bf_wal.h,
+  btree.c, pager.c, pager.h, pcache.c, pcache.h, wal.c, wal.h}`, `test/bf/wal_codec_test.c`;
+  new `bench/crash_oracle.py`, `bench/gen_rollback_stress.py` (fifth `stress_buf.sh` generator),
+  `bench/torn_tail_repro.sh`; `bench/stress_buf.sh`, `bench/recover_repro.sh` (stale header);
+  `BF_TREE_V2_PLAN.md`, `BF_TREE_V2_KNOWLEDGE.md`, `CLAUDE.md`.
+- Validation, on the final source (amalgamation byte-identical to the one tested in scratch):
+  `wal_codec_test` ALL PASS (new CLEAR cases); `torn_tail_repro.sh` PASS release and debug, and
+  FAIL on both the session-start binary and a build with only the wal-index probe removed;
+  `recover_repro.sh` 250/2000 rows and 250 under `SQLITE_DEBUG`: ALL CLEAN; `ckpt_repro.sh` OK;
+  `stress_xtable.sh` ALL CLEAN 15/15; `gen_rollback_stress` sweep 0/72 diverged (12 seeds × 3
+  journal modes × release+debug), and 0/32 with top-level savepoints added (session-start binary:
+  17/32); crash oracle 612/612 across six configurations — default 160, `bf_cache_size=262144`
+  120, `BF_GROUP=8` 160, `SQLITE_DEBUG` 32, `bf_promotion_rate=100` 80, 100-txn histories with
+  ring + `BF_GROUP=4` 60.  `stress.sh` ALL CLEAN 54/54.  **At commit time (owner asked to
+  commit before the gate finished) `stress_buf.sh` was at 65/65 passing, and its
+  `BF_CACHE_SIZE`/`BF_GROUP=8`/`BF_PROMOTION=100` variants and `ring_repro.sh` had not run yet;**
+  their results follow in the next entry.
+- Benchmark status: NOT RUN.  Correctness-only change (§6.1).  Expected costs, all unmeasured:
+  a write-transaction rollback replays the WAL's ops; each flush adds ~11 B of CLEAR per leaf
+  to its commit; group commit no longer defers commits that write pages, so group-mode WAL
+  savings on mixed workloads will shrink; `walFrames` reads a few wal-index slots per call.
+- Remaining and owed: the `integrity_check`-inside-a-transaction false positive (D1, pre-existing,
+  not fixed); a reproducer for `replay_dropped`>0 (`BF_FULL` during replay loses the record —
+  the old comment claiming otherwise was false); a power-loss crash VFS (SIGKILL cannot test
+  fsync ordering, which D2 needs); the checkpoint-architecture decision (D1, the user's).
+- Exact next action: fold the top-level savepoint shape into `bench/gen_rollback_stress.py`
+  (validated in scratch, above) once the gate releases `bench/`; then **commit, on the owner's
+  go-ahead** — the change is uncommitted, and until it lands every ROLLBACK on `main` can lose
+  committed rows.

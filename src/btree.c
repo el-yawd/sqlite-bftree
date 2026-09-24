@@ -4397,6 +4397,15 @@ int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
       ** to their base B-tree pages.  With journal_mode=OFF / synchronous=OFF
       ** this is the only "persistence" step for BF-buffered rows. */
       sqlite3BfBtreeFlushAllDirty(p);
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+      /* The checkpoint's materialisation commit still rides the WAL: log the
+      ** CLEARs of what it just flushed (no-op outside WAL mode). */
+      rc = sqlite3BfBtreeLogFlushMarks(p);
+      if( rc!=SQLITE_OK ){
+        sqlite3BtreeLeave(p);
+        return rc;
+      }
+# endif
     }
 #endif
 #ifndef SQLITE_OMIT_AUTOVACUUM
@@ -4607,6 +4616,11 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
   int rc;
   BtShared *pBt = p->pBt;
   MemPage *pPage1;
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  u8 **apBfStage = 0;       /* committed group batches staged in this txn */
+  int nBfStage = 0;
+  int bBfRehydrate = 0;
+#endif
 
   assert( writeOnly==1 || writeOnly==0 );
   assert( tripCode==SQLITE_ABORT_ROLLBACK || tripCode==SQLITE_OK );
@@ -4614,8 +4628,24 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
 #ifndef SQLITE_OMIT_BF_CACHE
   /* Discard any BF write-buffered inserts that were never committed to base
   ** pages.  If we left BFOP_INSERT records in the mini-page they would appear
-  ** as live rows after the rollback, violating atomicity. */
-  sqlite3BfBtreeClearCache(p);
+  ** as live rows after the rollback, violating atomicity.
+  **
+  ** Only a WRITE transaction can have put anything uncommitted in the cache;
+  ** rolling back a read transaction (BEGIN;ROLLBACK, a failed COMMIT) leaves
+  ** it alone.  In WAL mode the cache also holds COMMITTED records that exist
+  ** nowhere else but the log, so emptying it is not enough: it is rebuilt from
+  ** the log once the pager rollback has restored the committed snapshot (see
+  ** sqlite3BfBtreeRollbackRehydrate).  The staged payloads must be taken now,
+  ** because the pager rollback frees them. */
+  if( p->inTrans==TRANS_WRITE ){
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+    if( sqlite3PagerIsWal(pBt->pPager) ){
+      sqlite3PagerBfStageTake(pBt->pPager, &apBfStage, &nBfStage);
+      bBfRehydrate = 1;
+    }
+# endif
+    sqlite3BfBtreeClearCache(p);
+  }
 #endif
   if( tripCode==SQLITE_OK ){
     rc = tripCode = saveAllCursors(pBt, 0, 0);
@@ -4646,6 +4676,14 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
       btreeSetNPage(pBt, pPage1);
       releasePageOne(pPage1);
     }
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+    /* Still inside the read snapshot the rollback restored. */
+    if( bBfRehydrate ){
+      rc2 = sqlite3BfBtreeRollbackRehydrate(p, apBfStage, nBfStage);
+      apBfStage = 0;
+      if( rc2!=SQLITE_OK && rc==SQLITE_OK ) rc = rc2;
+    }
+#endif
     assert( countValidCursors(pBt, 1)==0 );
     pBt->inTransaction = TRANS_READ;
     btreeClearHasContent(pBt);
@@ -4711,10 +4749,32 @@ int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
     BtShared *pBt = p->pBt;
 #ifndef SQLITE_OMIT_BF_CACHE
     int nPagerSavepoint = sqlite3PagerNSavepoint(pBt->pPager);
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+    u8 **apBfStage = 0;       /* committed group batches staged in this txn */
+    int nBfStage = 0;
+    int bBfRehydrate = 0;
+    int rcBf = SQLITE_OK;
+# endif
 #endif
     assert( op==SAVEPOINT_RELEASE || op==SAVEPOINT_ROLLBACK );
     assert( iSavepoint>=0 || (iSavepoint==-1 && op==SAVEPOINT_ROLLBACK) );
     sqlite3BtreeEnter(p);
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+    /* iSavepoint==-1 rolls back the WHOLE transaction (ROLLBACK TO the
+    ** savepoint that began it) while keeping it open.  No pager savepoint
+    ** was ever opened for that level, so the flush-before-savepoint
+    ** invariant the ordinary case relies on never ran: the cache still holds
+    ** COMMITTED records that exist only there and in the log.  Rebuild it from
+    ** the log exactly as a full ROLLBACK does (sqlite3BtreeRollback); emptying
+    ** it lost them (found 2026-09-24:
+    **   INSERT INTO t VALUES(412,'x');  SAVEPOINT s1;  INSERT INTO u ...;
+    **   ROLLBACK TO s1;                 -- row 412 gone, in WAL mode). */
+    if( op==SAVEPOINT_ROLLBACK && iSavepoint<0
+     && sqlite3PagerIsWal(pBt->pPager) ){
+      sqlite3PagerBfStageTake(pBt->pPager, &apBfStage, &nBfStage);
+      bBfRehydrate = 1;
+    }
+#endif
     if( op==SAVEPOINT_ROLLBACK ){
       rc = saveAllCursors(pBt, 0, 0);
     }
@@ -4734,6 +4794,13 @@ int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
         ** savepoint (no write statement ran after it was created), the
         ** pager rollback above was a no-op, and any dirty BF records
         ** predate the savepoint — they must be kept, not discarded. */
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+        if( bBfRehydrate ){
+          rcBf = sqlite3BfBtreeRollbackRehydrate(p, apBfStage, nBfStage);
+          apBfStage = 0;
+          nBfStage = 0;
+        }else
+# endif
         sqlite3BfBtreeClearCache(p);
       }
 #endif
@@ -4747,6 +4814,14 @@ int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
       ** the transaction was started. Otherwise, it must be at least 1.  */
       assert( CORRUPT_DB || pBt->nPage>0 );
     }
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+    if( rc==SQLITE_OK ) rc = rcBf;
+    if( apBfStage ){                 /* the pager rollback failed first */
+      int iBf;
+      for(iBf=0; iBf<nBfStage; iBf++) sqlite3_free(apBfStage[iBf]);
+      sqlite3_free(apBfStage);
+    }
+#endif
     sqlite3BtreeLeave(p);
   }
   return rc;
@@ -6780,6 +6855,100 @@ static int bfMergeSeek(BtCursor *pCur, i64 intKey, int biasRight, int *pRes){
   *pRes = (curKey==intKey) ? 0 : +1;
   return SQLITE_OK;
 }
+
+/*
+** Reverse twin of bfMergeSeek, for OP_SeekLE/LT.
+**
+** Until 2026-09-24 backward range seeks had no merge step and fell back to
+** "flush this table first".  But the flush is refused under a READ transaction
+** (bfFlushOneMiniPage -- flushing there would drop committed records), so an
+** autocommit SELECT simply did not see buffered rows:
+**
+**     INSERT INTO t VALUES(6,'a');  INSERT INTO t VALUES(185,'b');
+**     SELECT id FROM t WHERE id<=239 ORDER BY id DESC;     -- returned only 6
+**
+** The flush-path comment called that degrading to "does not see buffered rows"
+** rather than losing them; it is a wrong query result either way.
+**
+** Positions a reverse merge cursor (bfMergeRev) on the LAST merged row <= intKey:
+** the base stream is parked on the largest base cell <= intKey (possibly none
+** on this leaf -- bfMergePickPrev then crosses to earlier leaves), the insert
+** stream on the leaf's last buffered record <= intKey, and bfMergePickPrev
+** picks the larger, applying tombstones and shadowing exactly as a full reverse
+** scan does.  Buffered records of LATER leaves are all above this leaf's range,
+** hence above intKey, so they can be ignored.  *pRes: 0 on the key, <0 below
+** it, >0 with an INVALID cursor when nothing is <= intKey.  SQLITE_NOTFOUND
+** means merging is not possible here (the caller falls back to the flush path).
+*/
+static int bfMergeSeekRev(BtCursor *pCur, i64 intKey, int *pRes){
+  MemPage *pPage;
+  i64 curKey;
+  int rc;
+
+  rc = bfMergeEnsureScratch(pCur);
+  if( rc!=SQLITE_OK ) return rc;
+
+  pCur->bfMerge = 0;
+  pCur->bfOnMini = 0;
+  sqlite3BfBtreeSuppressShortcut(pCur, +1);
+  rc = sqlite3BtreeTableMoveto(pCur, intKey, 0, pRes);
+  sqlite3BfBtreeSuppressShortcut(pCur, -1);
+  if( rc!=SQLITE_OK ) return rc;
+
+  pPage = pCur->pPage;
+  if( pPage==0 || !pPage->leaf ) return SQLITE_NOTFOUND;
+  if( pCur->eState!=CURSOR_VALID ){
+    /* Empty base tree: the root IS the leaf that owns the buffered records. */
+    if( pCur->eState!=CURSOR_INVALID || pPage->nCell!=0 ) return SQLITE_NOTFOUND;
+    pCur->ix = 0;
+    pCur->eState = CURSOR_VALID;
+    pCur->bfBaseDone = 1;
+  }else if( *pRes>0 ){
+    /* Landed above the key: the base candidate is the cell before, which may
+    ** be on an earlier leaf (bfMergePickPrev crosses when this one is done). */
+    if( pCur->ix==0 ){
+      pCur->bfBaseDone = 1;
+    }else{
+      pCur->ix--;
+      pCur->bfBaseDone = 0;
+    }
+  }else{
+    pCur->bfBaseDone = 0;
+  }
+
+  pCur->bfMergeLeaf = pPage->pgno;
+  pCur->bfIx = BF_MERGE_IX_END;
+  for(;;){
+    int foundIx = pCur->bfIx;
+    int insVal = 0, r;
+    i64 insKey = 0;
+    r = sqlite3BfBtreeMergePrevInsert(pCur, pPage->pgno, &foundIx, &insKey,
+            pCur->pBfScratch, pCur->nBfScratch, &insVal);
+    if( r<0 ) return SQLITE_NOTFOUND;       /* mini-page vanished: fall back */
+    if( r==0 || insKey<=intKey ){ pCur->bfIx = foundIx; break; }
+    pCur->bfIx = foundIx - 1;
+  }
+
+  pCur->bfMerge = 1;
+  pCur->bfMergeRev = 1;
+  pCur->curFlags &= ~BTCF_AtLast;
+  rc = bfMergePickPrev(pCur);
+  if( rc==SQLITE_DONE ){
+    /* Nothing at or before intKey.  Clear the merge state WITHOUT the flush
+    ** sqlite3BfBtreeMergeBail would do: there is no row to stand on. */
+    pCur->bfMerge = 0;
+    pCur->bfMergeRev = 0;
+    pCur->bfOnMini = 0;
+    pCur->eState = CURSOR_INVALID;
+    *pRes = +1;
+    return SQLITE_OK;
+  }
+  if( rc!=SQLITE_OK ) return rc;
+  curKey = pCur->bfOnMini ? pCur->info.nKey
+                          : bfBaseCellRowid(pCur->pPage, pCur->ix);
+  *pRes = (curKey==intKey) ? 0 : -1;
+  return SQLITE_OK;
+}
 #endif /* SQLITE_BF_INSERT_BUFFERING */
 
 int sqlite3BtreeTableMovetoForScan(
@@ -6792,11 +6961,15 @@ int sqlite3BtreeTableMovetoForScan(
 #ifndef SQLITE_OMIT_BF_CACHE
   int rc;
 # if defined(SQLITE_BF_INSERT_BUFFERING)
-  /* Forward range seeks merge instead of flushing (see bfMergeSeek).  Backward
-  ** seeks (OP_SeekLE/LT) finalise with Prev, which has no merge step, so they
-  ** keep the Phase-1 flush. */
+  /* Range seeks merge instead of flushing: forward ones through bfMergeSeek,
+  ** backward ones (OP_SeekLE/LT) through bfMergeSeekRev.  The flush below is
+  ** only a fallback, and under a read transaction it does nothing. */
   if( bForward && sqlite3BfBtreeBeginMergeScan(pCur) ){
     rc = bfMergeSeek(pCur, intKey, biasRight, pRes);
+    if( rc!=SQLITE_NOTFOUND ) return rc;
+    sqlite3BfBtreeMergeBail(pCur);
+  }else if( !bForward && sqlite3BfBtreeBeginMergeScanRev(pCur) ){
+    rc = bfMergeSeekRev(pCur, intKey, pRes);
     if( rc!=SQLITE_NOTFOUND ) return rc;
     sqlite3BfBtreeMergeBail(pCur);
   }
@@ -10496,6 +10669,25 @@ int sqlite3BtreeInsert(
         rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
         if( rc ) return rc;
       }
+    }
+    /* The block above only takes writes it may buffer.  One it declines --
+    ** BTREE_SAVEPOSITION, which is what an UPDATE sends when the cursor must
+    ** stay on the row (e.g. an UPDATE driven through an index) -- still has
+    ** the cursor serving the row FROM THE MINI-PAGE: info.pPayload points into
+    ** a scratch buffer and there is no base cell under the cursor.  The
+    ** same-size overwrite below would then patch "the cell" at that address
+    ** and report SQLITE_CORRUPT (pre-existing; found 2026-09-24 by
+    ** gen_rollback_stress.py:
+    **   INSERT INTO u VALUES(1633,97,'...'); INSERT INTO u VALUES(4726,30,'');
+    **   UPDATE u SET b='' WHERE a=30;   -- u has an index on a
+    ** failed with "database disk image is malformed").  Materialise the table
+    ** and re-seek so every path below operates on a physical cell. */
+    if( pCur->bfOnMini ){
+      if( sqlite3BfBtreeFlushTableForMutation(pCur)>0 ){
+        rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
+        if( rc ) return rc;
+      }
+      if( pCur->bfOnMini ) return SQLITE_CORRUPT_BKPT;  /* nothing to write */
     }
 #endif
 

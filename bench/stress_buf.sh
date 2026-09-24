@@ -31,8 +31,11 @@ for seed in $SEEDS; do
   # INSIDE transactions with pending buffered inserts — the Stage 2.2 merge path
   # that the first two never reach, since their in-txn SELECTs are point/range),
   # and gen_rev_stress (DESC scans, LIMIT-ed reverse scans, count(*)/min/max in
-  # the same state — the Stage 2.4 reverse-merge and merged-COUNT paths).
-  for gen in gen_stress gen_stress_rand gen_merge_stress gen_rev_stress; do
+  # the same state — the Stage 2.4 reverse-merge and merged-COUNT paths), and
+  # gen_rollback_stress (full ROLLBACK, empty and failed transactions, failing
+  # statements -- the path that destroyed committed buffered rows until
+  # 2026-09-24, invisible to the other four because they only ROLLBACK TO).
+  for gen in gen_stress gen_stress_rand gen_merge_stress gen_rev_stress gen_rollback_stress; do
     for jm in delete wal memory; do
       n=$((n+1))
       b="$WORK/buf_${gen}_s${seed}_${jm}"
@@ -46,10 +49,14 @@ for seed in $SEEDS; do
         # gen_merge_stress takes (seed, n_txns); prepend the journal pragma.
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
         python3 ./gen_merge_stress.py "$seed" 400 >> "$b.sql"
-      else
+      elif [ "$gen" = gen_rev_stress ]; then
         # gen_rev_stress takes (seed, n_txns); prepend the journal pragma.
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
         python3 ./gen_rev_stress.py "$seed" 400 >> "$b.sql"
+      else
+        # gen_rollback_stress takes (seed, n_txns, journal).
+        printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
+        python3 ./gen_rollback_stress.py "$seed" 300 "$jm" >> "$b.sql"
       fi
       # Optional BF knobs (BF_GROUP=N / BF_PROMOTION=N / BF_CACHE_SIZE=N).
       # Stock ignores the unknown pragmas, so both sides run the same script.

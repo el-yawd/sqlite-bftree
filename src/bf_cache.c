@@ -624,6 +624,10 @@ static void bfCacheDestroy(sqlite3_pcache *p){
   pCache->base.nUnlogPg = 0;
   pCache->base.nUnlogPgAlloc = 0;
   pCache->base.bUnlogOverflow = 0;
+  sqlite3_free(pCache->base.aFlushed);
+  pCache->base.aFlushed = 0;
+  pCache->base.nFlushed = 0;
+  pCache->base.nFlushedAlloc = 0;
 #if defined(SQLITE_BF_INSERT_BUFFERING)
   /* Release the group-commit batch.  Anything still in it is DIRTY in its
   ** mini-page, so the close-time flush has already materialised it to base. */
@@ -1053,18 +1057,64 @@ typedef struct BfReplayCtx BfReplayCtx;
 struct BfReplayCtx {
   BfCache    *pCache;
   BfWalIndex *pWalIdx;
+  u32         mxFrame;      /* committed end of the log */
+  int         bKeepBeyond;  /* replay ops past mxFrame too (rollback) */
   int         rc;       /* first error, sticky */
 };
 
+/*
+** Ordering.  The index keeps each leaf's ops in log order, but the base tree a
+** replay writes them over is the NEWEST image of every page.  An op a flush has
+** already put into base pages must therefore not be replayed: measured before
+** this rule existed, an UPDATE and a DELETE that reached base through the page
+** path were undone by the next checkpoint (the stale INSERT overwrote the
+** update and resurrected the deleted row), and count(*) double-counted the
+** replayed rows in between.
+**
+** The flush says so explicitly: the commit that carries its page images logs a
+** BFWAL_OP_CLEAR for every leaf whose records it applied, and replay starts
+** each leaf after its last CLEAR.  A first attempt inferred the same thing from
+** page images instead ("a newer image of the op's leaf contains the op"), and
+** the crash oracle broke it within a few hundred runs: a flush writes a leaf's
+** records wherever their keys live NOW, and after a split that is another leaf,
+** whose image says nothing about the first.  An op no CLEAR covers was never
+** applied to base, and no page-path write can have touched its key since --
+** such a write needs the row in base, i.e. a flush first -- so replaying it over
+** the newest images is correct.
+**
+** Ops carried by frames past mxFrame belong to no committed log: at recovery
+** they are the torn tail of a crashed commit and are skipped; at rollback they
+** are group-commit batches of EARLIER, committed transactions that a spill
+** wrote inside the rolled-back one, and are kept (bKeepBeyond).
+*/
 static int bfReplayOnePage(void *pCtx, u32 pgno){
   BfReplayCtx *ctx = (BfReplayCtx*)pCtx;
   int n = sqlite3BfWalIndexPageCount(ctx->pWalIdx, pgno);
-  int i;
-  for(i=0; i<n; i++){
+  int i, iStart = 0;
+  /* Start after the last CLEAR that is part of the log being replayed. */
+  for(i=n-1; i>=0; i--){
+    BfWalRec rec;
+    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
+    if( rec.op!=BFWAL_OP_CLEAR ) continue;
+    /* A CLEAR past the log's end is never honoured, even when other ops there
+    ** are kept: CLEARs are written only by a commit, so one past mxFrame
+    ** belongs to a commit that did not complete, whose flush was undone. */
+    if( rec.iFrame>ctx->mxFrame ) continue;
+    iStart = i+1;
+    break;
+  }
+  ctx->pCache->nReplaySuperseded += (u64)iStart;
+  for(i=iStart; i<n; i++){
     BfWalRec rec;
     u8 op;
     int wr;
     if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
+    if( rec.iFrame>ctx->mxFrame && !ctx->bKeepBeyond ){
+      ctx->pCache->nReplayTorn++;
+      continue;
+    }
+    if( rec.op==BFWAL_OP_CLEAR ) continue;  /* a torn-tail CLEAR, skipped above */
+    ctx->pCache->nReplayApplied++;
     op = (rec.op==BFWAL_OP_DELETE) ? BFOP_DELETE : BFOP_INSERT;
     wr = sqlite3BfRecordWrite(ctx->pCache, pgno, rec.pKey, (int)rec.nKey,
                               rec.pVal, (int)rec.nVal, op);
@@ -1078,17 +1128,24 @@ static int bfReplayOnePage(void *pCtx, u32 pgno){
       ctx->rc = SQLITE_NOMEM;
       return BFWAL_NOMEM;   /* stop the walk */
     }
-    /* BF_FULL (mini-page maxed) is tolerated: the record stays durable in the
-    ** WAL and is re-applied at the next checkpoint from the base path. */
+    /* BF_FULL (mini-page maxed) used to be "tolerated" on the grounds that the
+    ** record stays durable in the WAL and is re-applied at the next checkpoint
+    ** from the base path.  Nothing does that: checkpoint materialises the CACHE
+    ** and never reads record frames.  A refused op is a lost committed record,
+    ** so count it where it cannot be missed (bf_cache_stats replay_dropped). */
+    if( wr!=BF_OK ) ctx->pCache->nReplayDropped++;
   }
   return BFWAL_OK;
 }
 
-int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx){
+int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx,
+    u32 mxFrame, int bKeepBeyond){
   BfReplayCtx ctx;
   if( pCache==0 || pWalIdx==0 ) return SQLITE_OK;
   ctx.pCache  = pCache;
   ctx.pWalIdx = pWalIdx;
+  ctx.mxFrame = mxFrame;
+  ctx.bKeepBeyond = bKeepBeyond;
   ctx.rc      = SQLITE_OK;
   sqlite3BfWalIndexForEachPage(pWalIdx, bfReplayOnePage, &ctx);
   if( ctx.rc==SQLITE_OK ){

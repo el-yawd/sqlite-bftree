@@ -147,6 +147,9 @@ int sqlite3BfWalBatchAppend(BfWalBatch *p, const BfWalRec *pRec){
   if( p->nRec>=0xFFFF ) return BFWAL_FULL;
   if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_FULL;
   if( pRec->nKey>0x3FFF ) return BFWAL_FULL;
+  if( pRec->op==BFWAL_OP_CLEAR && (pRec->nKey!=0 || pRec->nVal!=0) ){
+    return BFWAL_FULL;      /* would not decode: refuse to encode it */
+  }
 
   need = sqlite3BfWalRecSize(pRec);
   if( p->nUsed > p->szBuf - need ) return BFWAL_FULL;
@@ -227,7 +230,9 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   rootPgno = bfGet32(p);  p += 4;  off += 4;
   op = *p++;              off += 1;
   if( pgno==0 || rootPgno<=1 ) return BFWAL_CORRUPT;
-  if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE ) return BFWAL_CORRUPT;
+  if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE && op!=BFWAL_OP_CLEAR ){
+    return BFWAL_CORRUPT;
+  }
 
   n = bfGetVarint(p, it->nUsed - off, &nKey);
   if( n<0 ) return BFWAL_CORRUPT;
@@ -241,9 +246,11 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   if( nKey > (u32)(it->nUsed - off) ) return BFWAL_CORRUPT;
   off += (int)nKey;
   if( nVal > (u32)(it->nUsed - off) ) return BFWAL_CORRUPT;
+  if( op==BFWAL_OP_CLEAR && (nKey!=0 || nVal!=0) ) return BFWAL_CORRUPT;
 
   pRec->pgno = pgno;
   pRec->rootPgno = rootPgno;
+  pRec->iFrame = 0;
   pRec->op   = op;
   pRec->nKey = nKey;
   pRec->nVal = nVal;
@@ -266,6 +273,7 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
 typedef struct BfWalIdxOp BfWalIdxOp;
 struct BfWalIdxOp {
   u32  rootPgno;            /* owning rowid-table root */
+  u32  iFrame;              /* WAL frame that carried this op */
   u8   op;                  /* BFWAL_OP_INSERT / BFWAL_OP_DELETE */
   u32  nKey;                /* key length */
   u32  nVal;                /* value length */
@@ -354,7 +362,7 @@ void sqlite3BfWalIndexFree(BfWalIndex *p){
   BFWAL_FREE(p);
 }
 
-int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec){
+int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
   BfWalIdxPage *pP;
   BfWalIdxOp *pOp;
   u8 *pBody;
@@ -394,6 +402,7 @@ int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec){
 
   pOp = &pP->aOp[pP->nOp++];
   pOp->rootPgno = pRec->rootPgno;
+  pOp->iFrame = iFrame;
   pOp->op = pRec->op;
   pOp->nKey = pRec->nKey;
   pOp->nVal = pRec->nVal;
@@ -413,6 +422,7 @@ int sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec){
   pOp = &pP->aOp[i];
   pRec->pgno = pgno;
   pRec->rootPgno = pOp->rootPgno;
+  pRec->iFrame = pOp->iFrame;
   pRec->op   = pOp->op;
   pRec->nKey = pOp->nKey;
   pRec->nVal = pOp->nVal;
@@ -435,17 +445,36 @@ int sqlite3BfWalIndexForEachPage(BfWalIndex *p,
   return BFWAL_OK;
 }
 
-int sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf){
+int sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf,
+                              u32 iFrame){
   BfWalIter it;
   BfWalRec r;
   int rc;
   rc = sqlite3BfWalIterInit(&it, aBuf, szBuf);
   if( rc!=BFWAL_OK ) return rc;
   while( (rc = sqlite3BfWalIterNext(&it, &r))==BFWAL_OK ){
-    int rc2 = sqlite3BfWalIndexAppend(p, &r);
+    int rc2 = sqlite3BfWalIndexAppend(p, &r, iFrame);
     if( rc2!=BFWAL_OK ) return rc2;
   }
   return (rc==BFWAL_DONE) ? BFWAL_OK : rc;
+}
+
+/* Ops are appended in log order, so within one page the ops to drop are a
+** suffix: truncate from the first op past mxFrame. */
+void sqlite3BfWalIndexPrune(BfWalIndex *p, u32 mxFrame){
+  int i;
+  if( p==0 ) return;
+  for(i=0; i<p->nBucket; i++){
+    BfWalIdxPage *pP;
+    for(pP = p->apBucket[i]; pP; pP = pP->pNext){
+      int j = pP->nOp;
+      while( j>0 && pP->aOp[j-1].iFrame>mxFrame ) j--;
+      while( pP->nOp>j ){
+        pP->nOp--;
+        BFWAL_FREE(pP->aOp[pP->nOp].pBody);
+      }
+    }
+  }
 }
 
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */

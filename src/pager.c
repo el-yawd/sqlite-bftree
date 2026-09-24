@@ -3284,7 +3284,8 @@ static int pagerBeginReadTransaction(Pager *pPager){
       BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
       if( pWalIdx ){
         BfCache *pBf = sqlite3PagerGetBfCache(pPager);
-        if( pBf ) rc = sqlite3BfCacheReplayWal(pBf, pWalIdx);
+        if( pBf ) rc = sqlite3BfCacheReplayWal(pBf, pWalIdx,
+                           sqlite3WalBfMxFrame(pPager->pWal), 0);
       }
     }
 #endif
@@ -4392,6 +4393,55 @@ int sqlite3PagerBfStage(Pager *pPager, const u8 *aData, int szPage){
 */
 int sqlite3PagerIsWal(Pager *pPager){
   return pPager!=0 && pagerUseWal(pPager);
+}
+
+/*
+** Phase 2 (WAL) rollback support.  After sqlite3PagerRollback the pager still
+** holds its read snapshot, which is exactly the committed log the rolled-back
+** transaction started from.
+**
+** sqlite3PagerBfReplayLog replays the WAL's record ops into pBf, skipping the
+** ones a later CLEAR supersedes and KEEPING the ops of frames the rollback
+** discarded (committed group-commit batches -- see sqlite3WalUndo), then drops
+** those ops from the index so their frame numbers can be reused.
+** *pbAllDurable is set when every op it replayed is still in the log.
+**
+** sqlite3PagerBfStageTake hands over the staged-but-unwritten payloads (also
+** committed group batches) before the rollback would free them.
+**
+** sqlite3PagerBfHasDirty reports whether the commit in progress will write any
+** page.
+*/
+int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable){
+  *pbAllDurable = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pBf && pagerUseWal(pPager) ){
+    int rc = SQLITE_OK;
+    BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
+    /* Every op replayed is in the committed log unless the rollback discarded
+    ** frames that carried some (then the pruning below is pending). */
+    *pbAllDurable = !sqlite3WalBfPrunePending(pPager->pWal);
+    if( pWalIdx ){
+      rc = sqlite3BfCacheReplayWal(pBf, pWalIdx,
+                                   sqlite3WalBfMxFrame(pPager->pWal), 1);
+    }
+    if( rc==SQLITE_OK ) sqlite3WalBfPrune(pPager->pWal);
+    return rc;
+  }
+#endif
+  return SQLITE_OK;
+}
+void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage){
+  *papStage = 0;
+  *pnStage = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    sqlite3WalBfStageTake(pPager->pWal, papStage, pnStage);
+  }
+#endif
+}
+int sqlite3PagerBfHasDirty(Pager *pPager){
+  return pPager!=0 && sqlite3PCacheIsDirty(pPager->pPCache);
 }
 
 /*

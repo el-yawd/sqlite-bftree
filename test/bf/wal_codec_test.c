@@ -136,7 +136,7 @@ static void test_index_order(void){
     key[0]=(u8)i; val[0]=(u8)pg; val[1]=(u8)i;
     r.pgno=pg; r.rootPgno=50+pg; r.op=(i&1)?BFWAL_OP_DELETE:BFWAL_OP_INSERT;
     r.nKey=1; r.pKey=key; r.nVal=(i&1)?0:2; r.pVal=(i&1)?0:val;
-    CHECK( sqlite3BfWalIndexAppend(ix,&r)==BFWAL_OK );
+    CHECK( sqlite3BfWalIndexAppend(ix,&r,(u32)(100+i))==BFWAL_OK );
   }
   CHECK( sqlite3BfWalIndexPageCount(ix,1)==10 );
   CHECK( sqlite3BfWalIndexPageCount(ix,2)==10 );
@@ -149,6 +149,16 @@ static void test_index_order(void){
     if( r.op==BFWAL_OP_INSERT ){ CHECK( r.nVal==2 && r.pVal[1]==(u8)(i*3) ); }
   }
   CHECK( sqlite3BfWalIndexGet(ix,1,10,&r)==BFWAL_DONE );
+
+  /* The frame tag round-trips, and prune drops exactly the ops carried by
+  ** frames past the cut: page 1 holds frames 100,103,...,127. */
+  CHECK( sqlite3BfWalIndexGet(ix,1,4,&r)==BFWAL_OK && r.iFrame==112 );
+  sqlite3BfWalIndexPrune(ix, 112);
+  CHECK( sqlite3BfWalIndexPageCount(ix,1)==5 );   /* 100..112 */
+  CHECK( sqlite3BfWalIndexPageCount(ix,2)==4 );   /* 101..110 */
+  CHECK( sqlite3BfWalIndexPageCount(ix,3)==4 );   /* 102..111 */
+  sqlite3BfWalIndexPrune(ix, 0);
+  CHECK( sqlite3BfWalIndexPageCount(ix,1)==0 );
 
   sqlite3BfWalIndexFree(ix);
 }
@@ -173,8 +183,8 @@ static void test_index_from_frame(void){
   sqlite3BfWalBatchFinish(&b);
   ix1 = sqlite3BfWalIndexNew();
   ix2 = sqlite3BfWalIndexNew();
-  CHECK( sqlite3BfWalIndexAddFrame(ix1, buf, sizeof(buf))==BFWAL_OK );
-  CHECK( sqlite3BfWalIndexAddFrame(ix2, buf, sizeof(buf))==BFWAL_OK );
+  CHECK( sqlite3BfWalIndexAddFrame(ix1, buf, sizeof(buf), 1)==BFWAL_OK );
+  CHECK( sqlite3BfWalIndexAddFrame(ix2, buf, sizeof(buf), 1)==BFWAL_OK );
   for(pg=1; pg<=5; pg++){
     int n1 = sqlite3BfWalIndexPageCount(ix1,pg);
     CHECK( n1==sqlite3BfWalIndexPageCount(ix2,pg) );
@@ -191,6 +201,45 @@ static void test_index_from_frame(void){
   sqlite3BfWalIndexFree(ix2);
 }
 
+/* BFWAL_OP_CLEAR (payload v3): round-trips between ordinary ops, and a CLEAR
+** carrying a key or value is refused by the encoder and rejected by the
+** decoder -- replay treats it as "drop every earlier op of this leaf", so a
+** malformed one must never be taken for a valid one. */
+static void test_clear_op(void){
+  u8 buf[512];
+  BfWalBatch b;
+  BfWalIter it;
+  BfWalRec r, o;
+  u8 key[8] = {0,0,0,0,0,0,0,7};
+  int n = 0;
+  sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
+  memset(&r, 0, sizeof(r));
+  r.pgno=9; r.rootPgno=2; r.op=BFWAL_OP_INSERT; r.nKey=8; r.pKey=key;
+  r.nVal=1; r.pVal=(const u8*)"v";
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
+  memset(&r, 0, sizeof(r));
+  r.pgno=9; r.rootPgno=2; r.op=BFWAL_OP_CLEAR;
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
+  r.nKey=8; r.pKey=key;                               /* CLEAR with a key */
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_FULL );
+  sqlite3BfWalBatchFinish(&b);
+  CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
+  while( sqlite3BfWalIterNext(&it, &o)==BFWAL_OK ){
+    if( n==1 ){ CHECK( o.op==BFWAL_OP_CLEAR && o.nKey==0 && o.nVal==0 ); }
+    n++;
+  }
+  CHECK( n==2 );
+  /* Hand-corrupt the CLEAR's keyLen varint (after leaf,root,op) to 1. */
+  {
+    int off = BFWAL_HDRSIZE + 4+4+1+1+1+8+1;     /* skip the INSERT record */
+    CHECK( buf[off+8]==BFWAL_OP_CLEAR );
+    buf[off+9] = 1;
+    CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
+    CHECK( sqlite3BfWalIterNext(&it, &o)==BFWAL_OK );
+    CHECK( sqlite3BfWalIterNext(&it, &o)==BFWAL_CORRUPT );
+  }
+}
+
 int main(void){
   test_roundtrip();
   test_full();
@@ -198,6 +247,7 @@ int main(void){
   test_fuzz_bounds();
   test_index_order();
   test_index_from_frame();
+  test_clear_op();
   if( nFail==0 ) printf("wal_codec_test: ALL PASS\n");
   else printf("wal_codec_test: %d FAILURE(S)\n", nFail);
   return nFail!=0;
