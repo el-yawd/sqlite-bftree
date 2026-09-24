@@ -419,9 +419,11 @@ int sqlite3BfBtreeFlushAllDirty(Btree *p){
 ** operation); the N-th transaction stages the batch and its commit writes one
 ** record frame plus the single page-1 commit frame for the whole group.
 **
-** Durability trade: COMMIT returns before the records reach the WAL, so a crash
-** loses at most the open group.  That is the paper-faithful setting; N<=1 keeps
-** strict per-commit record logging.  Nothing is ever LOST to a clean shutdown:
+** Durability trade -- BOUNDED DEFERRED DURABILITY, not group commit (plan D2):
+** COMMIT returns before the records reach the OS, so a crash, even of the
+** process, loses up to N-1 acknowledged commits.  This is NOT the paper's
+** setting: the reference's committer waits until its record is written (no
+** fsync), which is N<=1 here.  Nothing is ever LOST to a clean shutdown:
 ** the records stay DIRTY in the mini-page, so if the batch is never written the
 ** close/checkpoint flush still materialises them into base pages.
 **

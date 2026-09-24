@@ -30,8 +30,11 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
   frames. No sidecar / two-log design.  Payload **v3** (2026-09-24) adds op `CLEAR`: the commit
   whose page images absorbed a leaf's buffered records says so, and replay starts that leaf
   after it.  Never infer that from page images instead -- see `BF_TREE_V2_PLAN.md` D1.
-- **Configurable durability**: group-commit (~1 ms, paper-faithful) *and* strict per-commit
-  fsync via `PRAGMA synchronous`; measure both.  **Not yet what the code does** --
+- **Configurable durability** -- decided 2026-09-24 (plan D2): `bf_deferred_commit<=1` is the
+  durable, paper-faithful mode (records reach the OS before COMMIT returns, like the reference,
+  which never fsyncs); `PRAGMA synchronous=FULL` adds an fsync.  `bf_deferred_commit=N>1` (old
+  name `bf_group_commit`) is bounded DEFERRED durability, and must be reported as such.  Older
+  text, kept for the citation --
   `bf_group_commit=N` is bounded *deferred* durability (`bf_btree.c:705`: the first N-1
   *record-only* commits stage nothing and return; a commit that writes pages never defers).
   See `BF_TREE_V2_PLAN.md` item D2.

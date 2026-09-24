@@ -447,6 +447,13 @@ Checkpointing is async WAL replay; recovery is rebuild-then-replay.
   one recovery walk.  No sidecar, no cross-log atomicity.
 * **Configurable durability**: group commit *and* strict per-commit fsync via
   `PRAGMA synchronous`.  Measure both — the trade-off is a thesis result.
+  **Amended by owner decision, 2026-09-24 (D2):** the durable, paper-faithful mode is
+  `bf_deferred_commit` ≤ 1 — every commit's records reach the OS before it returns, as in the
+  reference — with `PRAGMA synchronous=FULL` adding an fsync.  `bf_deferred_commit=N>1` (old
+  name `bf_group_commit`, kept as an alias) is **bounded deferred durability**, named as such:
+  up to N−1 acknowledged commits may be lost even to a process crash.  A reference-style
+  waiting group commit is not built: it only pays with concurrent committers, which a
+  single-writer engine does not have.
 * **Single writer.**  `BtShared` serialization stays; a documented non-transfer.  Read
   concurrency is in scope (item **S1**).
 * **v1 scope**: rowid tables, primary B-tree only.  Secondary indexes stay write-through.
@@ -700,12 +707,71 @@ overwrite flush of the first design had been *masking* bug #8.
 ### D2 — settle the durability contract  *(a live contradiction, not just a gap)*
 *From: handoff P1b, and §4.2's locked decision, which current source does not implement.*
 
-- [ ] choose one and write it down: **(a)** true interval / log-full group flush where every
-      committing caller waits — what §4.2 locked and what the paper describes; or **(b)**
-      explicitly renamed bounded deferred durability, with the window stated
-- [ ] prefer (a) for thesis comparisons; (b) is only defensible if it is *named* as such
-- [ ] crash-boundary tests for every acknowledged commit
-- [ ] make `PRAGMA synchronous` × group mode an unambiguous matrix
+**Evidence gathered 2026-09-24 (read this before choosing).**
+
+*What the reference actually does* (`../bf-tree`, audited with citations):
+* With its WAL enabled, every insert/delete **blocks until its record is `pwrite()`n** as part
+  of a shared batch (`wal/mod.rs:196-229`, `append_and_wait` waits on `flushed_lsn`); a
+  background thread flushes every `flush_interval` (default **1 ms**, `config.rs:585`) or when the
+  buffer fills.  The committer holds its page write guard while it waits (`tree.rs:997-1000`).
+* **No fsync, anywhere on the WAL path** (`mod.rs:72-89`); "durable" means handed to the OS.
+* The WAL is **off by default** (`config.rs:55`) and **off for every benchmark**
+  (`benchmark/src/wrappers/bf_tree_wrapper.rs:15-43`; the RocksDB baseline sets `disable_wal`).
+* Its recovery (`snapshot.rs:1423-1458`) is documented "Incomplete": it replays deletes as inserts,
+  ignores LSNs, and its reader expects a tag byte the writer never writes.  No test exercises it.
+* There are no transactions: each op is its own record.
+
+*What that means here.*  The reference's batching only pays when several threads commit at
+once; a single-threaded committer would wait up to 1 ms for nobody.  Its guarantee — the record
+reaches the OS before the commit returns — is exactly our **`bf_group_commit=1`**, which we
+already provide, with `PRAGMA synchronous=FULL` adding a real fsync on top (verified: the
+record-only commit is refused whenever sector padding could be needed, so an fsync is issued
+exactly when stock would issue one).  **`bf_group_commit=N>1` does something the reference never
+does: it defers the `write()` itself**, so up to N−1 acknowledged commits are lost even on a
+process crash (the crash oracle asserts precisely that bound, `BF_GROUP=8`, 160/160).
+
+*What the deferral buys* (tripwire, NOT QUOTABLE — `wal_write_amp.sh 5000 200 1`, single-row
+commits, fixed build): WAL bytes/commit stock 7,581; BF group 1: 4,120 (1.84×); group 8: 515
+(14.7×); group 32: 124 (61×).  `synchronous` changes none of these.  **The whole group-mode WAL
+saving is the deferral**; a "true" group commit that writes every commit falls back to the group-1
+bytes.  The previously quoted "~30× less WAL than stock" is a deferred-durability number.
+
+- [x] choose one and write it down — **(b), owner decision 2026-09-24**, on the evidence above:
+      (a) as §4.2 phrased it is not what the reference does, and in a single-writer engine it
+      degenerates to `N=1`.  Renamed: `PRAGMA bf_deferred_commit` (alias `bf_group_commit`);
+      window documented at the pragma (`bf_config.c`) and the batch (`bf_btree.c`)
+- [x] (a)-vs-(b) preference — superseded by the decision above
+- [x] crash-boundary tests for every acknowledged commit — **process crash** (SIGKILL):
+      `crash_oracle.py` asserts recovery ≥ last acknowledged commit − (N−1)
+- [x] the same under **power loss** — `bench/powerloss/` (2026-09-24): a shim VFS keeps an undo
+      log of every write since each file's last sync and, at a random I/O event, reverts the
+      unsynced writes (all / random subset / torn at 512 B sectors) and dies.  285 runs:
+
+      | synchronous | mode | runs | acknowledged commits lost |
+      |---|---|---|---|
+      | FULL | durable (`bf_deferred_commit` ≤ 1) | 60 + 45 sector-padded (`PL_PSOW=0`) | **never** |
+      | FULL | durable, cycling ring (`bf_cache_size=262144`) | 60 | **never** |
+      | FULL | `bf_deferred_commit=8` | 60 | 10 runs, ≤ 2 each — inside the 7-commit window |
+      | NORMAL | durable | 60 | every run, up to 30 (NORMAL promises atomicity only) |
+
+      Every run, in every cell, recovered an exact committed prefix with `integrity_check`
+      ok, before and after a checkpoint: **no torn transaction and no corruption under any
+      loss model**.  The oracle's durability bound is exact, not a heuristic: a commit counts
+      as durable iff no file had an unsynced write when it was acknowledged (an earlier
+      version counted SYNC lines and was fooled by SQLite's WAL-header sync).
+      Not modelled: directory-entry durability (file create/delete) and drive write caches.
+- [x] `PRAGMA synchronous` × mode matrix, process crash, 2026-09-24 (`crash_oracle.py` seeds
+      101–112 × 4 recovery orders = 48 runs per cell, all 288 passing):
+
+      | synchronous | `bf_deferred_commit` | runs that lost acknowledged commits | max lost |
+      |---|---|---|---|
+      | OFF / NORMAL / FULL | 1 | 0 / 0 / 0 of 48 | 0 |
+      | OFF / NORMAL / FULL | 8 | 9 / 9 / 8 of 48 | 2 (window 7) |
+
+      As a process crash must be, `synchronous` changes nothing; the deferral is the only
+      source of loss, and it stays inside its window.  The realised window is smaller than N−1
+      because any commit that also writes pages carries the batch with it.  Power-loss
+      behaviour per cell is the open box above.
 
 ### H0 — make the comparison the paper's comparison
 *From: parity plan Stage A (A1, A2, A4).*  **Mostly done already** — verified 2026-09-21, after
@@ -1139,9 +1205,11 @@ ASan, and a static mini-page reference model.  We mirror it and extend:
   then the remaining transactions must reach stock's final state.  Found five of the six bugs
   in D1 on its first runs.  Its limit: SIGKILL keeps the OS page cache, so it tests process
   crashes, not power loss.
-* **Crash-injection oracle (power loss).**  A test VFS that records writes and fsyncs and cuts
-  power at each fsync boundary.  **Still not built**; D2's strict-durability claim needs it,
-  because a SIGKILL cannot lose a write that reached the kernel.
+* **Power-loss oracle — `bench/powerloss/` (2026-09-24).**  `plvfs.c` (a shim VFS + SQL
+  driver) undoes unsynced writes at a random I/O event — all, a random subset, or torn at
+  sector granularity — and dies; `powerloss_oracle.py` judges recovery against stock's prefix
+  hashes: an exact committed prefix, `integrity_check` ok, and at least every commit
+  acknowledged while nothing was unsynced (minus the deferral window).  Results in D2.
 * **Deterministic crash reproducers.**  `bench/recover_repro.sh` (root-pgno recovery, 3 orders),
   `bench/torn_tail_repro.sh` (torn record-frame tail), `bench/ckpt_repro.sh`.
 * **Full-ROLLBACK generator.**  `bench/gen_rollback_stress.py`, the fifth generator in
@@ -1716,3 +1784,29 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   (validated in scratch, above) once the gate releases `bench/`; then **commit, on the owner's
   go-ahead** — the change is uncommitted, and until it lands every ROLLBACK on `main` can lose
   committed rows.
+
+### 2026-09-24 (cont.) — Claude Opus 5.5 — D2 settled: durable mode named, verified under power loss
+
+- Starting state: branch `d1-rollback-replay-clear` at `d0f3904` (the D1 commit, made on the
+  owner's instruction while the gate was still running; gate results below).
+- Goal: D2 — what an acknowledged commit guarantees.
+- Evidence: a survey of `../bf-tree` (D2 section): its committer waits until its record is
+  `pwrite()`n in a ~1 ms shared batch, never fsyncs, and its WAL is off in every benchmark;
+  its recovery is incomplete.  Tripwire WAL-volume measurements (NOT QUOTABLE) showed the
+  whole group-mode saving is the deferral itself.
+- **Owner decision (AskUserQuestion, 2026-09-24): "name it honestly".**  Implemented:
+  `PRAGMA bf_deferred_commit` is the canonical name (`tool/mkpragmatab.tcl`), `bf_group_commit`
+  kept as an alias; the comments that called the deferral "the paper-faithful setting"
+  (`bf_config.c`, `bf_btree.c`) now say the opposite and state the N−1 window; §4.2 and
+  `CLAUDE.md` amended.  No behaviour change.
+- Validation: process-crash matrix `synchronous` {OFF, NORMAL, FULL} × mode {1, 8}, 288/288,
+  loss only in deferred mode and within its window (D2 table).  Built the power-loss oracle
+  (`bench/powerloss/plvfs.c`, `powerloss_oracle.py`); 285/285 across five configurations (D2
+  table).  Oracle teeth: NORMAL loses acknowledged commits in every run, as it may.
+  First-version oracle defect found and fixed: it took SQLite's WAL-header sync as covering
+  commit 0.
+- Benchmark status: NOT RUN.
+- D1 gate on `d0f3904` (for the record the previous entry promised): see the next entry.
+- Remaining: none of D2's boxes; drive write caches and directory fsync are out of the
+  oracle's model.  §2.3's "~30× less WAL" is a deferred-durability number and must be
+  labelled so wherever it is reported (harness report labels still owed).

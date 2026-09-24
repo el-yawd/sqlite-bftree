@@ -21,7 +21,8 @@
 **   PRAGMA bf_cache_size         - Get/set cache size
 **   PRAGMA bf_cache_stats        - Show cache statistics
 **   PRAGMA bf_promotion_rate     - Get/set read promotion rate
-**   PRAGMA bf_group_commit       - Transactions per record-frame group
+**   PRAGMA bf_deferred_commit    - Bounded deferred durability window (N txns)
+**   PRAGMA bf_group_commit       - Old name of bf_deferred_commit, kept
 **   PRAGMA bf_min_record         - Size-class ladder base
 **   PRAGMA bf_copy_on_access     - Copy-on-access region, percent
 */
@@ -500,16 +501,21 @@ void sqlite3PragmaBfCacheStats(
 }
 
 /*
-** Implementation of PRAGMA bf_group_commit
+** Implementation of PRAGMA bf_deferred_commit (old name: bf_group_commit)
 **
-** PRAGMA bf_group_commit;       -- Returns the current group size (0 = off)
-** PRAGMA bf_group_commit = N;   -- Batch up to N transactions' record frames
+** PRAGMA bf_deferred_commit;       -- Returns the current window (0 = off)
+** PRAGMA bf_deferred_commit = N;   -- Defer up to N-1 commits' record frames
 **
-** With N>1 a commit appends its records to an OPEN record batch and writes
-** nothing; the batch is written by the N-th transaction's commit (or earlier if
-** it fills, or if a base-page flush forces it out).  That is the paper-faithful
-** durability trade: COMMIT returns before the records reach the WAL, so a crash
-** loses at most one group.  N<=1 keeps strict per-commit record logging.
+** BOUNDED DEFERRED DURABILITY -- not group commit (BF_TREE_V2_PLAN.md D2, owner
+** decision 2026-09-24).  With N>1 a RECORD-ONLY commit appends its records to
+** an open batch and writes nothing; the batch is written by the N-th commit, or
+** earlier if it fills, if a base-page flush forces it out, or if a commit also
+** writes pages (which never defers: that would tear the transaction).  So an
+** acknowledged commit may be lost -- up to N-1 of them -- on a process crash as
+** well as a power loss.  The reference does not do this: its committer blocks
+** until its record is written (no fsync), which is what N<=1 does here, with
+** PRAGMA synchronous=FULL adding an fsync.  The WAL-volume saving of N>1 is
+** entirely the deferral; report it as such.
 */
 void sqlite3PragmaBfGroupCommit(
   Parse *pParse,
