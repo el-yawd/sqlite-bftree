@@ -6463,6 +6463,7 @@ static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
     return SQLITE_NOTFOUND;
   }
   if( n<0 || n>pCur->nBfScratch ) return SQLITE_NOTFOUND;
+  btreeGetBfCache(pCur->pBt)->nSeekServed++;
 
   /* Leaf-less keying so the BF read helpers resolve to chldPg. */
   pCur->bfLeaf = chldPg;
@@ -6617,6 +6618,14 @@ int sqlite3BtreeTableMoveto(
             *pRes = -1;
           }
 #endif
+#ifndef SQLITE_OMIT_BF_CACHE
+          /* The exact-match exit skips moveto_table_finish: count the seek
+          ** here too (nSeekLeaf, bf_cache.h). */
+          if( (pCur->curFlags & BTCF_WriteFlag)==0 ){
+            BfCache *pBfSeek = btreeGetBfCache(pCur->pBt);
+            if( pBfSeek ) pBfSeek->nSeekLeaf++;
+          }
+#endif
           return SQLITE_OK;
         }
       }
@@ -6657,6 +6666,10 @@ moveto_table_next_layer:
   }
 moveto_table_finish:
 #ifndef SQLITE_OMIT_BF_CACHE
+  if( rc==SQLITE_OK && pCur->curIntKey && (pCur->curFlags & BTCF_WriteFlag)==0 ){
+    BfCache *pBfSeek = btreeGetBfCache(pCur->pBt);
+    if( pBfSeek ) pBfSeek->nSeekLeaf++;
+  }
   if( rc==SQLITE_OK && pCur->eState==CURSOR_VALID && pCur->curIntKey ){
     int bf_status = sqlite3BfBtreeRecordExists(pCur, &intKey, sizeof(intKey));
     if( bf_status == 1 ){

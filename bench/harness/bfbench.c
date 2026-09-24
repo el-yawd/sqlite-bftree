@@ -342,7 +342,8 @@ static sqlite3_stmt *prep(sqlite3 *db, const char *zSql){
 ** the BF build and zero rows on a stock build, so the same code path works for
 ** both and the JSON simply carries an empty object for stock.
 */
-#define BF_MAX_STATS 40
+#define BF_MAX_STATS 96   /* was 40 while the pragma grew to 43 rows: the tail
+                            ** (wal_commits, group_*) was silently dropped */
 typedef struct BfStats {
   int n;
   char azName[BF_MAX_STATS][32];

@@ -522,6 +522,16 @@ struct BfCache {
                             ** the rest were excluded by the buffering gate in
                             ** sqlite3BtreeInsert before BF was even asked */
   u64 nUpgradeShed;         /* Cold cache records dropped by size upgrades */
+  /* Per-seek read outcome (H1b, 2026-09-24): the only honest record hit rate.
+  ** nMiniPageHit/Miss count LOOKUPS, and one point read makes several (descent
+  ** shortcut, the RecordExists at the leaf, fetchPayload's RecordExists, each
+  ** counted again by its wrapper) -- a miss ~1.8 times, a hit about once -- so
+  ** hits/(hits+misses) understated every hit rate this project has quoted.
+  ** These count once per read-cursor rowid seek that descended:
+  **   nSeekServed  the descent shortcut served the row; the leaf was NOT read
+  **   nSeekLeaf    the seek reached the leaf page (whatever BF then found) */
+  u64 nSeekServed;
+  u64 nSeekLeaf;
 
   /* Record-op replay ordering (D1).  Replay rebuilds the cache from the WAL's
   ** record ops at recovery and after a rollback.  An op is skipped when a later

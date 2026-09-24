@@ -105,7 +105,17 @@ def metrics(r):
         # sweep of bf_cache_size in the 2026-08-25 campaign.  Results produced
         # before the split have no page_cache_hits key; those files are marked
         # unreliable rather than silently re-plotted.
-        "bf_hit_rate": (100.0 * bf.get("mini_page_hits", 0)
+        # Since 2026-09-24 (H1b) the hit rate is PER SEEK: seek_served (the
+        # descent shortcut served the row; the leaf was not read) over all
+        # read-cursor rowid seeks.  mini_page_hits/misses count LOOKUPS -- a
+        # missed read makes ~1.8 of them, a hit ~1 -- so the old ratio
+        # understated every hit rate (h1b: 32.7% by lookups, 46.8% per read).
+        # Older results have no seek_* keys and fall back to the lookup ratio,
+        # reported as bf_lookup_hit_rate; do not compare the two.
+        "bf_hit_rate": (100.0 * bf.get("seek_served", 0)
+                        / max(1, bf.get("seek_served", 0) + bf.get("seek_leaf", 0))
+                        if "seek_served" in bf else None),
+        "bf_lookup_hit_rate": (100.0 * bf.get("mini_page_hits", 0)
                         / max(1, bf.get("mini_page_hits", 0)
                               + bf.get("mini_page_misses", 0))
                         if "mini_page_hits" in bf else None),
@@ -301,12 +311,17 @@ def main():
                             fmt(median([m["commit_p99_us"] for m in ms]), 1),
                             fmt(median([m["write_bytes_per_commit"] for m in ms]), 0)]
                 hit = [m["bf_hit_rate"] for m in ms if m["bf_hit_rate"] is not None]
+                hfmt = lambda h: fmt(median(h), 1)
+                if not hit:          # pre-2026-09-24 results: lookup ratio, marked
+                    hit = [m["bf_lookup_hit_rate"] for m in ms
+                           if m["bf_lookup_hit_rate"] is not None]
+                    hfmt = lambda h: fmt(median(h), 1) + "L"
                 phit = [m["bf_page_hit_rate"] for m in ms
                         if m.get("bf_page_hit_rate") is not None]
                 row += [fmt(median([m["read_MiB"] for m in ms]), 1),
                         fmt(median([m["write_MiB"] for m in ms]), 1),
                         fmt(median([m["cpu_s"] for m in ms]), 1),
-                        fmt(median(hit), 1) if hit else "-",
+                        hfmt(hit) if hit else "-",
                         fmt(median(phit), 1) if phit else "-"]
                 W("| " + " | ".join(row) + " |")
                 csv_rows.append([exp, ax, s] + row[2:])
@@ -430,6 +445,11 @@ def main():
       "pcache2 page hit rate. They are separate counters. A high `pg hit%` "
       "next to a low `rec hit%` means the win, if any, is coming from the "
       "page cache and not from the Bf-Tree record buffer.")
+    W("- `rec hit%` is PER SEEK: the share of read-cursor rowid seeks the descent "
+      "shortcut served without reading the leaf (`seek_served`/`seek_leaf`). A value "
+      "suffixed `L` predates those counters and is the LOOKUP ratio "
+      "`mini_page_hits/(hits+misses)`, which counts a missed read ~1.8 times and "
+      "reads 10-15 points low; never compare the two.")
     # Only the CURRENT build being under test invalidates the whole report; an
     # intentionally old comparison SUT (bf_pre) does not, and saying it does
     # would tell the reader to discard hit rates that are in fact fine.  Those

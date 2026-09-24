@@ -326,6 +326,22 @@ void sqlite3PragmaBfCacheStats(
     }
 
     {
+      /* Per-seek outcome: the record hit rate is seek_served/(served+leaf).
+      ** mini_page_hits/misses count lookups, several per read (bf_cache.h). */
+      u64 nServed = 0, nLeaf = 0;
+      if( pBt ){
+        extern void sqlite3BfBtreeSeekStat(Btree*, u64*, u64*);
+        sqlite3BfBtreeSeekStat(pBt, &nServed, &nLeaf);
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "seek_served", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nServed, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "seek_leaf", P4_STATIC);
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&nLeaf, P4_INT64);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+
+    {
       static const char *const azReplay[] = {
         "replay_applied", "replay_superseded", "replay_torn", "replay_dropped",
         "rollback_rehydrate", "clear_logged"

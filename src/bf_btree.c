@@ -1006,6 +1006,13 @@ void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
   if( pnShed ) *pnShed = pBf ? pBf->nUpgradeShed : 0;
 }
 
+void sqlite3BfBtreeSeekStat(Btree *p, u64 *pnServed, u64 *pnLeaf){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  *pnServed = pBf ? pBf->nSeekServed : 0;
+  *pnLeaf = pBf ? pBf->nSeekLeaf : 0;
+}
+
 void sqlite3BfBtreeClearCache(Btree *p){
   BfCache *pBf;
   if( !p || !p->pBt ) return;
