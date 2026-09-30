@@ -1010,6 +1010,15 @@ Three corrections that change the design, all verified against `../bf-tree`:
 The reference calls it a **gap cache, not a record cache** — "it caches the entire gap"
 (`mini_page_op.rs:936`).
 
+**2026-09-30 — measure first (owner decision).**  In this fork a full-page mirror in the ring
+would duplicate SQLite's own page cache, which already holds whole leaves and answers absent
+keys without I/O, and which the harness already gives part of BF's budget.  What Bf-Tree's
+full page really buys is ONE pool in which pages and records compete.  So the question is
+asked with existing knobs first: `configs/m2_split.json` moves a fixed 36 MiB between the
+ring (2..32 MiB, new runner key `ring_bytes`) and the page cache, on scrambled and contiguous
+zipf point reads and on contiguous range scans.  Page caching winning per byte on `zipfraw`
+=> build M2 as a unified pool; a wash => document it as a non-transfer.
+- [ ] run `configs/m2_split.json` (started 2026-09-30 from clean `aa1a49b`) and decide
 - [ ] **M2a (write side):** mirror the leaf after a mini-page merges to base.  Additive.
       `SQLITE_BF_NO_FULL_PAGE`.
 - [ ] **M2b (read side):** full-page promotion *instead of* record promotion.  A **mode** — the
@@ -2016,3 +2025,12 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   live long enough to share a leaf when materialised.  Next measurement: an autocheckpoint axis
   (0 / 1000 / 10000 / 100000) on update and replace, bf vs ablation, reporting records per
   flushed leaf (ops / clear_logged) beside ops/s.
+
+### 2026-09-30 (cont.) — Claude Opus 5.5 — M2 started as a measurement
+
+- Owner: "let's work on m2", then chose *measure first* over a faithful port / unified pool /
+  skip.  Reason recorded in the M2 item: a ring full page duplicates SQLite's pcache here.
+- `runner.py` gains `ring_bytes` (explicit ring, pcache = rest of the same total);
+  `configs/m2_split.json` (36 runs, ~2 h) launched from clean `aa1a49b`.
+- The `d3_ckpt` campaign died with the previous session at 9/36 and was NOT restarted (it would
+  have competed with M2 work); rerun it on an idle machine before the checkpoint decision.
