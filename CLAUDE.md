@@ -173,7 +173,8 @@ with `bf_min_record` after `bf_cache_size`.  `BF_TREE_V2_PLAN.md` §3.4 has the 
 
 Ablation switches (all default OFF, i.e. the feature is on): `SQLITE_BF_NO_MERGE_SCAN`,
 `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,
-`SQLITE_BF_NO_MINIPAGE_COMPACT`, `SQLITE_BF_NO_UPDATE_BUFFER`.
+`SQLITE_BF_NO_MINIPAGE_COMPACT`, `SQLITE_BF_NO_UPDATE_BUFFER`, `SQLITE_BF_NO_BLIND_INSERT`
+(D3b: `INSERT OR REPLACE` into an index-free table skips the uniqueness-probe leaf read).
 
 ## Debug builds are the fastest diagnostic here
 

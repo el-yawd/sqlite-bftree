@@ -4922,6 +4922,10 @@ static int btreeCursor(
   pCur->bfBaseDone = 0;
   pCur->bfMergeLeaf = 0;
   pCur->bfIx = 0;
+  pCur->bfBlindKey = 0;
+  pCur->bfBlindArmed = 0;
+  pCur->bfBlindSeek = 0;
+  pCur->bfBlindHit = 0;
 #endif
   pCur->pKeyInfo = pKeyInfo;
   pCur->pBtree = p;
@@ -5777,6 +5781,12 @@ static int moveToChild(BtCursor *pCur, u32 newPgno){
   if( rc ){
     pCur->pPage = pCur->apPage[--pCur->iPage];
   }
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
+ && !defined(SQLITE_BF_NO_BLIND_INSERT)
+  else if( pCur->pPage->leaf && pCur->curIntKey ){
+    sqlite3BfBtreeNoteLeaf(pCur);     /* D3b: a non-root table leaf, seen */
+  }
+#endif
   return rc;
 }
 
@@ -6475,6 +6485,56 @@ static int btreeBfParkOnMini(BtCursor *pCur, i64 intKey){
   return SQLITE_OK;
 }
 
+/*
+** D3b: called by OP_NotExists when both of its exits are the next instruction,
+** so the seek result is unused except as the seekResult the following
+** OP_Insert passes down.  Returns 1 if the cursor was armed for a blind upsert
+** of iKey (the caller then skips the seek and passes seekResult 0); 0 if the
+** caller must seek as usual.  The OP_Insert that follows re-checks everything
+** and seeks itself if it cannot go blind, so arming is never a promise.
+*/
+/*
+** VACUUM renumbers every page of the main database, and BF keys everything by
+** page number (2026-09-29).  bAfter==0, as the VACUUM's write transaction on
+** main opens: flush every buffered record to base, so the copy reads plain
+** pages and the VACUUM's commit logs a CLEAR for each flushed leaf -- no op
+** keyed by an OLD page number can be replayed later.  bAfter==1, once
+** sqlite3BtreeCopyFile has committed the new image: drop every mapping, all
+** clean by now.  Before this, the cache kept serving mini-pages keyed by
+** pre-VACUUM page numbers (an extra row in count(*) until the next reopen).
+*/
+int sqlite3BtreeBfVacuum(Btree *p, int bAfter){
+  if( !bAfter ){
+    sqlite3BfBtreeFlushAllDirty(p);
+# if defined(SQLITE_BF_INSERT_BUFFERING)
+    /* Stage the CLEARs NOW: sqlite3BtreeCopyFile commits main through
+    ** sqlite3PagerCommitPhaseOne directly (backup.c), bypassing
+    ** sqlite3BtreeCommitPhaseOne and with it the commit hook that logs them.
+    ** Without this, a reopen replayed pre-VACUUM record ops onto the
+    ** renumbered pages (a .dump showed 17 rows twice; count(*) did not). */
+    return sqlite3BfBtreeLogFlushMarks(p);
+# endif
+  }else{
+    sqlite3BfBtreeClearCache(p);
+  }
+  return SQLITE_OK;
+}
+
+int sqlite3BtreeBfArmBlind(BtCursor *pCur, i64 iKey){
+#if defined(SQLITE_BF_INSERT_BUFFERING) && !defined(SQLITE_BF_NO_BLIND_INSERT)
+  if( pCur->pKeyInfo!=0 ) return 0;       /* not curIntKey: see bfScanCanMerge */
+  if( pCur->pgnoRoot<=1 || (pCur->curFlags & BTCF_WriteFlag)==0 ) return 0;
+  if( btreeGetBfCache(pCur->pBt)==0 ) return 0;
+  pCur->bfBlindKey = iKey;
+  pCur->bfBlindArmed = 1;
+  return 1;
+#else
+  UNUSED_PARAMETER(pCur);
+  UNUSED_PARAMETER(iKey);
+  return 0;
+#endif
+}
+
 static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
   int n;
 
@@ -6715,6 +6775,20 @@ moveto_table_next_layer:
     if( btreeBfServeFromCache(pCur, chldPg, intKey)==SQLITE_OK ){
       *pRes = 0;
       return SQLITE_OK;         /* row served from BF; leaf page not read */
+    }
+#endif
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
+ && !defined(SQLITE_BF_NO_BLIND_INSERT)
+    /* D3b: a blind upsert stops at the leaf's parent when the child is a known
+    ** leaf.  The caller (sqlite3BtreeInsert) consumes the cursor at once:
+    ** BTCF_BfLeaf routes the record write to chldPg, and *pRes is meaningless
+    ** -- whether intKey exists is exactly what the upsert does not need. */
+    if( pCur->bfBlindSeek && sqlite3BfBtreeBlindChild(pCur, chldPg) ){
+      pCur->bfLeaf = chldPg;
+      pCur->curFlags |= BTCF_BfLeaf;
+      pCur->bfBlindHit = 1;
+      *pRes = 1;
+      return SQLITE_OK;
     }
 #endif
     rc = moveToChild(pCur, chldPg);
@@ -7987,6 +8061,10 @@ static int allocateBtreePage(
 end_allocate_page:
   releasePage(pTrunk);
   releasePage(pPrevTrunk);
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* D3b: whatever *pPgno was, it is about to become something new. */
+  if( rc==SQLITE_OK ) sqlite3BfBtreeNotePageAllocated(pBt, *pPgno);
+#endif
   assert( rc!=SQLITE_OK || sqlite3PagerPageRefcount((*ppPage)->pDbPage)<=1 );
   assert( rc!=SQLITE_OK || (*ppPage)->isInit==0 );
   return rc;
@@ -10284,6 +10362,17 @@ static int balance_deeper(MemPage *pRoot, MemPage **ppChild){
   /* Zero the contents of pRoot. Then install pChild as the right-child. */
   zeroPage(pRoot, pChild->aData[0] & ~PTF_LEAF);
   put4byte(&pRoot->aData[pRoot->hdrOffset+8], pgnoChild);
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* A root that was a LEAF just became an interior page in place, without
+  ** being freed -- the one leaf-to-interior transition that bypasses
+  ** freePage2's ForgetPage.  Its mini-page (clean: the base write that got us
+  ** here flushed the table first) must go now.  Left behind, it outlived the
+  ** tree growing and shrinking again: when balance_shallower made the root a
+  ** leaf once more, the stale cached copy of a since-deleted row was served by
+  ** the next point read (found 2026-09-29 by gen_blind_stress.py; a range
+  ** DELETE on a small table with overflow rows was enough). */
+  if( pChild->leaf ) sqlite3BfBtreeForgetPage(pBt, pRoot->pgno);
+#endif
 
   *ppChild = pChild;
   return SQLITE_OK;
@@ -10678,6 +10767,47 @@ int sqlite3BtreeInsert(
     /* BF per-leaf write buffering now happens AFTER the descent below, once
     ** the target leaf (loc) is known — see the SQLITE_BF_INSERT_BUFFERING
     ** block just before the base-page cell write. */
+
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
+ && !defined(SQLITE_BF_NO_BLIND_INSERT)
+    /* D3b blind insert (2026-09-29).  OP_NotExists armed this cursor instead
+    ** of seeking because its outcome could not change what happens next (see
+    ** sqlite3BtreeBfArmBlind), so loc is 0 and the cursor is not positioned.
+    ** Descend to the leaf's PARENT only and, when the child is a known leaf,
+    ** buffer an upsert there: the leaf is never read.  That leaf read is what
+    ** every buffered insert used to pay (3.9 KiB of reads per 116 B insert,
+    ** plan D3b).  Otherwise the descent completes as an ordinary seek and the
+    ** insert continues below with a real loc, exactly as if OP_NotExists had
+    ** sought. */
+    if( pCur->bfBlindArmed ){
+      pCur->bfBlindArmed = 0;
+      if( loc==0 && pCur->bfBlindKey==pX->nKey
+       && pCur->pgnoRoot>1
+       && (flags & (BTREE_SAVEPOSITION|BTREE_PREFORMAT|BTREE_APPEND))==0
+       && pX->pData!=0 && pX->nData>0 && pX->nData<=(int)BF_MAX_MINI_PAGE
+       && pX->nZero==0
+       && btreeGetBfCache(pCur->pBt)!=0
+      ){
+        pCur->bfBlindHit = 0;
+        pCur->bfBlindSeek = 1;
+        rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
+        pCur->bfBlindSeek = 0;
+        if( rc ) return rc;
+        if( pCur->bfBlindHit ){
+          int bfrc;
+          pCur->bfBlindHit = 0;
+          bfrc = sqlite3BfBtreeBlindInsert(pCur, pX->nKey, pX->pData, pX->nData);
+          pCur->curFlags &= ~(BTCF_BfLeaf|BTCF_ValidNKey|BTCF_ValidOvfl);
+          pCur->eState = CURSOR_INVALID;
+          if( bfrc==SQLITE_OK ) return SQLITE_OK;
+          if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+          /* Refused: seek for real (the leaf is read after all). */
+          rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
+          if( rc ) return rc;
+        }
+      }
+    }
+#endif
 
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
     /* Write-back UPDATE (Phase 2): the cursor is serving a dirty buffered row
@@ -11106,7 +11236,16 @@ int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, i64 iKey){
   if( pDest->pKeyInfo==0 ) aOut += putVarint(aOut, iKey);
   nIn = pSrc->info.nLocal;
   aIn = pSrc->info.pPayload;
-  if( aIn+nIn>pSrc->pPage->aDataEnd ){
+  if( aIn+nIn>pSrc->pPage->aDataEnd
+#ifndef SQLITE_OMIT_BF_CACHE
+   /* A row served from the BF cache (a merge scan ON a buffered record, or a
+   ** descent-shortcut read) lives in the cursor's scratch buffer, not on
+   ** pSrc->pPage, and is always whole and local (nLocal==nPayload).  This
+   ** check made every VACUUM, and every transfer-optimised INSERT...SELECT, of
+   ** a table with buffered rows fail as "malformed" (2026-09-29). */
+   && !pSrc->bfOnMini && (pSrc->curFlags & BTCF_BfLeaf)==0
+#endif
+  ){
     return SQLITE_CORRUPT_PAGE(pSrc->pPage);
   }
   nRem = pSrc->info.nPayload;
@@ -11743,6 +11882,13 @@ int sqlite3BtreeClearTable(Btree *p, int iTable, i64 *pnChange){
     }
     rc = clearDatabasePage(pBt, (Pgno)iTable, 0, pnChange);
   }
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* clearDatabasePage frees every other page (freePage2 forgets their
+  ** mini-pages) but ZEROES the root in place, so the root's mini-page -- clean
+  ** after the flush above -- survived "DELETE FROM t" and served the deleted
+  ** rows to later point reads (2026-09-29, gen_blind_stress.py). */
+  sqlite3BfBtreeForgetPage(pBt, (Pgno)iTable);
+#endif
   sqlite3BtreeLeave(p);
   return rc;
 }

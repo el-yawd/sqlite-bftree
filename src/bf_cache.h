@@ -574,6 +574,22 @@ struct BfCache {
   int nFlushed;
   int nFlushedAlloc;
   u8 bFlushedOom;
+
+  /* D3b blind insert (2026-09-29): a bitmap over pgno of pages KNOWN to be
+  ** non-root table leaves, so an upsert can buffer against a child pgno
+  ** without reading the child.  SQLite interior pages do not record their
+  ** height, so this is how the descent tells "the next page is a leaf" from
+  ** the parent alone.  Set when a descent enters a table leaf (moveToChild);
+  ** a non-root page keeps its leaf-ness until it is freed, so the bit is
+  ** cleared when the page is freed (ForgetPage) or allocated, for every page
+  ** at or above an xTruncate limit (file shrink, pager reset after another
+  ** connection's write), and wholesale by every rollback (ClearCache).  A bit
+  ** is only ever a claim about the CURRENT snapshot. */
+  u8 *aLeafBit;
+  u32 nLeafBit;             /* bytes in aLeafBit */
+  u64 nBlindInserts;        /* upserts buffered without reading the leaf */
+  u64 nBlindNoLeaf;         /* armed, but the child was not a known leaf */
+  u64 nBlindRefused;        /* reached a known leaf, but the mini-page refused */
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
@@ -839,6 +855,16 @@ SQLITE_PRIVATE int sqlite3BfBtreeKeyTombstoned(BtCursor *pCur, Pgno leaf,
 /* D3-core: the DIRTY op (BFOP_INSERT / BFOP_DELETE) buffered for rowid on leaf,
 ** or -1 when the leaf holds no dirty record for it. */
 SQLITE_PRIVATE int sqlite3BfBtreeKeyDirtyOp(BtCursor *pCur, Pgno leaf, i64 rowid);
+/* D3b: the known-leaf bitmap (BfCache.aLeafBit) and the blind upsert. */
+SQLITE_PRIVATE void sqlite3BfLeafBitSet(BfCache *pBf, u32 pgno);
+SQLITE_PRIVATE void sqlite3BfLeafBitClear(BfCache *pBf, u32 pgno);
+SQLITE_PRIVATE void sqlite3BfLeafBitClearFrom(BfCache *pBf, u32 pgno);
+SQLITE_PRIVATE int sqlite3BfLeafBitTest(BfCache *pBf, u32 pgno);
+SQLITE_PRIVATE void sqlite3BfBtreeNoteLeaf(BtCursor *pCur);
+SQLITE_PRIVATE void sqlite3BfBtreeNotePageAllocated(BtShared *pBt, Pgno pgno);
+SQLITE_PRIVATE int sqlite3BfBtreeBlindChild(BtCursor *pCur, Pgno chldPg);
+SQLITE_PRIVATE int sqlite3BfBtreeBlindInsert(BtCursor *pCur, i64 rowid,
+    const void *pData, int nData);
 /* D3a: buffer an existing-row overwrite as a BFOP_INSERT upsert on the cursor's
 ** leaf; SQLITE_OK if buffered, SQLITE_FULL to fall through to the base write. */
 SQLITE_PRIVATE int sqlite3BfBtreeUpdateCell(BtCursor *pCur, i64 rowid,

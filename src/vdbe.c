@@ -5539,6 +5539,23 @@ notExistsWithKey:
   pCrsr = pC->uc.pCursor;
   assert( pCrsr!=0 );
   res = 0;
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* D3b blind insert: when BOTH exits of this OP_NotExists are the next
+  ** instruction (INSERT OR REPLACE into a rowid table with no index, trigger
+  ** or foreign key), the answer changes nothing but the seekResult handed to
+  ** OP_Insert.  Let the btree arm a blind upsert instead of reading the leaf;
+  ** seekResult 0 makes OP_Insert's sqlite3BtreeInsert position itself. */
+  if( pOp->opcode==OP_NotExists && pOp->p2==(int)(pOp - aOp) + 1
+   && sqlite3BtreeBfArmBlind(pCrsr, iKey)
+  ){
+    pC->movetoTarget = iKey;
+    pC->nullRow = 0;
+    pC->cacheStatus = CACHE_STALE;
+    pC->deferredMoveto = 0;
+    pC->seekResult = 0;
+    break;
+  }
+#endif
   rc = sqlite3BtreeTableMoveto(pCrsr, iKey, 0, &res);
   assert( rc==SQLITE_OK || res==0 );
   pC->movetoTarget = iKey;  /* Used by OP_Delete */

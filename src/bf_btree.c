@@ -1019,6 +1019,9 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[0] = pBf ? pBf->nBufferedUpdates : 0;
   aOut[1] = pBf ? pBf->nUpdateFallbacks : 0;
   aOut[2] = pBf ? pBf->nShadowServes : 0;
+  aOut[3] = pBf ? pBf->nBlindInserts : 0;
+  aOut[4] = pBf ? pBf->nBlindNoLeaf : 0;
+  aOut[5] = pBf ? pBf->nBlindRefused : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){
@@ -1028,6 +1031,9 @@ void sqlite3BfBtreeClearCache(Btree *p){
   if( !pBf ) return;
   sqlite3BfMapIterate(pBf, bfClearOneEntry, NULL);
   pBf->bDirtyInserts = 0;  /* rolled-back inserts discarded */
+  /* D3b: a rollback can un-allocate a page without freePage2 ever seeing it,
+  ** and the next allocation may make it an interior page. */
+  sqlite3BfLeafBitClearFrom(pBf, 0);
   sqlite3BfUnlogListReset(pBf);   /* the pages it named no longer exist */
   /* NOT the flushed-leaf list: a SAVEPOINT rollback also lands here, and the
   ** flushes it recorded before the savepoint opened are still in base pages
@@ -1296,6 +1302,23 @@ int sqlite3BfBtreeMaxBufferedRowid(BtCursor *pCur, i64 *pMax){
   return 0;
 }
 
+/*
+** Can a DIRTY record of nVal value bytes be committed at all?  Commit logs it
+** as ONE record inside ONE WAL frame, whose payload is a page (bf_wal.h); a
+** record that does not fit an empty batch fails the whole commit with
+** SQLITE_CORRUPT (bfLogRecord).  BF_MAX_MINI_PAGE is 4096, so with 4 KiB pages
+** the mini-page limit always bound first and this could not happen -- at 512
+** or 1024 B pages an INSERT of a ~1.8 KB row failed as "malformed" (found
+** 2026-09-30 by gen_blind_stress.py, which now runs small pages).  Every path
+** that creates a dirty record asks this first and writes through otherwise.
+*/
+static int bfDirtyRecordFits(BfCache *pBf, int nVal){
+  BfWalRec r;
+  memset(&r, 0, sizeof(r));
+  r.pgno = 2; r.rootPgno = 2; r.op = BFWAL_OP_INSERT; r.nKey = 8; r.nVal = nVal;
+  return sqlite3BfWalRecSize(&r) <= pBf->szPage - BFWAL_HDRSIZE;
+}
+
 int sqlite3BfBtreeInsertCell(
   BtCursor *pCur,
   const void *pKey,
@@ -1312,7 +1335,10 @@ int sqlite3BfBtreeInsertCell(
   pBf = btreeGetBfCache(pBt);
   if( !pBf ) return SQLITE_NOTFOUND;
 
-  if( nData>BF_MAX_MINI_PAGE || nKey!=8 ){ pBf->nInsertRefused++; return SQLITE_FULL; }
+  if( nData>BF_MAX_MINI_PAGE || nKey!=8 || !bfDirtyRecordFits(pBf, nData) ){
+    pBf->nInsertRefused++;
+    return SQLITE_FULL;
+  }
 
   /* Per-leaf keying (Phase 1): buffer the insert into the mini-page of the
   ** leaf the cursor has descended to, not the table root.  If the cursor is
@@ -1502,6 +1528,75 @@ int sqlite3BfBtreeKeyDirtyOp(BtCursor *pCur, Pgno leaf, i64 rowid){
   return (op==BFOP_INSERT || op==BFOP_DELETE) ? (int)op : -1;
 }
 
+/*
+** D3b (2026-09-29) -- blind insert.
+**
+** The known-leaf bitmap.  NoteLeaf runs when a descent has just entered a
+** table leaf through its parent (moveToChild), i.e. a NON-root leaf: a root
+** changes from leaf to interior in place (balance_deeper) without being freed,
+** so roots are never recorded -- and a root is never reached as a child anyway.
+** Every other page keeps its level until freePage2 frees it; allocation and
+** rollback clear the bit too (bf_cache.h, BfCache.aLeafBit).
+*/
+void sqlite3BfBtreeNoteLeaf(BtCursor *pCur){
+  BfCache *pBf;
+  if( pCur->iPage<1 || !pCur->pPage->leaf || !pCur->pPage->intKey ) return;
+  pBf = sqlite3PagerGetBfCache(pCur->pBt->pPager);
+  if( pBf ) sqlite3BfLeafBitSet(pBf, pCur->pPage->pgno);
+}
+void sqlite3BfBtreeNotePageAllocated(BtShared *pBt, Pgno pgno){
+  BfCache *pBf = pBt ? sqlite3PagerGetBfCache(pBt->pPager) : 0;
+  if( pBf ) sqlite3BfLeafBitClear(pBf, pgno);
+}
+
+/*
+** The blind descent's test at the leaf edge: may the upsert buffer against
+** chldPg without reading it?  Only if it is a known leaf.  Counts the misses.
+*/
+int sqlite3BfBtreeBlindChild(BtCursor *pCur, Pgno chldPg){
+  BfCache *pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf ) return 0;
+  if( chldPg>1 && sqlite3BfLeafBitTest(pBf, chldPg) ) return 1;
+  pBf->nBlindNoLeaf++;
+  return 0;
+}
+
+/*
+** Buffer the upsert of `rowid` on the leaf the blind descent stopped above
+** (pCur->bfLeaf, BTCF_BfLeaf).  Whether the key exists does not matter: a
+** BFOP_INSERT over a base cell shadows it (D3-core), over a buffered record it
+** replaces it, over a tombstone or a phantom it revives the row.  It must
+** still note the rowid for OP_NewRowid, as a buffered insert does.
+** SQLITE_OK, SQLITE_FULL (caller seeks for real and writes as usual), NOMEM.
+*/
+int sqlite3BfBtreeBlindInsert(BtCursor *pCur, i64 rowid,
+                              const void *pData, int nData){
+  BfCache *pBf;
+  u8 keyBuf[8];
+  u32 leaf;
+  int rc;
+
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf ) return SQLITE_FULL;
+  leaf = bfCursorLeafPgno(pCur);
+  if( leaf==0 || nData>BF_MAX_MINI_PAGE || !bfDirtyRecordFits(pBf, nData) ){
+    pBf->nBlindRefused++;
+    return SQLITE_FULL;
+  }
+  bfEncodeRowid(rowid, keyBuf);
+  rc = sqlite3BfRecordWrite(pBf, leaf, keyBuf, 8, pData, nData, BFOP_INSERT);
+  if( rc==BF_OK ){
+    bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
+    pBf->bDirtyInserts = 1;
+    pBf->nBlindInserts++;
+    bfNoteMaxRowid(pBf, pCur->pgnoRoot, keyBuf);
+    return SQLITE_OK;
+  }
+  if( rc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+  pBf->nBlindRefused++;
+  return SQLITE_FULL;
+}
+
 void sqlite3BfBtreeNoteShadowServe(BtCursor *pCur){
   BfCache *pBf = (pCur && pCur->pBt) ? btreeGetBfCache(pCur->pBt) : 0;
   if( pBf ) pBf->nShadowServes++;
@@ -1528,7 +1623,10 @@ int sqlite3BfBtreeUpdateCell(BtCursor *pCur, i64 rowid,
   pBf = btreeGetBfCache(pCur->pBt);
   if( !pBf ) return SQLITE_FULL;
   leaf = bfCursorLeafPgno(pCur);
-  if( leaf==0 || nData>BF_MAX_MINI_PAGE ){ pBf->nUpdateFallbacks++; return SQLITE_FULL; }
+  if( leaf==0 || nData>BF_MAX_MINI_PAGE || !bfDirtyRecordFits(pBf, nData) ){
+    pBf->nUpdateFallbacks++;
+    return SQLITE_FULL;
+  }
   bfEncodeRowid(rowid, keyBuf);
   rc = sqlite3BfRecordWrite(pBf, leaf, keyBuf, 8, pData, nData, BFOP_INSERT);
   if( rc==BF_OK ){
@@ -1574,7 +1672,15 @@ static int bfScanCanMerge(BtCursor *pCur){
   ** rowid table cursor" fact, known from cursor creation, so use it as the
   ** pre-descent form of the same test (without it merge never armed on a fresh
   ** cursor and every scan fell back to the flush path). */
-  if( (!pCur->curIntKey && pCur->pKeyInfo!=0) || pCur->pgnoRoot<=1 ) return 0;
+  /* CORRECTION 2026-09-30: curIntKey is not 0 before the first descent, it is
+  ** UNINITIALISED -- it lives past BTCURSOR_FIRST_UNINIT, and btreeCursor never
+  ** sets it (0xAA under SQLITE_DEBUG).  The old test, (!curIntKey && pKeyInfo),
+  ** therefore let garbage arm a merge scan on an INDEX cursor, and the next
+  ** step reported SQLITE_CORRUPT from bfMergePick's leaf check: a covering-
+  ** index count(*) inside a transaction with buffered rows, whenever the
+  ** cursor's memory happened to hold a non-zero byte.  pKeyInfo alone is the
+  ** static fact: rowid table iff pKeyInfo==0. */
+  if( pCur->pKeyInfo!=0 || pCur->pgnoRoot<=1 ) return 0;
   if( (pCur->curFlags & BTCF_WriteFlag)!=0 ) return 0;
   pBf = btreeGetBfCache(pCur->pBt);
   if( !pBf || !pBf->bDirtyInserts ) return 0;
@@ -2326,6 +2432,7 @@ void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno){
   if( !pBt || pgno<=1 ) return;
   pBf = sqlite3PagerGetBfCache(pBt->pPager);
   if( !pBf ) return;
+  sqlite3BfLeafBitClear(pBf, pgno);   /* D3b: freed, so no longer a known leaf */
   pEntry = sqlite3BfMapLookup(pBf, pgno);
   if( pEntry && pEntry->locType==BF_LOC_MINI ){
     /* Drop only CLEAN mini-pages.  A dirty mini-page (buffered BFOP_INSERT /

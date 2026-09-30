@@ -250,6 +250,10 @@ void sqlite3BtreeCursorHint(BtCursor*, int, ...);
 #endif
 
 int sqlite3BtreeCloseCursor(BtCursor*);
+#ifndef SQLITE_OMIT_BF_CACHE
+int sqlite3BtreeBfArmBlind(BtCursor*, i64);
+int sqlite3BtreeBfVacuum(Btree*, int);
+#endif
 int sqlite3BtreeTableMoveto(
   BtCursor*,
   i64 intKey,

@@ -373,6 +373,8 @@ def build_argv(run, dbpath, jsonpath, page_floor):
             argv += ["--min-record", str(run["min_record"])]
         if run.get("copy_on_access") is not None:
             argv += ["--copy-on-access", str(run["copy_on_access"])]
+    if run.get("insert_mode"):
+        argv += ["--insert-mode", run["insert_mode"]]      # stock too: same SQL
     return argv
 
 

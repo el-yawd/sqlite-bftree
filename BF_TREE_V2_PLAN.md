@@ -400,6 +400,7 @@ Stops at:
 `SQLITE_BF_NO_MINIPAGE_COMPACT`, `SQLITE_BF_NO_COPY_ON_ACCESS`, `SQLITE_BF_NO_DIRTYLIST`,
 `SQLITE_BF_NO_UNLOGLIST`, `SQLITE_BF_NO_DROPCLEAN`, `SQLITE_BF_NO_MAXROWID`,
 `SQLITE_BF_NO_UPDATE_BUFFER` (D3a; D3-core's shadow serve is correctness and has no switch),
+`SQLITE_BF_NO_BLIND_INSERT` (D3b),
 `SQLITE_BF_UPGRADE_SHED` (opt-**in**).  All `NO_` switches default off, i.e. the feature is on.
 
 PRAGMAs (authoritative list: `tool/mkpragmatab.tcl:410-436`): `bf_cache` (enable),
@@ -947,17 +948,45 @@ not let it claim D3a's result.
 `sqlite3BtreeInsert` needs `loc`, `loc` comes from the descent, and *that descent is what reads
 the leaf*.
 
-- [ ] let the descent stop at the parent for a write cursor — `sqlite3BfBtreeDescentProbe`
-      refuses write cursors today; the insert path does not need a positioned cursor on success
-      (it sets `CURSOR_INVALID` and returns), only the child pgno, which the parent has
-- [ ] buffer the record against that pgno without consulting the base leaf
-- [ ] reads already prefer the buffered record; nothing new there
-- [ ] measure the **safe subsets first**, because they need no D3-core at all: `BTREE_APPEND`
-      inserts (the caller guarantees novelty) and keys with an existing `BFOP_PHANTOM`.  Neither
-      helps `bfbench` much — it inserts random keys into gaps — which is exactly why their share
-      must be *measured*: if it is negligible, that is the evidence for paying for D3-core
-- [ ] behind `SQLITE_BF_NO_BLIND_INSERT` (default = on), with `blind_inserts` / `blind_refused`
-      counters
+**BUILT 2026-09-30 (correctness-gated; measurement is the D campaign).**  Design as landed:
+
+- **Where the read is.**  Every explicit-key INSERT runs `OP_NotExists` first, and *that* seek
+  reads the leaf.  For a plain INSERT its answer is required (a duplicate must fail).  For
+  `INSERT OR REPLACE` on a rowid table with no index, trigger or FK, both of its exits are the
+  next instruction, so the answer is irrelevant -- the reference's upsert.  `vdbe.c` detects
+  exactly that shape (`p2 == pc+1`) and arms the cursor instead of seeking
+  (`sqlite3BtreeBfArmBlind`); `sqlite3BtreeInsert` then descends only to the leaf's PARENT
+  and buffers a `BFOP_INSERT` upsert against the child (D3-core makes that correct whether or
+  not the key exists).  Anything declined seeks for real and continues as before.
+- **Knowing the child is a leaf** without reading it: SQLite interior pages do not record
+  height, so `BfCache.aLeafBit` is a bitmap of pages known to be non-root table leaves -- set
+  when a descent enters one (`moveToChild`), cleared on free (`ForgetPage`), allocation,
+  `xTruncate` and every rollback.  Roots are never recorded (`balance_deeper` changes a root's
+  level in place).  A plain INSERT is never blind; neither the safe-subset idea (APPEND /
+  PHANTOM) nor a full-page gap cache was needed.
+- Switch `SQLITE_BF_NO_BLIND_INSERT`; counters `blind_inserts`, `blind_no_leaf`,
+  `blind_refused`.  Known limitation: a ROLLBACK clears the whole bitmap (conservative), so a
+  rollback-heavy workload goes blind rarely (crash test: 229 blind of ~2.5k REPLACEs at 10%
+  rollbacks).  Tracking the pages a transaction allocated would make that exact.
+- `bench/gen_blind_stress.py` (7th generator): page reuse (DROP/CREATE), `DELETE FROM`,
+  VACUUM, splits under ROLLBACK/savepoints, root-leaf growth, auto-rowid after large blind
+  keys, and **512/1024-byte pages** -- a stale bit is only observable at depth >= 3, and with 4
+  KiB pages the generator could not see a bitmap that was never cleared (216/216 with every
+  clear compiled out).  With small pages that mutant fails 108/216.
+- Validation: full gate 50/50; SIGKILL after 500 committed REPLACE/DELETE/UPDATE transactions
+  on a 512-byte-page tree recovers byte-identical to stock in both recovery orders.
+
+**Seven older bugs this generator found (all reproduced with D3b compiled out, all fixed):**
+
+| # | bug | symptom | fix |
+|---|---|---|---|
+| 1 | a root that was a leaf became interior in place (`balance_deeper`) keeping its mini-page | a deleted row served by a point read after the table shrank back | forget the root's mini-page there |
+| 2 | `DELETE FROM t` zeroes the root in place | deleted rows served | forget the root after `clearDatabasePage` |
+| 3 | `sqlite3BtreeTransferRow` bounds-checked a BF-served payload against the page | **every VACUUM (and xfer `INSERT…SELECT`) of a table with buffered rows: "malformed"** | skip the page bound for `bfOnMini`/`BTCF_BfLeaf` sources |
+| 4 | VACUUM renumbers pages; the cache and the log kept old pgnos, and `CopyFile` commits via the pager, skipping the CLEAR hook | an extra row until reopen; after reopen 17 rows dumped twice | flush + stage CLEARs as VACUUM opens main's txn, clear the cache after the copy |
+| 5 | ring: the head sweep reclaimed a FREELISTED block without unlinking it; once re-freed, two chains shared a node | segfault in `bfFreeListRemove` (cycling ring) | drop that size class's chain when the sweep reclaims a member |
+| 6 | a dirty record larger than one WAL frame (small pages) cannot be logged | INSERT of a ~1.8 KB row at 512 B pages: "malformed" at commit | `bfDirtyRecordFits`: such records write through |
+| 7 | `bfScanCanMerge` read `curIntKey` before the first descent -- it is UNINITIALISED | a merge scan armed on an INDEX cursor: covering-index `count(*)` "malformed" | test `pKeyInfo` only (also fixed in the new arm check) |
 
 ### M2 — full-page / gap cache (`BF_LOC_FULL`)
 *From: parity plan B3 (corrected 2026-09-21), handoff P5.*  Currently **zero lines of logic**.
@@ -1947,3 +1976,18 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Exact next action: the D-letter campaign (H6-style write arms: insert / update / mixed,
   group 1 and 32, `bf` vs a `NO_UPDATE_BUFFER` SUT), or D3b (blind insert) first if the owner
   prefers to batch the write mechanisms into one campaign.
+
+### 2026-09-30 — Claude Opus 5.5 — D3b blind insert built; its generator found seven older bugs
+
+- Owner: "build d3b first then benchmark".  D3b as designed in its item (REPLACE-shaped
+  inserts skip `OP_NotExists`'s leaf read via a known-leaf bitmap).
+- `bench/gen_blind_stress.py` exposed seven bugs that predate D3b (table in D3b); the two worst:
+  every VACUUM of a table with buffered rows failed, and a ring free-list corruption segfault.
+  Also learnt: a generator must be proven able to see its target (mutation test) -- the first
+  version could not, until it used small pages; and a reducer's temp dir must be on tmpfs
+  (rollback-journal fsyncs on btrfs-on-LUKS timed every run out, reading as "no divergence").
+- Harness: `bfbench --insert-mode replace`, runner key `insert_mode`, SUTs `bf_noupd` /
+  `bf_noblind` in `build_suts.sh --all`.
+- Validation: full gate 50/50; mutation test (bitmap clears compiled out) 108/216 fail; crash
+  test byte-identical to stock.
+- Exact next action: the D-letter write campaign (`configs/d3.json`).

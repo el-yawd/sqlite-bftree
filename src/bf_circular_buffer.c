@@ -231,6 +231,34 @@ static int bfFreeListAdd(BfFreeList *pFl, void *ptr, u32 size){
 }
 
 /*
+** Abandon the chain a block of `size` bytes would have been filed under
+** (bfFreeListAdd's class rule).  Called when the eviction sweep reclaims a
+** block that is still FREELISTED: the chain runs THROUGH that block, and a
+** chain that outlives its members is how two chains came to share a node.
+**
+** The head check in bfFreeListRemove only catches a swept block that is still
+** in the wrong state.  It cannot catch one that the tail has since reused AND
+** that has been freed again: that block is FREELISTED once more, but its next
+** pointer now belongs to the chain it was re-filed on, while the old chain's
+** predecessor still points at it.  Two lists then share nodes, a block is
+** handed out twice, and the ring corrupts itself (2026-09-30:
+** gen_blind_stress.py, cycling ring, bfFreeListRemove segfaulting on a
+** next pointer that was record bytes).  Dropping the class is O(1) and loses
+** nothing -- the head sweep reclaims that space like any other block.
+*/
+static void bfFreeListDropClassOf(BfFreeList *pFl, u32 size){
+  int i;
+  sqlite3_mutex_enter(pFl->mutex);
+  for(i = BF_SIZE_CLASS_COUNT - 1; i >= 0; i--){
+    if( pFl->aSizeClass[i] <= size ){
+      pFl->apHead[i] = 0;
+      break;
+    }
+  }
+  sqlite3_mutex_leave(pFl->mutex);
+}
+
+/*
 ** Try to remove a pointer from the free list for a given size.
 ** Returns pointer on success, NULL if list is empty.
 */
@@ -602,6 +630,7 @@ int sqlite3BfCircularBufferEvictOne(BfCircularBuffer *pCb,
         ** benign: bfFreeListRemove will return it, but the allocator checks
         ** copy-on-access status before reusing, and a double-use of an
         ** evicted slot just results in a fresh tail allocation instead. */
+        bfFreeListDropClassOf(&pCb->freeList, pMeta->size);
         bfMetaStoreState(pMeta, BF_STATE_TOMBSTONE);
         bfTombstoneToEvicted(pMeta);
         break;

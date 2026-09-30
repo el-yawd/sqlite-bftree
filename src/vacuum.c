@@ -269,6 +269,12 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
   if( rc!=SQLITE_OK ) goto end_of_vacuum;
   rc = sqlite3BtreeBeginTrans(pMain, pOut==0 ? 2 : 0, 0);
   if( rc!=SQLITE_OK ) goto end_of_vacuum;
+#ifndef SQLITE_OMIT_BF_CACHE
+  if( pOut==0 ){
+    rc = sqlite3BtreeBfVacuum(pMain, 0);
+    if( rc!=SQLITE_OK ) goto end_of_vacuum;
+  }
+#endif
 
   /* Do not attempt to change the page size for a WAL database */
   if( sqlite3PagerGetJournalMode(sqlite3BtreePager(pMain))
@@ -377,6 +383,9 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
 
     if( pOut==0 ){
       rc = sqlite3BtreeCopyFile(pMain, pTemp);
+#ifndef SQLITE_OMIT_BF_CACHE
+      if( rc==SQLITE_OK ) (void)sqlite3BtreeBfVacuum(pMain, 1);
+#endif
     }
     if( rc!=SQLITE_OK ) goto end_of_vacuum;
     rc = sqlite3BtreeCommit(pTemp);

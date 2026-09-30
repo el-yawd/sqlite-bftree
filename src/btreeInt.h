@@ -570,6 +570,16 @@ struct BtCursor {
                             ** is exhausted (ix is u16, so it cannot go to -1) */
   Pgno bfMergeLeaf;         /* Leaf pgno bfIx indexes into (detects leaf change) */
   int bfIx;                 /* Next mini-page sorted index to examine on merge */
+  /* D3b blind insert: OP_NotExists whose outcome does not matter (both of its
+  ** exits are the next instruction -- INSERT OR REPLACE on a table with no
+  ** index, trigger or FK) arms the cursor for bfBlindKey instead of seeking;
+  ** the following sqlite3BtreeInsert descends only to the leaf's PARENT
+  ** (bfBlindSeek) and, when the child is a known leaf (bfBlindHit), buffers an
+  ** upsert against it without reading it. */
+  i64 bfBlindKey;
+  u8 bfBlindArmed;
+  u8 bfBlindSeek;
+  u8 bfBlindHit;
 #endif
   i8 iPage;                 /* Index of current page in apPage */
   u8 curIntKey;             /* Value of apPage[0]->intKey */

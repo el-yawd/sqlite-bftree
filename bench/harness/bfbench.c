@@ -421,6 +421,9 @@ typedef struct Config {
   int nPromotion;
   int nMinRecord;             /* PRAGMA bf_min_record; -1 leaves the default */
   int nCopyOnAccess;          /* PRAGMA bf_copy_on_access, percent; -1 = default */
+  int bInsertReplace;         /* --insert-mode replace: INSERT OR REPLACE (upsert),
+                              ** the reference's insert semantics and the shape the
+                              ** D3b blind insert takes (plan D3b) */
   int bfEnable;              /* -1 = leave alone, 0/1 = PRAGMA bf_cache */
   int nOpsPerTxn;
   int nAutoCheckpoint;
@@ -888,7 +891,9 @@ static int cmdRun(Config *p){
 
   s.pRead   = prep(db, "SELECT v FROM usertable WHERE id=?");
   s.pUpdate = prep(db, "UPDATE usertable SET v=? WHERE id=?");
-  s.pInsert = prep(db, "INSERT INTO usertable VALUES(?,?)");
+  s.pInsert = prep(db, p->bInsertReplace
+                      ? "INSERT OR REPLACE INTO usertable VALUES(?,?)"
+                      : "INSERT INTO usertable VALUES(?,?)");
   s.pScan   = prep(db, "SELECT id,v FROM usertable WHERE id>=? ORDER BY id LIMIT ?");
 
   s.aVal = malloc(p->nValueLen);
@@ -1048,9 +1053,11 @@ static int cmdRun(Config *p){
           p->bfCacheBytes, p->pageCacheBytes);
   fprintf(out, "    \"synchronous\": \"%s\", \"journal_mode\": \"%s\", "
                "\"group_commit\": %d, \"promotion_rate\": %d, "
-               "\"copy_on_access\": %d, \"min_record\": %d,\n",
+               "\"copy_on_access\": %d, \"min_record\": %d, "
+               "\"insert_mode\": \"%s\",\n",
           p->zSync, p->zJournal, p->nGroupCommit, p->nPromotion,
-          p->nCopyOnAccess, p->nMinRecord);
+          p->nCopyOnAccess, p->nMinRecord,
+          p->bInsertReplace ? "replace" : "plain");
   fprintf(out, "    \"ops_per_txn\": %d, \"seed\": %llu, "
                "\"read_txn\": %d, \"drop_cache\": %d\n",
           p->nOpsPerTxn, (unsigned long long)p->seed, p->bReadTxn,
@@ -1172,6 +1179,7 @@ static const char zUsage[] =
 "  --synchronous off|normal|full  --journal wal|delete\n"
 "  --group-commit N             --promotion N    --bf-cache on|off\n"
 "  --copy-on-access N           PRAGMA bf_copy_on_access, percent of the ring\n"
+"  --insert-mode plain|replace  insert as INSERT (default) or INSERT OR REPLACE\n"
 "                               (reference cb_copy_on_access_ratio; -1 default)\n"
 "  --min-record N               PRAGMA bf_min_record: base of the derived\n"
 "                               size-class ladder (reference cb_min_record_size)\n"
@@ -1215,6 +1223,10 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--promotion")==0 ){ NEEDVAL; cfg.nPromotion = atoi(zVal); }
     else if( strcmp(z,"--min-record")==0 ){ NEEDVAL; cfg.nMinRecord = atoi(zVal); }
     else if( strcmp(z,"--copy-on-access")==0 ){ NEEDVAL; cfg.nCopyOnAccess = atoi(zVal); }
+    else if( strcmp(z,"--insert-mode")==0 ){ NEEDVAL;
+      if( strcmp(zVal,"replace")==0 ) cfg.bInsertReplace = 1;
+      else if( strcmp(zVal,"plain")==0 ) cfg.bInsertReplace = 0;
+      else die("--insert-mode: want plain or replace, got %s", zVal); }
     else if( strcmp(z,"--bf-cache")==0 ){ NEEDVAL;
       cfg.bfEnable = (strcmp(zVal,"on")==0 || strcmp(zVal,"1")==0) ? 1 : 0; }
     else if( strcmp(z,"--ops-per-txn")==0 ){ NEEDVAL; cfg.nOpsPerTxn = atoi(zVal); }

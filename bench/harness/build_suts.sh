@@ -90,6 +90,9 @@ if [ "$ALL" = 1 ]; then
   # Opt-IN, unlike the ablations above: size upgrades shed cold cache records
   # (the reference's copy-on-access cold discard, applied on the upgrade copy).
   build_one bf_shed       "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_UPGRADE_SHED"
+  # D3 ablations (2026-09-30): existing-row UPDATE buffering, blind REPLACE.
+  build_one bf_noupd      "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPDATE_BUFFER"
+  build_one bf_noblind    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_BLIND_INSERT"
 fi
 
 # bf_off is the same binary as bf; the runner passes --bf-cache off.

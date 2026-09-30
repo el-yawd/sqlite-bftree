@@ -570,11 +570,50 @@ static void bfCacheRekey(
 ** upper bound is all the range test needs, and being conservative here can
 ** only cost an unnecessary full sweep, never a missed page.
 */
+/*
+** D3b known-leaf bitmap (bf_cache.h, BfCache.aLeafBit).  Set grows the map and
+** silently does nothing on OOM: a missing bit only costs a leaf read.
+*/
+void sqlite3BfLeafBitSet(BfCache *pBf, u32 pgno){
+  u32 iByte = pgno>>3;
+  if( iByte>=pBf->nLeafBit ){
+    u32 nNew = pBf->nLeafBit ? pBf->nLeafBit : 1024;
+    u8 *aNew;
+    while( nNew<=iByte ) nNew *= 2;
+    aNew = (u8*)sqlite3_realloc64(pBf->aLeafBit, nNew);
+    if( aNew==0 ) return;
+    memset(&aNew[pBf->nLeafBit], 0, nNew - pBf->nLeafBit);
+    pBf->aLeafBit = aNew;
+    pBf->nLeafBit = nNew;
+  }
+  pBf->aLeafBit[iByte] |= (u8)(1<<(pgno&7));
+}
+void sqlite3BfLeafBitClear(BfCache *pBf, u32 pgno){
+  if( (pgno>>3)<pBf->nLeafBit ) pBf->aLeafBit[pgno>>3] &= (u8)~(1<<(pgno&7));
+}
+void sqlite3BfLeafBitClearFrom(BfCache *pBf, u32 pgno){
+  u32 i;
+  if( pBf->nLeafBit==0 ) return;
+  if( pgno==0 ){ memset(pBf->aLeafBit, 0, pBf->nLeafBit); return; }
+  for(i=pgno; (i&7)!=0 && (i>>3)<pBf->nLeafBit; i++) sqlite3BfLeafBitClear(pBf, i);
+  if( (i>>3)<pBf->nLeafBit ){
+    memset(&pBf->aLeafBit[i>>3], 0, pBf->nLeafBit - (i>>3));
+  }
+}
+int sqlite3BfLeafBitTest(BfCache *pBf, u32 pgno){
+  if( (pgno>>3)>=pBf->nLeafBit ) return 0;
+  return (pBf->aLeafBit[pgno>>3]>>(pgno&7)) & 1;
+}
+
 static void bfCacheTruncate(sqlite3_pcache *p, unsigned int iLimit){
   BfCacheInt *pCache = (BfCacheInt*)p;
   BfPage *pPage, *pNext;
   unsigned int h, iStop;
 
+  /* Pages at or above iLimit are leaving the snapshot this cache describes
+  ** (a shrinking file, or a pager reset after another connection wrote):
+  ** whatever they are next, nobody has seen it yet. */
+  sqlite3BfLeafBitClearFrom(&pCache->base, iLimit);
   if( pCache->nHash==0 ) return;
   if( iLimit > pCache->iMaxKey ) return;      /* nothing at or above iLimit */
 
@@ -626,6 +665,9 @@ static void bfCacheDestroy(sqlite3_pcache *p){
   pCache->base.bUnlogOverflow = 0;
   sqlite3_free(pCache->base.aFlushed);
   pCache->base.aFlushed = 0;
+  sqlite3_free(pCache->base.aLeafBit);
+  pCache->base.aLeafBit = 0;
+  pCache->base.nLeafBit = 0;
   pCache->base.nFlushed = 0;
   pCache->base.nFlushedAlloc = 0;
 #if defined(SQLITE_BF_INSERT_BUFFERING)
