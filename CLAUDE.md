@@ -53,8 +53,9 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
   commit-time record logging, recovery replay, checkpoint materialisation, forward AND
   reverse merge scans, merged `Count`, group commit (`PRAGMA bf_group_commit=N`) and
   mini-page compaction.  Differential gate ALL CLEAN.
-  **Existing-row UPDATE is NOT buffered** (`btree.c:10577-10585` returns through
-  `btreeOverwriteCell` before the BF block); see `BF_TREE_V2_PLAN.md` D3a.
+  **Existing-row UPDATE is buffered since 2026-09-29** (D3: a `BFOP_INSERT` upsert that
+  shadows the base cell; `SQLITE_BF_NO_UPDATE_BUFFER` ablates it; SAVEPOSITION updates still
+  write through); see `BF_TREE_V2_PLAN.md` D3-core / D3a.
   - Measured: **1 page frame per commit** (the WAL-format commit frame — zero base-page
     writes), and with `bf_group_commit=32` about **30x less WAL than stock** on
     single-row commits.  Counters live in `PRAGMA bf_cache_stats`.  Mind the denominator:
@@ -121,8 +122,8 @@ The three findings this file used to list as unexplained:
   - *record-size cliff* — **explained and fixed**.  `aSizeClass` was filled
     descending and scanned ascending, so every mini-page became 4096 B.
   - *`negative_read` 4.5x slower* — **did not reproduce**; a stale-binary artefact.
-  - *UPDATE never buffers* — **still true** (`rec frames/commit` = 0); it takes
-    the page-image path at 1 frame/commit.  The oldest open item.
+  - *UPDATE never buffers* — **fixed 2026-09-29** (D3): single-row updates emit 1
+    record frame and 0 page frames per commit; not yet measured by a campaign.
 
 ## Build & test
 ```bash
@@ -172,7 +173,7 @@ with `bf_min_record` after `bf_cache_size`.  `BF_TREE_V2_PLAN.md` §3.4 has the 
 
 Ablation switches (all default OFF, i.e. the feature is on): `SQLITE_BF_NO_MERGE_SCAN`,
 `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,
-`SQLITE_BF_NO_MINIPAGE_COMPACT`.
+`SQLITE_BF_NO_MINIPAGE_COMPACT`, `SQLITE_BF_NO_UPDATE_BUFFER`.
 
 ## Debug builds are the fastest diagnostic here
 

@@ -6443,6 +6443,38 @@ bf_last_no_flush:
 ** BTCF_BfLeaf flag is cleared and SQLITE_NOTFOUND is returned, so the caller
 ** continues the normal descent and reads the real leaf.
 */
+/*
+** Park pCur, which has descended to the leaf that owns intKey, on intKey's
+** BUFFERED record: copy the record into the cursor's scratch and serve it
+** through pCur->info with bfOnMini=1, leaving pPage/ix where the descent put
+** them.  Used where the leaf's dirty BFOP_INSERT for intKey is the row's
+** authoritative value -- no base cell (a buffered insert), or a base cell it
+** SHADOWS (D3-core).  SQLITE_OK when parked, SQLITE_NOTFOUND when the record
+** could not be read (the caller keeps its fallback), SQLITE_NOMEM.
+*/
+static int btreeBfParkOnMini(BtCursor *pCur, i64 intKey){
+  int nServe;
+  if( pCur->nBfScratch<(int)BF_MAX_MINI_PAGE ){
+    char *pNew = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
+    if( pNew==0 ) return SQLITE_NOMEM_BKPT;
+    pCur->pBfScratch = pNew;
+    pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
+  }
+  pCur->info.nKey = intKey;
+  nServe = sqlite3BfBtreeReadCachedRecord(pCur, pCur->pBfScratch,
+                                          pCur->nBfScratch);
+  if( nServe<0 ) return SQLITE_NOTFOUND;
+  pCur->info.nKey     = intKey;
+  pCur->info.pPayload = (u8*)pCur->pBfScratch;
+  pCur->info.nPayload = (u32)nServe;
+  pCur->info.nLocal   = (u16)nServe;
+  pCur->info.nSize    = (u16)(nServe>0 ? nServe : 1);
+  pCur->bfOnMini = 1;
+  pCur->curFlags |= BTCF_ValidNKey;
+  pCur->curFlags &= ~BTCF_ValidOvfl;
+  return SQLITE_OK;
+}
+
 static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
   int n;
 
@@ -6616,6 +6648,30 @@ int sqlite3BtreeTableMoveto(
             ** hit (loc==0), contradicting *pRes and tripping asserts. */
             pCur->curFlags &= ~BTCF_ValidNKey;
             *pRes = -1;
+          }else
+#endif
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+          /* D3-core (2026-09-29): the base cell is SHADOWED by a newer dirty
+          ** BFOP_INSERT for the same key (a buffered UPDATE, its recovery
+          ** replay, or a re-insert after a write-back delete).  The buffered
+          ** value is the row; the base cell is its stale predecessor.  Park on
+          ** the record, exactly as the not-found exit below does for a buffered
+          ** insert with no base cell.  Returning the base cell here is what
+          ** used to make every write cursor -- UPDATE's OP_Column reads of the
+          ** old row, the index maintenance built from them -- and every seek on
+          ** a single-leaf table (no descent, so no shortcut) read the old value.
+          ** Not while the shortcut is suppressed: those seeks position for
+          ** iteration over a table the caller has just materialised, or
+          ** re-descend a BF-served cursor onto its physical cell to step it. */
+          if( (pCur->curFlags & BTCF_BfLeaf)==0
+           && sqlite3BfBtreeKeyDirtyOp(pCur, pPage->pgno, intKey)==BFOP_INSERT
+          ){
+            BfCache *pBfSh = btreeGetBfCache(pCur->pBt);
+            if( pBfSh && !pBfSh->bShortcutSuppressed ){
+              int rcSh = btreeBfParkOnMini(pCur, intKey);
+              if( rcSh==SQLITE_NOMEM ) return rcSh;
+              if( rcSh==SQLITE_OK ) sqlite3BfBtreeNoteShadowServe(pCur);
+            }
           }
 #endif
 #ifndef SQLITE_OMIT_BF_CACHE
@@ -6706,26 +6762,8 @@ moveto_table_finish:
         ** have already materialised the table's buffered rows, so a mini-page
         ** serve would park the cursor off-cell and break the following Next. */
         BfCache *pBfServe = btreeGetBfCache(pCur->pBt);
-        int nServe = -1;
         if( pBfServe && pBfServe->bShortcutSuppressed ) goto bf_serve_done;
-        if( pCur->nBfScratch<(int)BF_MAX_MINI_PAGE ){
-          char *pNew = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
-          if( pNew ){ pCur->pBfScratch=pNew; pCur->nBfScratch=(int)BF_MAX_MINI_PAGE; }
-        }
-        if( pCur->nBfScratch>=(int)BF_MAX_MINI_PAGE ){
-          pCur->info.nKey = intKey;
-          nServe = sqlite3BfBtreeReadCachedRecord(pCur, pCur->pBfScratch,
-                                                  pCur->nBfScratch);
-        }
-        if( nServe>=0 ){
-          pCur->info.nKey     = intKey;
-          pCur->info.pPayload = (u8*)pCur->pBfScratch;
-          pCur->info.nPayload = (u32)nServe;
-          pCur->info.nLocal   = (u16)nServe;
-          pCur->info.nSize    = (u16)(nServe>0 ? nServe : 1);
-          pCur->bfOnMini = 1;
-          pCur->curFlags |= BTCF_ValidNKey;
-          pCur->curFlags &= ~BTCF_ValidOvfl;
+        if( btreeBfParkOnMini(pCur, intKey)==SQLITE_OK ){
           *pRes = 0;
           return SQLITE_OK;
         }
@@ -10652,7 +10690,16 @@ int sqlite3BtreeInsert(
     ** stale predecessor record frame would then shadow it on recovery replay).
     ** Skipped for save-position / preformat / zero-extended writes, which keep
     ** the write-through path. */
-    if( pCur->bfOnMini
+    /* D3a (2026-09-29): the same move for a row that DOES have a base cell,
+    ** i.e. an ordinary UPDATE.  The new value becomes a BFOP_INSERT that
+    ** shadows the base cell (D3-core); the base page is not written.  Before
+    ** this every existing-row UPDATE took the page-image path: 1 page frame and
+    ** 0 record frames per commit.  SQLITE_BF_NO_UPDATE_BUFFER restores that. */
+    if( (pCur->bfOnMini
+#if !defined(SQLITE_BF_NO_UPDATE_BUFFER)
+         || (pCur->eState==CURSOR_VALID && pCur->pPage && pCur->pPage->leaf)
+#endif
+        )
      && pCur->curIntKey && pCur->pgnoRoot>1
      && (pCur->curFlags & BTCF_ValidNKey)!=0
      && pX->nKey==pCur->info.nKey
@@ -10661,11 +10708,12 @@ int sqlite3BtreeInsert(
      && pX->nZero==0
      && btreeGetBfCache(pCur->pBt)!=0
     ){
-      u8 keyBuf[8];
-      i64 rid = pX->nKey;
-      int ki, bfrc;
-      for(ki=7; ki>=0; ki--){ keyBuf[ki]=(u8)(rid&0xff); rid>>=8; }
-      bfrc = sqlite3BfBtreeInsertCell(pCur, keyBuf, 8, pX->pData, pX->nData);
+      int bfrc;
+      int wasOnMini = pCur->bfOnMini;
+      bfrc = sqlite3BfBtreeUpdateCell(pCur, pX->nKey, pX->pData, pX->nData);
+      if( bfrc==SQLITE_FULL && !wasOnMini ){
+        goto bf_update_declined;      /* base cell, nothing buffered: as before */
+      }
       if( bfrc==SQLITE_OK ){
         /* Overwritten in the mini-page (no base cell).  Invalidate the cursor
         ** like a buffered insert; a later read re-seeks and BF serves the row. */
@@ -10683,6 +10731,7 @@ int sqlite3BtreeInsert(
         if( rc ) return rc;
       }
     }
+   bf_update_declined:
     /* The block above only takes writes it may buffer.  One it declines --
     ** BTREE_SAVEPOSITION, which is what an UPDATE sends when the cursor must
     ** stay on the row (e.g. an UPDATE driven through an index) -- still has

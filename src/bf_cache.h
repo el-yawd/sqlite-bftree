@@ -532,6 +532,14 @@ struct BfCache {
   **   nSeekLeaf    the seek reached the leaf page (whatever BF then found) */
   u64 nSeekServed;
   u64 nSeekLeaf;
+  /* D3 (2026-09-29): existing-row UPDATE buffering and the shadow it creates.
+  **   nBufferedUpdates  loc==0 rowid writes absorbed as a BFOP_INSERT upsert
+  **   nUpdateFallbacks  eligible updates the mini-page refused (base write)
+  **   nShadowServes     exact-match seeks that found a base cell AND a newer
+  **                     dirty BFOP_INSERT for it, and parked on the latter */
+  u64 nBufferedUpdates;
+  u64 nUpdateFallbacks;
+  u64 nShadowServes;
 
   /* Record-op replay ordering (D1).  Replay rebuilds the cache from the WAL's
   ** record ops at recovery and after a rollback.  An op is skipped when a later
@@ -826,6 +834,16 @@ SQLITE_PRIVATE int sqlite3BfBtreeBufferDelete(BtCursor *pCur,
 ** not a clean PHANTOM) — the merge scan suppresses that base cell. */
 SQLITE_PRIVATE int sqlite3BfBtreeKeyTombstoned(BtCursor *pCur, Pgno leaf,
     i64 rowid);
+#endif
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+/* D3-core: the DIRTY op (BFOP_INSERT / BFOP_DELETE) buffered for rowid on leaf,
+** or -1 when the leaf holds no dirty record for it. */
+SQLITE_PRIVATE int sqlite3BfBtreeKeyDirtyOp(BtCursor *pCur, Pgno leaf, i64 rowid);
+/* D3a: buffer an existing-row overwrite as a BFOP_INSERT upsert on the cursor's
+** leaf; SQLITE_OK if buffered, SQLITE_FULL to fall through to the base write. */
+SQLITE_PRIVATE int sqlite3BfBtreeUpdateCell(BtCursor *pCur, i64 rowid,
+    const void *pData, int nData);
+SQLITE_PRIVATE void sqlite3BfBtreeNoteShadowServe(BtCursor *pCur);
 #endif
 #endif
 #ifdef SQLITE_DEBUG

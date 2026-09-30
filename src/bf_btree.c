@@ -1013,6 +1013,14 @@ void sqlite3BfBtreeSeekStat(Btree *p, u64 *pnServed, u64 *pnLeaf){
   *pnLeaf = pBf ? pBf->nSeekLeaf : 0;
 }
 
+void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = btreeGetBfCache(p->pBt);
+  aOut[0] = pBf ? pBf->nBufferedUpdates : 0;
+  aOut[1] = pBf ? pBf->nUpdateFallbacks : 0;
+  aOut[2] = pBf ? pBf->nShadowServes : 0;
+}
+
 void sqlite3BfBtreeClearCache(Btree *p){
   BfCache *pBf;
   if( !p || !p->pBt ) return;
@@ -1465,6 +1473,75 @@ int sqlite3BfBtreeKeyTombstoned(BtCursor *pCur, Pgno leaf, i64 rowid){
   return op==BFOP_DELETE;
 }
 #endif /* SQLITE_BF_INSERT_BUFFERING && !SQLITE_BF_NO_WRITEBACK_DELETE */
+
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+/*
+** D3-core (2026-09-29).  A buffered BFOP_INSERT may SHADOW a base cell of the
+** same key: an UPDATE buffered by D3a, a recovery replay of one, or a
+** re-insert after a write-back delete.  The dirty record is the newer value and
+** wins, as in the reference, whose insert is an upsert (mini_page_op.rs:474).
+** The merge scans already honour that (bfMergePick: insKey==baseKey); the point
+** seek's exact-match exit asks this function, and parks on the mini-page record
+** when the answer is BFOP_INSERT.  Returns the dirty op or -1.
+*/
+int sqlite3BfBtreeKeyDirtyOp(BtCursor *pCur, Pgno leaf, i64 rowid){
+  BfCache    *pBf;
+  BfMapEntry *pEntry;
+  u8          keyBuf[8], op = 0;
+
+  if( !pCur || !pCur->pBt || leaf<=1 ) return -1;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf || !pBf->bDirtyInserts ) return -1;   /* no dirty record anywhere */
+  pEntry = sqlite3BfMapLookup(pBf, leaf);
+  if( !pEntry || pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ) return -1;
+  if( !sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage) ) return -1;
+  bfEncodeRowid(rowid, keyBuf);
+  if( !sqlite3BfMiniPageLookupOp((BfMiniPage*)pEntry->pPage, keyBuf, 8, &op) ){
+    return -1;
+  }
+  return (op==BFOP_INSERT || op==BFOP_DELETE) ? (int)op : -1;
+}
+
+void sqlite3BfBtreeNoteShadowServe(BtCursor *pCur){
+  BfCache *pBf = (pCur && pCur->pBt) ? btreeGetBfCache(pCur->pBt) : 0;
+  if( pBf ) pBf->nShadowServes++;
+}
+
+/*
+** D3a (2026-09-29): buffer an existing-row overwrite.  The cursor is on the row
+** (a base cell, a BF-served leaf, or a mini-page record); the new value becomes
+** a BFOP_INSERT on that leaf -- an in-place upsert when the leaf already holds
+** the key, a shadow of the base cell otherwise -- and no base page is written.
+** It is logged, replayed, flushed and checkpointed exactly like a buffered
+** insert: every consumer of BFOP_INSERT already treats it as an upsert
+** (bfApplyOneRecord's sqlite3BtreeInsert overwrites; replay rebuilds the
+** record).  SQLITE_FULL: the caller writes the base cell as before.
+*/
+int sqlite3BfBtreeUpdateCell(BtCursor *pCur, i64 rowid,
+                             const void *pData, int nData){
+  BfCache *pBf;
+  u8 keyBuf[8];
+  u32 leaf;
+  int rc;
+
+  if( !pCur || !pCur->pBt ) return SQLITE_FULL;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf ) return SQLITE_FULL;
+  leaf = bfCursorLeafPgno(pCur);
+  if( leaf==0 || nData>BF_MAX_MINI_PAGE ){ pBf->nUpdateFallbacks++; return SQLITE_FULL; }
+  bfEncodeRowid(rowid, keyBuf);
+  rc = sqlite3BfRecordWrite(pBf, leaf, keyBuf, 8, pData, nData, BFOP_INSERT);
+  if( rc==BF_OK ){
+    bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
+    pBf->bDirtyInserts = 1;
+    pBf->nBufferedUpdates++;
+    return SQLITE_OK;
+  }
+  if( rc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+  pBf->nUpdateFallbacks++;
+  return SQLITE_FULL;
+}
+#endif /* SQLITE_BF_INSERT_BUFFERING */
 
 /*
 ** Stage 2.1 — scan-mode gate.  Decide whether the upcoming scan on pCur may

@@ -34,8 +34,10 @@ for seed in $SEEDS; do
   # the same state — the Stage 2.4 reverse-merge and merged-COUNT paths), and
   # gen_rollback_stress (full ROLLBACK, empty and failed transactions, failing
   # statements -- the path that destroyed committed buffered rows until
-  # 2026-09-24, invisible to the other four because they only ROLLBACK TO).
-  for gen in gen_stress gen_stress_rand gen_merge_stress gen_rev_stress gen_rollback_stress; do
+  # 2026-09-24, invisible to the other four because they only ROLLBACK TO), and
+  # gen_update_stress (UPDATEs of rows checkpointed into BASE pages: the D3
+  # buffered-update / shadowed-base-cell state the others barely reach).
+  for gen in gen_stress gen_stress_rand gen_merge_stress gen_rev_stress gen_rollback_stress gen_update_stress; do
     for jm in delete wal memory; do
       n=$((n+1))
       b="$WORK/buf_${gen}_s${seed}_${jm}"
@@ -53,6 +55,10 @@ for seed in $SEEDS; do
         # gen_rev_stress takes (seed, n_txns); prepend the journal pragma.
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
         python3 ./gen_rev_stress.py "$seed" 400 >> "$b.sql"
+      elif [ "$gen" = gen_update_stress ]; then
+        # gen_update_stress takes (seed, n_txns, journal).
+        printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"
+        python3 ./gen_update_stress.py "$seed" 250 "$jm" >> "$b.sql"
       else
         # gen_rollback_stress takes (seed, n_txns, journal).
         printf 'PRAGMA journal_mode=%s;\n' "$jm" > "$b.sql"

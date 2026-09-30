@@ -342,6 +342,25 @@ void sqlite3PragmaBfCacheStats(
     }
 
     {
+      /* D3: existing-row UPDATE buffering and the shadow serves it causes. */
+      static const char *const azUpd[] = {
+        "buffered_updates", "update_fallbacks", "shadow_serves"
+      };
+      u64 aUpd[3];
+      int iU;
+      memset(aUpd, 0, sizeof(aUpd));
+      if( pBt ){
+        extern void sqlite3BfBtreeUpdateStat(Btree*, u64*);
+        sqlite3BfBtreeUpdateStat(pBt, aUpd);
+      }
+      for(iU=0; iU<3; iU++){
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, azUpd[iU], P4_STATIC);
+        sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&aUpd[iU], P4_INT64);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+      }
+    }
+
+    {
       static const char *const azReplay[] = {
         "replay_applied", "replay_superseded", "replay_torn", "replay_dropped",
         "rollback_rehydrate", "clear_logged"

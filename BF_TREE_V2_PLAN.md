@@ -89,7 +89,7 @@ a comment array was repointed.  **No benchmark configuration changed** — in pa
 |---|---|
 | **0** — port the 3 durability-agnostic leaf modules | **DONE** — `bf_mini_page.c`, `bf_circular_buffer.c`, `bf_mapping.c`, `bf_cache.h`, whole-file guarded by `SQLITE_OMIT_BF_CACHE`, inlined into the amalgamation |
 | **1** — read cache + write-through | **DONE** (`8dba75c`) — lifecycle, config/pragmas, `pcache2` activation, btree read hooks, descent shortcut |
-| **2** — record-granular physiological WAL | **DONE** (`3bf3fb2`), **ON by default** (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`) — write-back insert and **delete**, commit-time record logging, recovery replay, checkpoint materialisation, forward and reverse merge scans, merged `Count`, transaction grouping, mini-page compaction. WAL payload v2 persists both leaf and table-root pgno, fixing the 2026-09-22 recovery corruption; **v3 (2026-09-24, uncommitted)** adds `BFWAL_OP_CLEAR` so replay never re-applies a flushed op, and ROLLBACK rebuilds the cache from the log instead of emptying it. **Existing-row UPDATE is NOT buffered** (§3.2, D3a). Two contracts remain open: **D1** (remaining recovery/checkpoint edge cases) and **D2** (what an acknowledged commit guarantees) |
+| **2** — record-granular physiological WAL | **DONE** (`3bf3fb2`), **ON by default** (`main.mk` adds `-DSQLITE_BF_INSERT_BUFFERING`) — write-back insert and **delete**, commit-time record logging, recovery replay, checkpoint materialisation, forward and reverse merge scans, merged `Count`, transaction grouping, mini-page compaction. WAL payload v2 persists both leaf and table-root pgno, fixing the 2026-09-22 recovery corruption; **v3 (2026-09-24, uncommitted)** adds `BFWAL_OP_CLEAR` so replay never re-applies a flushed op, and ROLLBACK rebuilds the cache from the log instead of emptying it. **Existing-row UPDATE is buffered since 2026-09-29** (D3-core + D3a, `SQLITE_BF_NO_UPDATE_BUFFER` to ablate; §3.2). Two contracts remain open: **D1** (remaining recovery/checkpoint edge cases) and **D2** (what an acknowledged commit guarantees) |
 | **3** — measurement campaign + reference parity | **IN PROGRESS** — this is where all remaining work in §5 lives |
 | **4** — the faithful file-incompatible branch | not started; §7.3 |
 
@@ -348,9 +348,13 @@ of them re-enables a measured data-loss bug.  Each has a counter in `PRAGMA bf_c
 
 Stops at:
 
-* **existing-row UPDATE is not buffered.**  `btree.c:10604` gates buffering on `loc!=0`, and
-  an update found by descent has `loc==0`, so it takes the page-image path.  `rec
-  frames/commit` is 0 for updates.  Oldest open item.
+* **existing-row UPDATE is buffered (D3, 2026-09-29).**  An overwrite of a row with a base
+  cell becomes a `BFOP_INSERT` upsert on its leaf that SHADOWS the base cell; the point seek's
+  exact-match exit parks on the record (`btreeBfParkOnMini`, counter `shadow_serves`), the merge
+  scans already let it win, and the flush's `sqlite3BtreeInsert` overwrites the base cell.
+  Declined, as before: `BTREE_SAVEPOSITION` (index-driven multi-row UPDATE), preformat,
+  zero-extended and overflow-sized values (`update_fallbacks`).  Update commits now emit 1 record
+  frame and 0 page frames (tripwire).
 * **dirty mini-pages cannot be evicted.**  `evictCallback` (`bf_cache.c:1148-1169`) returns
   `BF_ERROR` on a dirty mini-page rather than merging it to base.
 * checkpoint materialises cached records into page-image frames before normal backfill; it
@@ -382,7 +386,7 @@ Stops at:
 | **full-page / gap cache (`BF_LOC_FULL`)** | **absent** | zero producers — the identifier appears only in a comment at `bf_mapping.c:18` |
 | **separate scan promotion** | **absent** | no `scan_promotion` symbol exists |
 | **eviction batching** | **absent** | `sqlite3BfCacheEvict(pCache, 16)` at three call sites — a fixed **16 entries**, against the reference's ~1024 accumulated **bytes** with retry cap 10 (`tree.rs:1012-1018`) |
-| **general UPDATE buffering** | **missing** | see §3.2 |
+| **general UPDATE buffering** | **done 2026-09-29** (single-row; SAVEPOSITION declined) | see §3.2, D3 |
 | native mini/base split | deliberately absent | SQLite materialises and balances fixed pages |
 | shared reader buffer pool | missing | one `BfCache` per pager (`pager.c:4259-4269`) |
 | concurrent readers | missing | `BfCache.mutex` is allocated (`bf_cache.c:217`) and the `bfCacheEnter`/`bfCacheLeave` macros exist (`bf_cache.h:637-641`), but **have zero call sites**.  Scaffold only — do not read it as locking. |
@@ -395,6 +399,7 @@ Stops at:
 `SQLITE_BF_NO_MERGE_SCAN`, `SQLITE_BF_NO_WRITEBACK_DELETE`, `SQLITE_BF_NO_DESCENT_SHORTCUT`,
 `SQLITE_BF_NO_MINIPAGE_COMPACT`, `SQLITE_BF_NO_COPY_ON_ACCESS`, `SQLITE_BF_NO_DIRTYLIST`,
 `SQLITE_BF_NO_UNLOGLIST`, `SQLITE_BF_NO_DROPCLEAN`, `SQLITE_BF_NO_MAXROWID`,
+`SQLITE_BF_NO_UPDATE_BUFFER` (D3a; D3-core's shadow serve is correctness and has no switch),
 `SQLITE_BF_UPGRADE_SHED` (opt-**in**).  All `NO_` switches default off, i.e. the feature is on.
 
 PRAGMAs (authoritative list: `tool/mkpragmatab.tcl:410-436`): `bf_cache` (enable),
@@ -585,8 +590,7 @@ are the write path and the unswept retention knobs, not the eviction machinery:
 1. **D1 / D2** — the remaining durability contracts. Nothing downstream is quotable until an
    acknowledged commit means something definite.
 2. ~~**H1b**~~ — **DONE 2026-09-24**: retention is not the constraint (see the H1b item).
-3. **D3-core → D3a** — existing-row UPDATE is still page-image write-through.  This is the
-   oldest open item in the project and the one with an obvious mechanism behind it.
+3. ~~**D3-core → D3a**~~ — **DONE 2026-09-29** (see the items); measure at the D letter gate.
 4. **H0 / H2** — update and scan arms at the paper shape, and a warmup floor per arm.
 5. **M2** — full-page cache, the last absent mechanism with real upside, but it needs H0's
    contiguous-zipf arm to be judged fairly.
@@ -878,12 +882,27 @@ D3a and D3b, for different reasons, so it is lifted once rather than twice.
 The reference has no such invariant: its insert is an **upsert** and a dirty INSERT simply wins
 over the base record (`mini_page_op.rs:474`; see §4.4).
 
-- [ ] teach the merge (forward scan, reverse scan, `Count`, point lookup, flush and checkpoint
-      materialisation) that a buffered record may shadow a base cell of the same key, and wins
-- [ ] rollback, savepoint, recovery and checkpoint tests for a shadowed key
-- [ ] its own ablation switch and counters
-- [ ] differential oracles **and** the `BF_CACHE_SIZE=262144` cycling-ring variant — this
-      changes merge semantics, where a wrong answer silently returns stale data
+**DONE 2026-09-29.**  Most of it already existed: write-back delete (Stage 2.3) creates the
+shadow state (delete then re-insert of a base row), so the forward/reverse merge picks
+(`bfMergePick`: `insKey==baseKey` drops the base cell), `Count` (merged), the flush
+(`bfApplyOneRecord` → `sqlite3BtreeInsert` overwrites) and replay were already upserts.  The
+one hole was the **point seek**: its exact-match exit returned the BASE cell, so a write cursor
+(UPDATE's `OP_Column` reads of the old row, and the index maintenance built from them) or any
+seek on a single-leaf table (no descent ⇒ no shortcut) read the stale value.
+
+- [x] exact-match exit asks `sqlite3BfBtreeKeyDirtyOp` and parks on a shadowing `BFOP_INSERT`
+      (`btreeBfParkOnMini`, factored out of the not-found exit); counter `shadow_serves`
+- [x] `bench/gen_update_stress.py` (6th generator in difftest/`stress_buf.sh`): checkpoints a
+      populated base, then updates it — point/range/reverse/count reads, single-leaf table,
+      overflow values, indexed column changes, index-driven multi-row UPDATE, delete/re-insert,
+      REPLACE, rowid change, ROLLBACK, savepoints, mid-session checkpoints.  ~800
+      `buffered_updates` and ~150 `shadow_serves` per script
+- [x] **mutation test:** with the shadow serve compiled out, 109/162 difftest cases diverge
+      (the new generator, `gen_stress` and `gen_rollback_stress`) — the oracle sees it
+- [x] no ablation switch: it is correctness, needed with D3a off too (re-insert after delete)
+- [x] full gate 50/50 (all four difftest variants incl. the cycling ring); SIGKILL after 400
+      committed update transactions over a checkpointed base recovers byte-identical to stock
+      under read-first and checkpoint-first, and stock reads the checkpointed file identically
 
 Risk: high, and concentrated here rather than in the two items below.  Cursor invariants
 (`BTCF_BfLeaf`, `BTCF_ValidNKey` — the Phase 1 scan bug lived here), splits, and the merge path,
@@ -897,14 +916,24 @@ today and take the page-image path.
 through `btreeOverwriteCell()` **before** the BF block is reached.  Nothing about avoiding the
 descent's leaf read changes that; this is a separate route into the buffer.
 
-- [ ] isolate first: same-size existing-row update · size-changing update · a row authoritative
-      only in the mini-page · with and without secondary indexes
-- [ ] decide the representation: is an update an INSERT/upsert physiological record, or a
-      distinct op?  (`BFOP_*` already has room; the recovery replay index must agree)
-- [ ] handle overflow payloads and the secondary-index scope boundary without widening v1 scope
-- [ ] route `loc==0` through the buffer behind its own switch, with counters
-- [ ] verify record **and** page frames per commit actually move, at group 1 and group 32
-- [ ] differential, rollback, savepoint, recovery, checkpoint
+**DONE 2026-09-29 (correctness-gated; not yet measured by a campaign).**
+- [x] representation: a `BFOP_INSERT` upsert — no new op, no payload version change; every
+      consumer (log, replay, rehydrate, flush, checkpoint) already treats INSERT as upsert, and
+      a mini-page overwrite clears the record's LOGGED bit so the new value is re-logged
+- [x] route: the existing write-back-UPDATE block (rows living only in the mini-page, Phase 2)
+      widened to a cursor on a base cell (`sqlite3BfBtreeUpdateCell`); behind
+      `SQLITE_BF_NO_UPDATE_BUFFER`; counters `buffered_updates`, `update_fallbacks`
+- [x] scope kept: SAVEPOSITION / preformat / nZero / value > `BF_MAX_MINI_PAGE` fall back to
+      the base write (for a mini-page row: flush + re-seek first, as before); secondary indexes
+      stay write-through
+- [x] tripwire (NOT QUOTABLE; 1,000 single-row updates of a checkpointed 20k-row table):
+      commits emit **1 record frame, 0 page frames** (stock: 1 page frame), so at group 1 the
+      bytes per commit equal stock's (frames are fixed-size) and at group 32 the WAL holds
+      ~1/28 of stock's frames before checkpoint.  The checkpoint then writes one page image per
+      distinct dirty leaf (335 for those 1,000 updates).  `NO_UPDATE_BUFFER`: 531 page frames
+      in a 500-update script vs 31 with buffering
+- [x] differential (all variants), rollback, savepoint, recovery, checkpoint: see D3-core
+- [ ] **measure** at the D gate: H6 (insert, ordinary update, mixed) with the switch as an axis
 
 ### D3b — blind INSERT: drop the uniqueness-probe leaf read
 *From: perf plan Stage 3(a)(b)(d).*  The general path needs D3-core; the safe subsets named below
@@ -1901,3 +1930,20 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   counters, report.py switched.  And bfbench dropped stats rows past 40.
 - Validation: quick gate green on `e153ea9` (12/12).  Numbers: within-campaign only.
 - Exact next action: **D3-core** (let a buffered record shadow a same-key base cell), then D3a.
+
+### 2026-09-29 — Claude Opus 5.5 — D3-core + D3a: existing-row UPDATE is buffered
+
+- Committed first: H1b write-up (`f9c0e91`).
+- D3-core turned out to be one hole, not a merge rewrite: shadowing already existed (write-back
+  delete + re-insert) and the scans/flush/replay handled it; the point seek's exact-match exit
+  did not.  Fixed (`btreeBfParkOnMini` + `sqlite3BfBtreeKeyDirtyOp`), and D3a widened the
+  existing write-back-UPDATE block to base cells behind `SQLITE_BF_NO_UPDATE_BUFFER`.
+- New generator `gen_update_stress.py`; a mutation test (shadow serve compiled out) fails
+  109/162 cases, so the oracle can see the state it targets.
+- Validation: full gate 50/50 on the final build; the `NO_UPDATE_BUFFER` build 648/648 on
+  difftest base+ring; SIGKILL/recovery byte-identical to stock in two recovery orders.
+- Numbers: tripwire only (above, NOT QUOTABLE).  Group 1 gains no bytes (one fixed-size frame
+  per commit either way); the WAL-volume win needs group commit, as D2 says for inserts.
+- Exact next action: the D-letter campaign (H6-style write arms: insert / update / mixed,
+  group 1 and 32, `bf` vs a `NO_UPDATE_BUFFER` SUT), or D3b (blind insert) first if the owner
+  prefers to batch the write mechanisms into one campaign.
