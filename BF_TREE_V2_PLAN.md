@@ -1018,7 +1018,16 @@ asked with existing knobs first: `configs/m2_split.json` moves a fixed 36 MiB be
 ring (2..32 MiB, new runner key `ring_bytes`) and the page cache, on scrambled and contiguous
 zipf point reads and on contiguous range scans.  Page caching winning per byte on `zipfraw`
 => build M2 as a unified pool; a wash => document it as a non-transfer.
-- [ ] run `configs/m2_split.json` (started 2026-09-30 from clean `aa1a49b`) and decide
+- [ ] run `configs/m2_split.json` and decide.  **First run INVALID** (`results/m2_split`):
+      its `zipfraw` arm silently ran scrambled zipf (bfbench spelled it `zipf-raw` and fell
+      back on unknown names -- fixed `d1f6884`, it now dies).  That accident made it a
+      replication, and the replication failed: bf at a 16/32 MiB ring ran 33.6k/38.0k ops/s
+      in one window and 21.8k/24.7k in another, same bytes/op, less CPU (I/O wait).  So the
+      first run's apparent 1.15x at a 32 MiB ring is NOT evidence.  Rerun with the new
+      `runner.py --shuffle 7` into `results/m2_split_v2`.
+      Clean from the first run (scan arm, drift-free by construction? no -- but consistent
+      across all five rings): range scans are 0.83-0.86x of stock at EVERY split, because
+      the record cache never serves a scan and BF pays merge/flush overhead on top.
 - [ ] **M2a (write side):** mirror the leaf after a mini-page merges to base.  Additive.
       `SQLITE_BF_NO_FULL_PAGE`.
 - [ ] **M2b (read side):** full-page promotion *instead of* record promotion.  A **mode** — the
