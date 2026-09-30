@@ -1,0 +1,51 @@
+{
+  "name": "d3",
+  "_comment": [
+    "D-letter write campaign (plan D3a/D3b, 2026-09-30).  One campaign so every",
+    "comparison is within-campaign.  Arms:",
+    "  insert          plain INSERT of new keys (bf vs stock): the pre-D3 insert path",
+    "  replace         INSERT OR REPLACE of new keys: D3b's blind path; bf_noblind is",
+    "                  the same build with SQLITE_BF_NO_BLIND_INSERT",
+    "  update          existing-row UPDATE: D3a; bf_noupd = SQLITE_BF_NO_UPDATE_BUFFER",
+    "  mixed           read=50,update=50: does buffered UPDATE cost the reads anything",
+    "each at bf_group_commit 1 (durable, the paper-faithful mode) and 32 (bounded",
+    "DEFERRED durability, plan D2 -- report it as such).  stock ignores the group",
+    "axis, so its two cells are two more repeats of the same thing.",
+    "",
+    "Larger-than-memory (4M x 100 B rows, 32 MiB budget, drop_cache) because D3b's",
+    "claim is read I/O: an insert that no longer faults in its leaf.  Read",
+    "read_MiB/op beside ops/s, and blind_inserts vs blind_no_leaf: the bitmap only",
+    "knows leaves some descent has entered, so the blind share grows with warmup.",
+    "What each mechanism must show, or it has not earned its keep:",
+    "  D3a  update commits: 1 record frame, 0 page frames (bf) vs 1 page frame (noupd)",
+    "  D3b  replace: fewer read bytes/op than bf_noblind at equal correctness"
+  ],
+  "datasets": {
+    "v100": { "records": 4000000, "value_len": 100, "key_spacing": 16 }
+  },
+  "defaults": {
+    "dataset": "v100",
+    "repeats": 2,
+    "seconds": 60,
+    "warmup_seconds": 30,
+    "dist": "zipf",
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true,
+    "budget_bytes": "32M",
+    "memmax": "auto",
+    "bf_page_cache_floor": "16M"
+  },
+  "experiments": [
+    { "name": "insert",  "workload": "insert=100", "suts": ["stock", "bf"],
+      "axes": { "group_commit": [1, 32] } },
+    { "name": "replace", "workload": "insert=100", "insert_mode": "replace",
+      "suts": ["stock", "bf", "bf_noblind"], "axes": { "group_commit": [1, 32] } },
+    { "name": "update",  "workload": "update=100", "suts": ["stock", "bf", "bf_noupd"],
+      "axes": { "group_commit": [1, 32] } },
+    { "name": "mixed",   "workload": "read=50,update=50",
+      "suts": ["stock", "bf", "bf_noupd"], "axes": { "group_commit": [1, 32] } }
+  ]
+}

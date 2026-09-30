@@ -1,0 +1,90 @@
+{
+  "name": "d3_smoke",
+  "_comment": [
+    "Tripwire for d3.json, NOT QUOTABLE: 6 s runs, 1 repeat, 2 s warmup."
+  ],
+  "datasets": {
+    "v100": {
+      "records": 4000000,
+      "value_len": 100,
+      "key_spacing": 16
+    }
+  },
+  "defaults": {
+    "dataset": "v100",
+    "repeats": 1,
+    "seconds": 6,
+    "warmup_seconds": 2,
+    "dist": "zipf",
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true,
+    "budget_bytes": "32M",
+    "memmax": "auto",
+    "bf_page_cache_floor": "16M"
+  },
+  "experiments": [
+    {
+      "name": "insert",
+      "workload": "insert=100",
+      "suts": [
+        "stock",
+        "bf"
+      ],
+      "axes": {
+        "group_commit": [
+          1,
+          32
+        ]
+      }
+    },
+    {
+      "name": "replace",
+      "workload": "insert=100",
+      "insert_mode": "replace",
+      "suts": [
+        "stock",
+        "bf",
+        "bf_noblind"
+      ],
+      "axes": {
+        "group_commit": [
+          1,
+          32
+        ]
+      }
+    },
+    {
+      "name": "update",
+      "workload": "update=100",
+      "suts": [
+        "stock",
+        "bf",
+        "bf_noupd"
+      ],
+      "axes": {
+        "group_commit": [
+          1,
+          32
+        ]
+      }
+    },
+    {
+      "name": "mixed",
+      "workload": "read=50,update=50",
+      "suts": [
+        "stock",
+        "bf",
+        "bf_noupd"
+      ],
+      "axes": {
+        "group_commit": [
+          1,
+          32
+        ]
+      }
+    }
+  ]
+}

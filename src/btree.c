@@ -6443,16 +6443,9 @@ bf_last_no_flush:
 **     *pRes>0      The cursor is left pointing at an entry that
 **                  is larger than intKey.
 */
-#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_DESCENT_SHORTCUT)
-/*
-** Descent shortcut (Stage 1.6): serve a point read straight from the BF
-** mini-page cache without reading the leaf page chldPg.  On success the cursor
-** is left in the leaf-less BTCF_BfLeaf state with pCur->info fully populated
-** (key + the payload bytes copied into the per-cursor scratch buffer) and
-** SQLITE_OK is returned.  On any failure (raced/evicted/oversized/OOM) the
-** BTCF_BfLeaf flag is cleared and SQLITE_NOTFOUND is returned, so the caller
-** continues the normal descent and reads the real leaf.
-*/
+#ifndef SQLITE_OMIT_BF_CACHE
+/* D3 helpers: needed with or without the descent shortcut (2026-09-30: the
+** bf_noshortcut ablation build lost them when they sat inside its guard). */
 /*
 ** Park pCur, which has descended to the leaf that owns intKey, on intKey's
 ** BUFFERED record: copy the record into the cursor's scratch and serve it
@@ -6535,6 +6528,18 @@ int sqlite3BtreeBfArmBlind(BtCursor *pCur, i64 iKey){
 #endif
 }
 
+#endif /* SQLITE_OMIT_BF_CACHE */
+
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_DESCENT_SHORTCUT)
+/*
+** Descent shortcut (Stage 1.6): serve a point read straight from the BF
+** mini-page cache without reading the leaf page chldPg.  On success the cursor
+** is left in the leaf-less BTCF_BfLeaf state with pCur->info fully populated
+** (key + the payload bytes copied into the per-cursor scratch buffer) and
+** SQLITE_OK is returned.  On any failure (raced/evicted/oversized/OOM) the
+** BTCF_BfLeaf flag is cleared and SQLITE_NOTFOUND is returned, so the caller
+** continues the normal descent and reads the real leaf.
+*/
 static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
   int n;
 
