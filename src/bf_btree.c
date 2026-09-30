@@ -1544,6 +1544,10 @@ void sqlite3BfBtreeNoteLeaf(BtCursor *pCur){
   pBf = sqlite3PagerGetBfCache(pCur->pBt->pPager);
   if( pBf ) sqlite3BfLeafBitSet(pBf, pCur->pPage->pgno);
 }
+void sqlite3BfBtreeNoteBlindMiss(BtCursor *pCur){
+  BfCache *pBf = btreeGetBfCache(pCur->pBt);
+  if( pBf ) pBf->nBlindNoLeaf++;
+}
 void sqlite3BfBtreeNotePageAllocated(BtShared *pBt, Pgno pgno){
   BfCache *pBf = pBt ? sqlite3PagerGetBfCache(pBt->pPager) : 0;
   if( pBf ) sqlite3BfLeafBitClear(pBf, pgno);
@@ -1556,9 +1560,10 @@ void sqlite3BfBtreeNotePageAllocated(BtShared *pBt, Pgno pgno){
 int sqlite3BfBtreeBlindChild(BtCursor *pCur, Pgno chldPg){
   BfCache *pBf = btreeGetBfCache(pCur->pBt);
   if( !pBf ) return 0;
-  if( chldPg>1 && sqlite3BfLeafBitTest(pBf, chldPg) ) return 1;
-  pBf->nBlindNoLeaf++;
-  return 0;
+  /* Not counted here: this runs at EVERY level of the descent, so a miss here
+  ** at an interior level is not a declined blind insert.  sqlite3BtreeInsert
+  ** counts one per insert that reached no known leaf (sqlite3BfBtreeNoteBlindMiss). */
+  return chldPg>1 && sqlite3BfLeafBitTest(pBf, chldPg);
 }
 
 /*

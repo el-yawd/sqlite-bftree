@@ -862,6 +862,7 @@ SQLITE_PRIVATE void sqlite3BfLeafBitClearFrom(BfCache *pBf, u32 pgno);
 SQLITE_PRIVATE int sqlite3BfLeafBitTest(BfCache *pBf, u32 pgno);
 SQLITE_PRIVATE void sqlite3BfBtreeNoteLeaf(BtCursor *pCur);
 SQLITE_PRIVATE void sqlite3BfBtreeNotePageAllocated(BtShared *pBt, Pgno pgno);
+SQLITE_PRIVATE void sqlite3BfBtreeNoteBlindMiss(BtCursor *pCur);
 SQLITE_PRIVATE int sqlite3BfBtreeBlindChild(BtCursor *pCur, Pgno chldPg);
 SQLITE_PRIVATE int sqlite3BfBtreeBlindInsert(BtCursor *pCur, i64 rowid,
     const void *pData, int nData);

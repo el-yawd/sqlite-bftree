@@ -10809,6 +10809,8 @@ int sqlite3BtreeInsert(
           /* Refused: seek for real (the leaf is read after all). */
           rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
           if( rc ) return rc;
+        }else{
+          sqlite3BfBtreeNoteBlindMiss(pCur);  /* no known leaf on the way down */
         }
       }
     }
