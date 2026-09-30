@@ -1991,3 +1991,28 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Validation: full gate 50/50; mutation test (bitmap clears compiled out) 108/216 fail; crash
   test byte-identical to stock.
 - Exact next action: the D-letter write campaign (`configs/d3.json`).
+
+### 2026-09-30 (cont.) — Claude Opus 5.5 — D campaign: the write buffer cannot batch at this shape
+
+- Ran `configs/d3.json` from clean `30c05a1` (44 runs, 85 min, 0 failed; a first attempt died
+  at 9/44 in a shutdown and was discarded, not resumed).  v100 4M rows, 32 MiB budget, zipf 0.9,
+  synchronous=NORMAL, WAL, harness default `wal_autocheckpoint` (SQLite's 1000 frames).
+- **Mechanisms are live**: 61-68% of REPLACEs went blind; 350-430k buffered UPDATEs per cell;
+  ablation SUTs show 0 for their counters.
+- **No throughput win, and the reason is measured, not guessed**: `clear_logged` ~= ops in every
+  insert/replace/update cell -- nearly every buffered record is materialised into its base leaf
+  ALONE.  Between two auto-checkpoints (~1000 frames) ~1000 random records land on ~1000 of
+  ~120k leaves, so each checkpoint flush reads and rewrites one leaf per record.  D3b's skipped
+  leaf read is paid at flush time instead (replace read B/op: bf 5.8k vs bf_noblind 5.3k at
+  group 1); D3a adds a record frame and still pays the page (update write B/op at group 1:
+  bf 10.8k vs bf_noupd 7.7k; 0.92x vs 1.02x of stock).  Under UPDATE the ring also fills with
+  dirty records (164k-378k evict stalls, 14-31% of updates fall back to base writes).
+- Cells, ops/s vs stock (within-campaign; spreads in results/d3/RESULTS.md): insert bf 1.00 /
+  0.73 (group 1/32, the 32 cell 68% spread); replace bf 1.01 / 0.98, noblind 1.00 / 1.17;
+  update bf 0.92 / 0.97, noupd 1.02 / 1.02; mixed bf 0.87 / 0.88, noupd 0.91 / 0.95.  One real
+  BF advantage: insert p99 latency 407 us vs stock 1018 us at group 1.
+- Verdict: at this data:ring:checkpoint shape D3a/D3b MOVE work rather than remove it.  The
+  lever is the checkpoint policy (the D1 checkpoint-architecture decision, owner's): records must
+  live long enough to share a leaf when materialised.  Next measurement: an autocheckpoint axis
+  (0 / 1000 / 10000 / 100000) on update and replace, bf vs ablation, reporting records per
+  flushed leaf (ops / clear_logged) beside ops/s.
