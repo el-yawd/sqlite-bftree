@@ -1025,6 +1025,27 @@ zipf point reads and on contiguous range scans.  Page caching winning per byte o
       in one window and 21.8k/24.7k in another, same bytes/op, less CPU (I/O wait).  So the
       first run's apparent 1.15x at a 32 MiB ring is NOT evidence.  Rerun with the new
       `runner.py --shuffle 7` into `results/m2_split_v2`.
+- [x] **Rerun `results/m2_split_v2` (shuffled, 36/36, dists verified in the result JSON):**
+
+  | workload | stock ops/s | bf at ring 2/4/8/16/32 MiB (x stock) | read B/op stock vs bf |
+  |---|---|---|---|
+  | point, scrambled zipf | 34.1k | 0.85 / 0.85 / 0.96 / 0.93 / **1.14** | 1633 vs 1363 at 32M |
+  | point, contiguous zipf-raw | 70.6k | 0.88 / 0.87 / 0.86 / 0.79 / 0.88 | 605 vs 610-616 at EVERY split |
+  | 32-row scan, zipf-raw | 18.6k | 0.80-0.81 at every split | 1718 vs 1679-1718 |
+
+  (32M cell spread 0-1%; the 2M/4M/16M scrambled cells 14-21%.  Seek hit 31-56% by ring size;
+  cached_records 10k-175k; evictions > 0 everywhere.)
+- **Decision input for M2:**
+  1. Scrambled zipf: record granularity beats page granularity per byte -- the more of the
+     budget the ring gets, the better; 32 MiB ring + 4 MiB pcache is +14% over stock with 17%
+     fewer bytes read.
+  2. Contiguous zipf: BF reads the SAME bytes per op as stock at every split -- the hot
+     leaves already sit in the page cache, so the ring caches records whose pages are cached.
+     BF's 12-21% loss there is CPU on the BF read path, not I/O.  A full-page mirror in the
+     ring cannot save I/O that is already not being spent, so the reference's M2 cannot close
+     this gap.  **M2 as designed = non-transfer**; the gap is a read-path overhead to profile.
+  3. The harness default split (16 MiB ring + 20 MiB pcache at this budget) is dominated by
+     the ring-heavy 32 + 4 split on all three workloads.
       Clean from the first run (scan arm, drift-free by construction? no -- but consistent
       across all five rings): range scans are 0.83-0.86x of stock at EVERY split, because
       the record cache never serves a scan and BF pays merge/flush overhead on top.
@@ -2043,3 +2064,13 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   `configs/m2_split.json` (36 runs, ~2 h) launched from clean `aa1a49b`.
 - The `d3_ckpt` campaign died with the previous session at 9/36 and was NOT restarted (it would
   have competed with M2 work); rerun it on an idle machine before the checkpoint decision.
+
+### 2026-09-30 (cont.) — Claude Opus 5.5 — M2 answered by measurement: non-transfer as designed
+
+- `results/m2_split_v2` (table in M2).  Records win per byte on scrambled zipf (+14% over stock
+  at a 32 MiB ring); on contiguous zipf BF's I/O equals stock's at every split, so its 12-21%
+  deficit is read-path CPU, which a ring full-page mirror cannot remove.  M2 as the reference
+  designs it is recorded as a non-transfer in this fork (SQLite's pcache is the page arm).
+- Proposed next, pending the owner: (a) profile the BF point-read path on zipf-raw at a 32 MiB
+  ring (perf, per CLAUDE.md's loop) to find the CPU overhead; (b) make the harness default split
+  ring-heavy (pcache sized to interior pages), since it dominates the current default.
