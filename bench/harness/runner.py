@@ -247,6 +247,16 @@ def split_memory(run, page_floor):
     behaviours for comparison with results recorded before this.
     """
     budget = parse_size(run["budget_bytes"])
+    if run.get("ring_bytes") is not None:
+        # Explicit split (M2 measurement, 2026-09-30): the ring gets exactly
+        # ring_bytes (a power of two, as the ring requires) and the page cache
+        # gets the rest of the SAME total, so an axis over ring_bytes moves
+        # memory between record-granular and page-granular caching and nothing
+        # else.  Every SUT in the cell still gets `budget` in total.
+        ring = parse_size(run["ring_bytes"])
+        if ring & (ring - 1) or ring >= budget:
+            raise SystemExit("ring_bytes must be a power of two below budget_bytes")
+        return budget, ring, budget - ring
     floor = parse_size(run.get("bf_page_cache_floor", page_floor))
     floor = min(floor, budget // 2)
     ring = budget - floor

@@ -1,0 +1,128 @@
+{
+  "name": "m2_split",
+  "_comment": [
+    "M2 measure-first (owner decision 2026-09-30).  In ../bf-tree a 'full page' is a",
+    "copy of the base leaf in the ring: page-granular caching inside the same pool as",
+    "the records.  This fork already HAS a page-granular cache -- SQLite's pcache --",
+    "and the harness gives it part of BF's budget.  So M2's question can be asked",
+    "with no code: at a FIXED total, move memory between the record ring and the",
+    "page cache and see which granularity serves more reads per byte.",
+    "  ring_bytes 2/4/8/16/32 MiB, page cache = 36 MiB - ring; stock = 36 MiB pcache",
+    "  read_zipf     point reads, scrambled zipf (YCSB): hot keys spread over leaves",
+    "  read_zipfraw  point reads, contiguous zipf: hot keys share leaves -- where a",
+    "                full page should beat records",
+    "  scan_zipfraw  32-row range scans: the record cache does not serve scans, so",
+    "                this arm isolates the page cache",
+    "If page caching wins per byte on zipfraw, M2 is worth building (as a unified",
+    "pool); if records win or it is a wash, M2 is a documented non-transfer.",
+    "Read seek hit %, cached_records, evictions and pg hit % beside ops/s."
+  ],
+  "datasets": {
+    "v100": {
+      "records": 4000000,
+      "value_len": 100,
+      "key_spacing": 16
+    }
+  },
+  "defaults": {
+    "dataset": "v100",
+    "repeats": 2,
+    "seconds": 60,
+    "warmup_seconds": 120,
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "read_txn": true,
+    "drop_cache": true,
+    "budget_bytes": "36M",
+    "memmax": "auto",
+    "promotion": 30,
+    "copy_on_access": 10
+  },
+  "experiments": [
+    {
+      "name": "read_zipf",
+      "workload": "read=100",
+      "dist": "zipf",
+      "suts": [
+        "stock"
+      ],
+      "ring_bytes": "16M",
+      "_why": "stock ignores the ring; ring_bytes only pins the cell TOTAL to 36 MiB, all of it pcache"
+    },
+    {
+      "name": "read_zipf",
+      "workload": "read=100",
+      "dist": "zipf",
+      "suts": [
+        "bf"
+      ],
+      "axes": {
+        "ring_bytes": [
+          "2M",
+          "4M",
+          "8M",
+          "16M",
+          "32M"
+        ]
+      }
+    },
+    {
+      "name": "read_zipfraw",
+      "workload": "read=100",
+      "dist": "zipfraw",
+      "suts": [
+        "stock"
+      ],
+      "ring_bytes": "16M",
+      "_why": "stock ignores the ring; ring_bytes only pins the cell TOTAL to 36 MiB, all of it pcache"
+    },
+    {
+      "name": "read_zipfraw",
+      "workload": "read=100",
+      "dist": "zipfraw",
+      "suts": [
+        "bf"
+      ],
+      "axes": {
+        "ring_bytes": [
+          "2M",
+          "4M",
+          "8M",
+          "16M",
+          "32M"
+        ]
+      }
+    },
+    {
+      "name": "scan_zipfraw",
+      "workload": "scan=100",
+      "dist": "zipfraw",
+      "scan_len": 32,
+      "suts": [
+        "stock"
+      ],
+      "ring_bytes": "16M",
+      "_why": "stock ignores the ring; ring_bytes only pins the cell TOTAL to 36 MiB, all of it pcache"
+    },
+    {
+      "name": "scan_zipfraw",
+      "workload": "scan=100",
+      "dist": "zipfraw",
+      "scan_len": 32,
+      "suts": [
+        "bf"
+      ],
+      "axes": {
+        "ring_bytes": [
+          "2M",
+          "4M",
+          "8M",
+          "16M",
+          "32M"
+        ]
+      }
+    }
+  ]
+}
