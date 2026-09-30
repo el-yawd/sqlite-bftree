@@ -136,7 +136,10 @@ are not measurements of the current tree.**
 
 ### 2.4 Two measured constraints currently dominate the evidence
 
-1. **FIFO retention.**  Every steady-state cell sits **18–25 points below the Zipf ideal** for
+1. **FIFO retention — CORRECTED 2026-09-24 (H1b): mostly a metric artifact.**  The figures
+   below are lookup ratios that read 10–15 points low; per read, the engine matches a model of
+   its own policy and copy-on-access recovers ~2 points and no throughput.  Kept for the record:
+   Every steady-state cell sits **18–25 points below the Zipf ideal** for
    the number of records it actually caches (33.9 vs 54.7; 53.7 vs 71.7; 31.9 vs 57.2; 49.2 vs
    71.7).  The ring evicts the oldest record, not the coldest.  Addressed by the
    copy-on-access second-chance region (landed `c99c040`).  The mechanism is not in doubt — the
@@ -408,7 +411,9 @@ back correctly but has no effect is almost always this.  Issue them in exactly t
 2. **Then `PRAGMA journal_mode`, then the per-cache settings.**  `bf_cache_size`,
    `bf_min_record`, `bf_promotion_rate`, `bf_group_commit` and `bf_copy_on_access` all reach
    into *this connection's* `BfCache` (`bf_btree.c:724`, `:753`, `:776`), and `journal_mode`
-   reopens the pager and drops anything configured before it.
+   reopens the pager and drops anything configured before it.  (Correction 2026-09-24: `bf_copy_on_access`
+   is the exception — a global the ring re-reads at every (re)initialisation, so it is
+   order-free; H1b.)
 3. **`bf_min_record` after `bf_cache_size`.**  Setting it rebuilds the size-class ladder by
    dropping every mapping and reinitialising the ring at its *current* capacity, so it must see
    the capacity the run actually wants (`bfbench.c:875-877`).  The reverse order silently builds
@@ -579,9 +584,7 @@ are the write path and the unswept retention knobs, not the eviction machinery:
    green; nothing downstream is quotable on a tree that loses rows on `ROLLBACK`.
 1. **D1 / D2** — the remaining durability contracts. Nothing downstream is quotable until an
    acknowledged commit means something definite.
-2. **H1b** — copy-on-access has been landed and unmeasured since `c99c040`, and §2.4 names
-   retention as one of the two constraints on reads.  It is a harness change, not an engine
-   change, and it is the cheapest unknown left.
+2. ~~**H1b**~~ — **DONE 2026-09-24**: retention is not the constraint (see the H1b item).
 3. **D3-core → D3a** — existing-row UPDATE is still page-image write-through.  This is the
    oldest open item in the project and the one with an obvious mechanism behind it.
 4. **H0 / H2** — update and scan arms at the paper shape, and a warmup floor per arm.
@@ -820,13 +823,48 @@ Copy-on-access is the half that is genuinely unwired: `copy_on_access` appears *
 `bfbench.c` or `runner.py`, so the mechanism landed in `c99c040` has never been swept and §2.4's
 retention gap has no remedy measurement.
 
-- [ ] `--copy-on-access` in `bfbench.c`, forwarded from `runner.py`
-- [ ] axes taken from `benchmark/bench_bftree.toml` so ours line up with theirs:
-      copy-on-access `0,5,10,15,20,40,60,80,100`; read promotion `1,5,10,20,40,60,80,100`
-- [ ] upgrade-shed (`SQLITE_BF_UPGRADE_SHED`) off/on as SUTs, or a runtime control
-- [ ] observe the ordering rules in §3.4 — `bf_copy_on_access` is per-cache, so it goes after
-      `journal_mode`; check whether it must also follow `bf_cache_size` the way `bf_min_record`
-      does
+- [x] `--copy-on-access` in `bfbench.c`, forwarded from `runner.py`, echoed in the result
+      JSON (`309ea3f`); liveness-checked: 0/10/40/100 move relocations, shed and evictions
+- [x] axes taken from `benchmark/bench_bftree.toml` — `configs/h1b.json`, as two 1-D sweeps
+      through the defaults (the cross product is >1 day at the steady-state warmup)
+- [x] upgrade-shed as a SUT: `bf_shed` (`build_suts.sh --all`), crossed with the coa axis
+- [x] ordering: **no constraint** — `bf_copy_on_access` is a global the ring re-reads on
+      every (re)initialisation (`bf_circular_buffer.c:328`), so it survives a later
+      `bf_cache_size`/`bf_min_record` rebuild; §3.4's claim that it is per-cache was wrong
+- [x] run `configs/h1b.json` (54 runs, 169.6 min, 0 failed, clean `309ea3f`) and the per-seek
+      confirmation `configs/h1b_seek.json` (clean `f08e09b`).  **DONE 2026-09-24; result below.**
+
+**Result (v100, 4M rows, 32 MiB budget, zipf 0.9, 120 s warmup; every cell saturated,
+evictions > 0).**  Hit rate is PER SEEK (`seek_served`/`seek_leaf`, `e153ea9`):
+
+| copy_on_access | hit % / read | cached_records | evictions | model hit % |
+|---|---|---|---|---|
+| 0   | 46.8 | 87k | 93k–201k | 45.4 |
+| 10  | 48.6 | 82k | 236k–241k | 47.9 |
+| 20  | 48.9 | 77k | 259k–272k | 48.8 |
+| 40  | 48.8 | 68k | 300k–347k | 49.6 |
+| 100 | 40.2 | 24k | 1.1M–1.2M | 42.5 |
+
+- "Model" = a record-level simulation of the same policy (FIFO ring, admission p=0.3 on miss,
+  copy-on-access with the old slot left as dead space until the head passes, 88k slots).  The
+  engine tracks it within ~1.5 points: **the implementation reaches its policy's ceiling.**
+  The prediction in `h1b.json` holds — an interior optimum (20–40), and strict relocation
+  (100) churns the ring into dead space (live `mini_page_bytes` 16.0 MB → 4.9 MB).
+- **Throughput: no gain.**  h1b (within-campaign): stock 26,995 ops/s; bf 0.92–0.95x stock at
+  coa 0–60 with coa=0 nominally best; 0.58x/0.75x at 80/100 (spreads up to 29%).  `bf_shed`
+  is never better than `bf`.  Promotion axis: hit flat for promotion ≥ 5; promotion = 1 never
+  saturated (0 evictions).  h1b_seek ran ~35k ops/s for the same cells: cross-campaign numbers
+  are not comparable (powersave governor), as §6.5 says.
+- **Metric correction (the bigger finding).**  `mini_page_hits/(hits+misses)` counts LOOKUPS:
+  one point read makes several (descent shortcut, `RecordExists` at the leaf and in
+  `fetchPayload`, each counted again by its `bf_btree.c` wrapper), so a miss counts ~1.8x and a
+  hit ~1x.  Every record hit rate quoted before 2026-09-24 is 10–15 points low (h1b coa=0:
+  32.7% by lookups, 46.8% per read) — including §2.4's "18–25 points below the Zipf ideal".
+  `report.py` now uses the seek counters and suffixes old lookup ratios `L`.
+- Also fixed: `bfbench.c` kept at most 40 `bf_cache_stats` rows while the pragma emits 43+,
+  silently dropping `wal_commits` and `group_*` from every result JSON.
+- **Verdict:** retention policy is not what holds reads back on this box.  Leave
+  `bf_copy_on_access` at 10 (within noise of the optimum, matches the reference default).
 
 ### D3-core — let a buffered record shadow a same-key base cell
 *From: perf plan Stage 3(c), and the precondition D3a and D3b both need.*  Gated behind V0 and
@@ -1852,3 +1890,14 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   runs; power-loss 240 runs; repros; codec; ring_repro).
 - Benchmark status: NOT RUN.  Note for the campaign: promotion is now deterministic, so repeat
   runs of a benchmark cell are no longer independent draws of the promotion coin.
+
+### 2026-09-24 (cont.) — Claude Opus 5.5 — H1b swept; the record hit rate was mis-measured
+
+- Ran `configs/h1b.json` (54 runs, 0 failed) and `configs/h1b_seek.json`; results, table and
+  verdict in the H1b item.  Copy-on-access: interior hit-rate optimum at 20–40, zero
+  throughput gain; the engine matches a record-level simulation of its policy within ~1.5 pts.
+- Found and fixed (`e153ea9`): the record hit rate counted lookups, not reads (a miss ~1.8x),
+  understating every hit rate ever quoted by 10–15 points; new `seek_served`/`seek_leaf`
+  counters, report.py switched.  And bfbench dropped stats rows past 40.
+- Validation: quick gate green on `e153ea9` (12/12).  Numbers: within-campaign only.
+- Exact next action: **D3-core** (let a buffered record shadow a same-key base cell), then D3a.

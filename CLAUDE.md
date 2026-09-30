@@ -94,7 +94,7 @@ warmup -- since shown to be too short: 900 s is the larger-than-memory floor,
 and 420 s never evicted, so numbers taken there were mid-fill.  **Report `cached_records` and `evictions` beside every hit rate**; a
 hit rate without them is uninterpretable.
 
-**The one thing holding reads back is measured and consistent: FIFO retention.**
+**CORRECTED 2026-09-24 (plan H1b): the FIFO-retention story below used a lookup-weighted hit rate that reads 10-15 points low; per read, the engine matches its policy model and copy-on-access buys no throughput. Use `seek_served`/`seek_leaf`.**  Old text: **The one thing holding reads back is measured and consistent: FIFO retention.**
 Every steady-state cell sits **18-25 points below the Zipf ideal** for the number
 of records it actually caches (33.9% vs 54.7%; 53.7% vs 71.7%; 31.9% vs 57.2%;
 49.2% vs 71.7%).  The ring evicts the oldest record, not the coldest, so it
