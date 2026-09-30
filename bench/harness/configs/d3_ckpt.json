@@ -1,0 +1,70 @@
+{
+  "name": "d3_ckpt",
+  "_comment": [
+    "Follow-up to d3.json (plan \u00a79 2026-09-30): there, clear_logged ~= ops -- every buffered",
+    "record was materialised into its leaf ALONE, because SQLite's default auto-checkpoint",
+    "(1000 frames) flushes ~1000 random records onto ~1000 of ~120k leaves.  The question this",
+    "answers: do D3a/D3b pay once records live long enough to share a leaf?",
+    "Axis: wal_autocheckpoint 1000 (default) / 10000 / 0 (never during the run).  Read",
+    "ops / clear_logged (records per flushed leaf) beside ops/s, read B/op and write B/op.",
+    "Durable mode only (group 1); stock runs on the same axis as the reference."
+  ],
+  "datasets": {
+    "v100": {
+      "records": 4000000,
+      "value_len": 100,
+      "key_spacing": 16
+    }
+  },
+  "defaults": {
+    "dataset": "v100",
+    "repeats": 2,
+    "seconds": 60,
+    "warmup_seconds": 30,
+    "dist": "zipf",
+    "theta": 0.9,
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true,
+    "budget_bytes": "32M",
+    "memmax": "auto",
+    "bf_page_cache_floor": "16M"
+  },
+  "experiments": [
+    {
+      "name": "update",
+      "workload": "update=100",
+      "suts": [
+        "stock",
+        "bf",
+        "bf_noupd"
+      ],
+      "axes": {
+        "autocheckpoint": [
+          1000,
+          10000,
+          0
+        ]
+      }
+    },
+    {
+      "name": "replace",
+      "workload": "insert=100",
+      "insert_mode": "replace",
+      "warmup_seconds": 120,
+      "suts": [
+        "stock",
+        "bf",
+        "bf_noblind"
+      ],
+      "axes": {
+        "autocheckpoint": [
+          1000,
+          10000,
+          0
+        ]
+      }
+    }
+  ]
+}
