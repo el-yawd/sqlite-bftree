@@ -1206,9 +1206,14 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--key-spacing")==0 ){ NEEDVAL; cfg.nKeySpacing = atoi(zVal); }
     else if( strcmp(z,"--workload")==0 ){ NEEDVAL; parseMix(&cfg, zVal); }
     else if( strcmp(z,"--dist")==0 ){ NEEDVAL;
-      cfg.dist = strcmp(zVal,"uniform")==0  ? DIST_UNIFORM
-               : strcmp(zVal,"latest")==0   ? DIST_LATEST
-               : strcmp(zVal,"zipf-raw")==0 ? DIST_ZIPFRAW : DIST_ZIPF; }
+      /* Unknown names used to fall back to scrambled zipf SILENTLY: the
+      ** 2026-09-30 m2_split campaign asked for "zipfraw", got "zipf", and ran
+      ** its whole contiguous arm as a second copy of the scrambled one. */
+      if( strcmp(zVal,"uniform")==0 ) cfg.dist = DIST_UNIFORM;
+      else if( strcmp(zVal,"latest")==0 ) cfg.dist = DIST_LATEST;
+      else if( strcmp(zVal,"zipf-raw")==0 || strcmp(zVal,"zipfraw")==0 ) cfg.dist = DIST_ZIPFRAW;
+      else if( strcmp(zVal,"zipf")==0 ) cfg.dist = DIST_ZIPF;
+      else die("--dist: want uniform, latest, zipf or zipf-raw, got %s", zVal); }
     else if( strcmp(z,"--theta")==0 ){ NEEDVAL; cfg.theta = atof(zVal); }
     else if( strcmp(z,"--scan-len")==0 ){ NEEDVAL; cfg.nScanLen = atoi(zVal); }
     else if( strcmp(z,"--seconds")==0 ){ NEEDVAL; cfg.seconds = atof(zVal); }

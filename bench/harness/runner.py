@@ -448,6 +448,8 @@ def main():
     ap.add_argument("--reload", action="store_true", help="rebuild datasets")
     ap.add_argument("--work", default=None, help="work directory for db copies")
     ap.add_argument("--continue-on-error", action="store_true")
+    ap.add_argument("--shuffle", type=int, default=None, metavar="SEED",
+                    help="randomise run order (within each dataset) with SEED")
     ap.add_argument("--force", action="store_true",
                     help="run a strict config despite a dirty tree or a "
                          "non-performance cpu governor")
@@ -462,6 +464,24 @@ def main():
     only = set(args.only.split(",")) if args.only else None
     suts_override = args.suts.split(",") if args.suts else None
     runs = expand(config, only, suts_override)
+    if args.shuffle is not None:
+        # Randomise the order so a slow window of the machine spreads across
+        # cells (and shows up as repeat spread) instead of landing on whichever
+        # cells ran consecutively.  2026-09-30 m2_split: two cells of an
+        # identical workload ran 35% slower in one ~10-minute window, with the
+        # same bytes read per op and less CPU -- the storage path, not the code.
+        # Grouped by dataset so the load/copy logic still sees one dataset at a
+        # time.
+        import random as _random
+        rng = _random.Random(args.shuffle)
+        by_ds = {}
+        for r in runs:
+            by_ds.setdefault(r.get("dataset"), []).append(r)
+        runs = []
+        for ds in by_ds:
+            chunk = by_ds[ds]
+            rng.shuffle(chunk)
+            runs += chunk
 
     page_floor = parse_size(config.get("defaults", {})
                             .get("bf_page_cache_floor", DEFAULT_PAGE_FLOOR))

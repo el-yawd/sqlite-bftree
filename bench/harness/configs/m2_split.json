@@ -15,7 +15,8 @@
     "                this arm isolates the page cache",
     "If page caching wins per byte on zipfraw, M2 is worth building (as a unified",
     "pool); if records win or it is a wash, M2 is a documented non-transfer.",
-    "Read seek hit %, cached_records, evictions and pg hit % beside ops/s."
+    "Read seek hit %, cached_records, evictions and pg hit % beside ops/s.",
+    "RERUN 2026-09-30: the first run's zipfraw arm silently ran scrambled zipf (bfbench spelled it zipf-raw and fell back on unknown names); run with --shuffle."
   ],
   "datasets": {
     "v100": {
@@ -71,7 +72,7 @@
     {
       "name": "read_zipfraw",
       "workload": "read=100",
-      "dist": "zipfraw",
+      "dist": "zipf-raw",
       "suts": [
         "stock"
       ],
@@ -81,7 +82,7 @@
     {
       "name": "read_zipfraw",
       "workload": "read=100",
-      "dist": "zipfraw",
+      "dist": "zipf-raw",
       "suts": [
         "bf"
       ],
@@ -98,7 +99,7 @@
     {
       "name": "scan_zipfraw",
       "workload": "scan=100",
-      "dist": "zipfraw",
+      "dist": "zipf-raw",
       "scan_len": 32,
       "suts": [
         "stock"
@@ -109,7 +110,7 @@
     {
       "name": "scan_zipfraw",
       "workload": "scan=100",
-      "dist": "zipfraw",
+      "dist": "zipf-raw",
       "scan_len": 32,
       "suts": [
         "bf"
