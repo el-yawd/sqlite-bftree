@@ -592,6 +592,9 @@ struct BfCache {
   u64 nBlindInserts;        /* upserts buffered without reading the leaf */
   u64 nBlindNoLeaf;         /* armed, but the child was not a known leaf */
   u64 nBlindRefused;        /* reached a known leaf, but the mini-page refused */
+  u64 nInsertGen;           /* H2: bumped by every sqlite3BfRecordWrite, the one
+                            ** path that adds a key to a mini-page */
+  u64 nProbeMemo;           /* H2: seeks whose re-probes the probe memo skipped */
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
@@ -797,7 +800,11 @@ SQLITE_PRIVATE void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno);
 /* Descent shortcut (Stage 1.6): true iff leaf pgno chldPg has a CLEAN cached
 ** record for intKey, so the descent can skip reading the leaf page. */
 SQLITE_PRIVATE int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg,
-    i64 intKey, void *pBuf, int *pnBuf);
+    i64 intKey, void *pBuf, int *pnBuf, int *pAbsent);
+#if !defined(SQLITE_BF_NO_DESCENT_SHORTCUT) && !defined(SQLITE_BF_NO_PROBE_MEMO)
+SQLITE_PRIVATE void sqlite3BfBtreeNoteAbsent(BtCursor *pCur, Pgno leaf, i64 intKey);
+#endif
+SQLITE_PRIVATE int sqlite3BfBtreeKnownAbsent(BtCursor *pCur, Pgno leaf, i64 intKey);
 /* Length of the clean cached record for the BF-served cursor's leaf key, or -1. */
 /* Copy the clean cached record into pBuf (cap nCap) in one read; len or -1. */
 SQLITE_PRIVATE int sqlite3BfBtreeReadCachedRecord(BtCursor *pCur, void *pBuf, int nCap);

@@ -4926,6 +4926,9 @@ static int btreeCursor(
   pCur->bfBlindArmed = 0;
   pCur->bfBlindSeek = 0;
   pCur->bfBlindHit = 0;
+  pCur->bfAbsentLeaf = 0;
+  pCur->bfAbsentKey = 0;
+  pCur->bfAbsentGen = 0;
 #endif
   pCur->pKeyInfo = pKeyInfo;
   pCur->pBtree = p;
@@ -5695,7 +5698,10 @@ static const void *fetchPayload(
   }
 #ifndef SQLITE_OMIT_BF_CACHE
   if( pCur->curIntKey ){
-    int bfSeen = sqlite3BfBtreeRecordExists(pCur,
+    /* H2: the descent's probe memo already says "no record here". */
+    int bfSeen = sqlite3BfBtreeKnownAbsent(pCur, pCur->pPage->pgno,
+                                           pCur->info.nKey) ? 0
+               : sqlite3BfBtreeRecordExists(pCur,
                      &pCur->info.nKey, sizeof(pCur->info.nKey));
     /* Populate the record cache on a read miss.
     **
@@ -6529,7 +6535,8 @@ int sqlite3BtreeBfArmBlind(BtCursor *pCur, i64 iKey){
 ** BTCF_BfLeaf flag is cleared and SQLITE_NOTFOUND is returned, so the caller
 ** continues the normal descent and reads the real leaf.
 */
-static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
+static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey,
+                                 int *pAbsent){
   int n;
 
   /* One scratch buffer per cursor, sized once to the max record class and
@@ -6540,7 +6547,8 @@ static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
   ** cursor is not touched until this succeeds, so a miss leaves no flags to
   ** unwind -- the caller just descends for real. */
   n = pCur->nBfScratch;
-  if( !sqlite3BfBtreeDescentServe(pCur, chldPg, intKey, pCur->pBfScratch, &n) ){
+  if( !sqlite3BfBtreeDescentServe(pCur, chldPg, intKey, pCur->pBfScratch, &n,
+                                  pAbsent) ){
     return SQLITE_NOTFOUND;
   }
   if( n<0 || n>pCur->nBfScratch ) return SQLITE_NOTFOUND;
@@ -6572,6 +6580,10 @@ int sqlite3BtreeTableMoveto(
   int *pRes                /* Write search results here */
 ){
   int rc;
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_DESCENT_SHORTCUT) \
+ && !defined(SQLITE_BF_NO_PROBE_MEMO)
+  Pgno bfAbsentPg = 0;      /* H2: the shortcut found NO record here (leaf) */
+#endif
 
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
@@ -6677,6 +6689,21 @@ int sqlite3BtreeTableMoveto(
           pCur->info.nKey = nCellKey;
           pCur->info.nSize = 0;
           *pRes = 0;
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_DESCENT_SHORTCUT) \
+ && !defined(SQLITE_BF_NO_PROBE_MEMO)
+          /* H2 probe memo: the shortcut has just searched THIS leaf's
+          ** mini-page for intKey and found nothing -- no tombstone, no dirty
+          ** op, no cached copy -- and nothing has run since.  Skip the three
+          ** re-probes below (and fetchPayload's) and remember it. */
+          if( bfAbsentPg!=0 && bfAbsentPg==pPage->pgno ){
+            sqlite3BfBtreeNoteAbsent(pCur, pPage->pgno, intKey);
+            if( (pCur->curFlags & BTCF_WriteFlag)==0 ){
+              BfCache *pBfSeek = btreeGetBfCache(pCur->pBt);
+              if( pBfSeek ) pBfSeek->nSeekLeaf++;
+            }
+            return SQLITE_OK;
+          }
+#endif
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
  && !defined(SQLITE_BF_NO_WRITEBACK_DELETE)
           /* Write-back delete (Stage 2.3): the base cell physically exists but
@@ -6761,9 +6788,15 @@ moveto_table_next_layer:
     ** subsequent point payload read through the BF cache.  Only fires at the
     ** true leaf edge (interior pgnos are never in the BF map).  Any non-point
     ** cursor op re-descends for real first (see getCellInfo / Next / etc.). */
-    if( btreeBfServeFromCache(pCur, chldPg, intKey)==SQLITE_OK ){
-      *pRes = 0;
-      return SQLITE_OK;         /* row served from BF; leaf page not read */
+    {
+      int bAbsent = 0;
+      if( btreeBfServeFromCache(pCur, chldPg, intKey, &bAbsent)==SQLITE_OK ){
+        *pRes = 0;
+        return SQLITE_OK;       /* row served from BF; leaf page not read */
+      }
+# if !defined(SQLITE_BF_NO_PROBE_MEMO)
+      bfAbsentPg = bAbsent ? chldPg : 0;
+# endif
     }
 #endif
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \

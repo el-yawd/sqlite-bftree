@@ -863,6 +863,7 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   void *pNew;
   u32 newSize;
 
+  pCache->nInsertGen++;     /* H2 probe memo: a key may become present */
   pEntry = sqlite3BfMapGetOrCreate(pCache, pgno);
   if( !pEntry ){
     BF_ALLOC_TRACE("map-getorcreate-nomem", pCache, (int)pgno);

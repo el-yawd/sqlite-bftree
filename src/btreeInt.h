@@ -580,6 +580,15 @@ struct BtCursor {
   u8 bfBlindArmed;
   u8 bfBlindSeek;
   u8 bfBlindHit;
+  /* H2 probe memo (2026-10-01): the descent shortcut probed leaf bfAbsentLeaf
+  ** for bfAbsentKey and found NO record (no mini-page, or key not in it).
+  ** Valid while BfCache.nInsertGen==bfAbsentGen: only sqlite3BfRecordWrite
+  ** adds a key to a mini-page, so until it runs the key stays absent.  Lets
+  ** the leaf exit and fetchPayload skip re-probing the same leaf for the same
+  ** key (tombstone, dirty-op, record-exists).  SQLITE_BF_NO_PROBE_MEMO. */
+  Pgno bfAbsentLeaf;
+  i64 bfAbsentKey;
+  u64 bfAbsentGen;
 #endif
   i8 iPage;                 /* Index of current page in apPage */
   u8 curIntKey;             /* Value of apPage[0]->intKey */

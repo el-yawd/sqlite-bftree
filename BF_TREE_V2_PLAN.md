@@ -1089,10 +1089,23 @@ under the campaign cgroup).  BF spent 17-22% of samples in libc (stock 5%).  Wha
       of an 8-byte big-endian rowid -- constant for every row in a leaf, so the preview never
       decides a comparison and every search step dereferences the key bytes.  Needs a
       per-mini-page prefix (fences) to port faithfully.
-- [ ] redundant probes: after a shortcut miss at leaf L for key K, the same seek re-probes L for
-      K up to three times (tombstone, dirty-op, record-exists).  A per-cursor "missed (L,K)"
-      note would skip them; `KeyTombstoned` also lacks `KeyDirtyOp`'s `bDirtyInserts` early-out.
-- [ ] re-profile after these; then decide whether what remains is structural (the probe cost)
+- [x] redundant probes -- built and committed 2026-10-01 (owner: keep it): the probe memo
+      (`BtCursor.bfAbsentLeaf/Key/Gen`, `BfCache.nInsertGen`, counter `probe_memo`, switch
+      `SQLITE_BF_NO_PROBE_MEMO`).  After a shortcut miss that found NO record for K in leaf L,
+      the leaf exit skips `KeyTombstoned`/`KeyDirtyOp` and `fetchPayload` skips `RecordExists`,
+      while no `sqlite3BfRecordWrite` (the only path that adds a key) has run.  Fires on every
+      leaf seek (`probe_memo`/op = `seek_leaf`/op = 0.454).  Gate green.  **Buys nothing
+      measurable**: smoke ABBA (not quotable) stock 48.4k, without 45.6k, with 45.8k (+0.4%,
+      inside run spread) -- the re-probes hit lines the shortcut had just pulled into cache.
+      The generation guard is oracle-blind: a mutant without it passes difftest 720/720 (the
+      stale case needs a same-row write between one cursor's seek and its column read, inside
+      one statement).  I recommended dropping it (no gain, an untestable invariant); the owner
+      chose to keep it.  It ships with its switch, so the letter campaign can still attribute it.
+- [x] re-profile (2026-10-01, memo build): libc is down to stock's level.  The shortcut is
+      19-23% inclusive, and **60% of `bfBinarySearch` is one load: the record's key bytes**
+      (`mov (%rsi),%rdx`), a cache miss per search step; 8% more is the preview byte.  That is
+      the cost the preview exists to avoid, so the preview-prefix port above is next, now on
+      evidence.
 
 ### D4 — the 64 B write-amplification question, still open
 *From: perf plan Stage 4.*  `pg frames/commit` regressed 1.00 → 3.74 at 64 B payloads (write
@@ -2124,3 +2137,12 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   merge generator extended and mutation-checked (HEAD 180/216, fix 216/216).
 - Gate: quick 12/12, full 50/50 (difftest 1581/1581).  All SUTs rebuilt from this tree.
 - Still pending: rerun `d3_ckpt`; the H2 open boxes (preview prefix, redundant probes).
+
+### 2026-10-01 (cont.) — Claude Opus 5.5 — H2 probe memo built; no gain; re-profile names the key load
+
+- `86229da` committed (H2 accidents + negative-rowid fix), owner's go-ahead.
+- Probe memo built per owner ("go for the repeated lookups"): correct, fires on every leaf
+  seek, gate green, +0.4% (noise).  Its guard is oracle-blind (mutant 720/720).  I recommended
+  dropping it; owner: "keep it and commit".
+- Re-profile: the remaining gap is the key-byte cache miss in `bfBinarySearch` -- the preview
+  port (fence prefix) is the evidence-backed next step.

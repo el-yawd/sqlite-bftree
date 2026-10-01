@@ -1036,6 +1036,7 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[3] = pBf ? pBf->nBlindInserts : 0;
   aOut[4] = pBf ? pBf->nBlindNoLeaf : 0;
   aOut[5] = pBf ? pBf->nBlindRefused : 0;
+  aOut[6] = pBf ? pBf->nProbeMemo : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){
@@ -2135,7 +2136,7 @@ int sqlite3BfBtreeRecordExists(
 ** leaf edge.
 */
 int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
-                               void *pBuf, int *pnBuf){
+                               void *pBuf, int *pnBuf, int *pAbsent){
   BtShared   *pBt;
   BfCache    *pBf;
   BfMapEntry *pEntry;
@@ -2157,7 +2158,10 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
   if( (pCur->curFlags & BTCF_WriteFlag)!=0 ) return 0;
 
   pEntry = sqlite3BfMapLookup(pBf, chldPg);
-  if( !pEntry || pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ) return 0;
+  if( !pEntry || pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ){
+    *pAbsent = 1;             /* no mini-page: no record of any kind */
+    return 0;
+  }
   pMini = (BfMiniPage*)pEntry->pPage;
 
   /* ONE search, and it copies.  This used to be a probe that searched without a
@@ -2169,7 +2173,7 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
   if( rc!=BF_OK ){
     /* BF_DELETED (tombstone/phantom) or miss: let the real descent decide. */
     if( rc==BF_DELETED ) pBf->nMiniPageHit++;
-    else pBf->nMiniPageMiss++;
+    else{ pBf->nMiniPageMiss++; *pAbsent = 1; }
     return 0;
   }
   pBf->nMiniPageHit++;
@@ -2179,6 +2183,34 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
   return 1;
 }
 
+
+/*
+** H2 probe memo (btreeInt.h, BtCursor.bfAbsentLeaf).  NoteAbsent records that
+** the descent shortcut found no record for intKey in leaf's mini-page;
+** KnownAbsent is true while that still holds, i.e. the cursor asks about the
+** same (leaf, key) and no sqlite3BfRecordWrite has run since.  A record can
+** only appear through that function (mark-clean and copies rewrite existing
+** keys), so the memo is exact, not a heuristic.
+*/
+#if !defined(SQLITE_BF_NO_DESCENT_SHORTCUT) && !defined(SQLITE_BF_NO_PROBE_MEMO)
+void sqlite3BfBtreeNoteAbsent(BtCursor *pCur, Pgno leaf, i64 intKey){
+  BfCache *pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf ){ pCur->bfAbsentLeaf = 0; return; }
+  pCur->bfAbsentLeaf = leaf;
+  pCur->bfAbsentKey = intKey;
+  pCur->bfAbsentGen = pBf->nInsertGen;
+  pBf->nProbeMemo++;
+}
+#endif
+int sqlite3BfBtreeKnownAbsent(BtCursor *pCur, Pgno leaf, i64 intKey){
+  BfCache *pBf;
+  if( pCur->bfAbsentLeaf==0 || pCur->bfAbsentLeaf!=leaf
+   || pCur->bfAbsentKey!=intKey ){
+    return 0;
+  }
+  pBf = btreeGetBfCache(pCur->pBt);
+  return pBf!=0 && pBf->nInsertGen==pCur->bfAbsentGen;
+}
 
 /*
 ** Per-cursor scratch (the buffer a BF-served row's payload is copied into).
