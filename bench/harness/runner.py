@@ -356,6 +356,10 @@ def build_argv(run, dbpath, jsonpath, page_floor):
         argv += ["--read-txn"]
     if run.get("drop_cache", True):
         argv += ["--drop-cache"]
+    if run.get("direct_io"):
+        # H7: main db through bfdio (O_DIRECT), every SUT alike.  Proven per run
+        # below from the driver's mincore residency, not assumed.
+        argv += ["--direct-io"]
 
     # --- the memory split: identical totals, different spending -------------
     if sut == "stock":
@@ -679,6 +683,25 @@ def main():
                     fout.flush()
                     sys.exit("refusing to continue: the SUT is not running the "
                              "memory budget it was given")
+
+        # Direct-I/O proof (H7).  btrfs accepts O_DIRECT and still serves
+        # compressed extents through the page cache, so "the flag was passed"
+        # proves nothing.  The db's OS-cached pages must not grow over the
+        # measured phase; a run where they did measured buffered I/O.
+        if record.get("run") and r.get("direct_io"):
+            dio = (record["run"].get("result") or {}).get("dio") or {}
+            before = dio.get("db_resident_pages_before", -1)
+            after = dio.get("db_resident_pages_after", -1)
+            if dio.get("direct_io") != 1:
+                record["error"] = "direct_io asked, driver did not run it"
+            elif before < 0 or after < 0:
+                record["warning"] = "direct-io unproven: residency unmeasurable"
+            elif after > before + 256:
+                record["warning"] = ("direct-io proof failed: db resident pages "
+                                     "%d -> %d" % (before, after))
+            if record.get("warning") or record.get("error"):
+                print("          WARNING: %s" % (record.get("warning")
+                                                  or record.get("error")))
 
         if proc.returncode != 0:
             n_fail += 1

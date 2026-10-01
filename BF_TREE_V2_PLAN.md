@@ -1123,27 +1123,44 @@ This does **not** reverse §7.1: SQLite core and its unix VFS stay untouched, an
 the comparison.  The VFS is harness-side, both SUTs use it, and it is reported as a second
 I/O mode beside buffered, never instead of it.
 
-- [ ] `bfbench --direct-io`: register a shim VFS over `unix` (`sqlite3_vfs_register`, not
+- [x] `bfbench --direct-io`: register a shim VFS over `unix` (`sqlite3_vfs_register`, not
       default for anything else) that opens **the main database only** with `O_DIRECT`.  Bounce
       buffers aligned to the logical block size for every read/write, since pcache buffers are
       not 4 KiB-aligned and the 100-byte header read is neither aligned nor block-sized.  WAL,
       shm and journals stay buffered (unaligned WAL frame offsets; the read campaigns write
       nothing).  `mmap_size=0` asserted.
-- [ ] verify the filesystem honours it: the work dir is btrfs (zstd mount, `nodatacow` on the
+- [x] verify the filesystem honours it: the work dir is btrfs (zstd mount, `nodatacow` on the
       dir) over LUKS -- btrfs falls back to buffered I/O for compressed extents.  Proof per run,
       not assumed: `/proc/self/io` `read_bytes` ≈ pcache misses x page size, and the data file's
       resident page-cache pages (`fincore`/`mincore`) do not grow during the measured window.
       If btrfs will not cooperate, use a dedicated ext4/xfs loop image or partition and record
       it in the manifest.
-- [ ] correctness: the shim must be invisible.  `bfbench verify`-style full read (count +
+- [x] correctness: the shim must be invisible.  `bfbench verify`-style full read (count +
       checksum of every row) identical across buffered/direct for stock and bf, plus the
       integrity check; a short read/write mixed run under direct I/O for both SUTs.
-- [ ] `runner.py` key `direct_io` (default false) forwarded to every SUT; manifest records the
+- [x] `runner.py` key `direct_io` (default false) forwarded to every SUT; manifest records the
       mode, fs type and alignment; `report.py` labels direct-I/O cells.
+- [x] **built 2026-10-01.**  Shim: every file goes through `dioMethods`; for the main db a
+      second `O_DIRECT` fd serves `xRead` and aligned `xWrite` (bounce buffer, 4 KiB
+      alignment), everything else forwards; `xFetch` returns no mapping; EINVAL dies.  Work
+      dir (btrfs, `C` attr = nodatacow, so no compression) honours it: a direct stock run kept
+      the db at 4 resident pages throughout with block bytes/op == pcache misses x 4096
+      exactly (2632 = 2632); buffered grew 20k -> 74k resident pages.  Correctness: one
+      seeded mixed run (read/update/insert/scan/negative-read, 60k ops, ops_per_txn 4) for
+      stock and bf, buffered and direct -- all four integrity `ok`, 0 read errors, and the
+      SAME `.sha3sum` (`2672769a...`); 53k/47k direct writes, 0 unaligned fallbacks.  Runner
+      forwards `direct_io` and warns/excludes on residency growth >256 pages; report shows an
+      `I/O mode` row.  `dio_smoke` 8/8, every direct run proven (4 -> 4 pages).
 - [ ] `configs/dio_smoke.json` (tripwire, not quotable), then `configs/dio.json`: the m2_split
       arms (scrambled + contiguous point reads, scans) at the 32 MiB ring split and the
       default, buffered vs direct inside ONE campaign, shuffled.  The cgroup cap stays, but
       under direct I/O it no longer decides the result.
+      `configs/dio.json` is written: 48 runs, rings 4/16/32 MiB x {buffered, direct},
+      warmup 2M ops (300k for scans), 2 repeats -- it re-asks M2's split question where a
+      miss is a device read.  Smoke signal, NOT quotable (200k-op warmup): under direct I/O
+      on contiguous zipf, BF at 32+4 read MORE block bytes than stock (2441 vs 1534 B/op) --
+      the 4 MiB pcache cannot hold hot leaves stock's 36 MiB does; on scrambled zipf it read
+      13% less.
 - [ ] read the outcome against §6's three outcomes: a win that appears only under direct I/O
       is outcome 2 quantified -- the thesis's central measurement claim.
 

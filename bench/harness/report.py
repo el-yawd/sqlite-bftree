@@ -238,6 +238,14 @@ def main():
     W("| storage | %s on %s, opts `%s`, nodatacow=%s |"
       % (mach.get("workdir_fstype", "?"), mach.get("workdir_device", "?"),
          mach.get("workdir_mountopts", "?"), mach.get("nodatacow")))
+    n_dio = sum(1 for r in rows if (r.get("run") or {}).get("config", {})
+                .get("direct_io"))
+    W("| I/O mode | %s |" % (
+        "buffered (OS page cache in play)" if n_dio == 0 else
+        "**direct**: main db via O_DIRECT (bfdio VFS, plan H7), proven per run "
+        "by mincore residency" if n_dio == len(rows) else
+        "**mixed**: %d of %d runs direct (O_DIRECT, bfdio VFS); see the "
+        "`direct_io` axis" % (n_dio, len(rows))))
     W("| git rev | `%s`%s |" % (build.get("git_rev", "?")[:12],
                                " **(dirty tree)**" if build.get("git_dirty") else ""))
     W("| compiler | %s |" % build.get("cc", "?"))

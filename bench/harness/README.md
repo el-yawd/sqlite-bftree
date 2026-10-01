@@ -268,6 +268,22 @@ inserts across the whole key space so each commit touches a different leaf. The
 top half of the slot space is reserved for negative reads, so the two never
 overlap.
 
+## Direct I/O (`--direct-io`, config key `direct_io`; plan H7)
+
+Under buffered I/O an avoided page read is usually an OS page-cache hit, so the bytes BF
+saves barely move throughput.  `--direct-io` opens the main database through `bfdio`, a shim
+VFS in `bfbench.c` that serves reads and page-aligned writes from a second `O_DIRECT`
+descriptor via an aligned bounce buffer; locking, sync, WAL and shm stay on SQLite's own unix
+file.  Both SUTs use it, so SQLite core and the comparison against stock are unchanged.
+
+**Proven per run, never assumed** (btrfs accepts `O_DIRECT` and still serves compressed
+extents from the page cache).  The driver's JSON `result.dio` carries the db file's resident
+OS-cache pages before and after the measured phase (`mincore`); the runner warns, and the
+report excludes the run, if they grow by more than 256 pages.  In a valid direct run
+`io.read_bytes` equals `pcache.miss` x page size to the byte.  A filesystem that rejects
+`O_DIRECT` kills the run rather than falling back.  Warm up in operations
+(`warmup_ops`), not seconds, so both modes enter the measured phase with the same history.
+
 ## Known gaps
 
 - **Single threaded.** The fork keeps SQLite's single-writer serialisation, so

@@ -1,0 +1,42 @@
+{
+  "name": "dio",
+  "_comment": [
+    "H7 campaign: price BF's avoided reads.  Buffered vs direct I/O (bfdio VFS,",
+    "O_DIRECT on the main db) inside ONE campaign, shuffled, for both SUTs.",
+    "Under buffered I/O an avoided miss is usually an OS page-cache hit; under direct",
+    "I/O it is a device read, which is how ../bf-tree measures.  Every direct run is",
+    "proven by the driver's mincore residency (runner warns when the db's cached pages",
+    "grow) -- check RESULTS.md's excluded-runs table before reading any number.",
+    "Re-asks M2's split question where misses are real: ring 4/16/32 MiB of a fixed",
+    "36 MiB total, rest is pcache; stock = 36 MiB pcache (ring_bytes only pins the total).",
+    "  read_zipf     point reads, scrambled zipf (hot keys spread over leaves)",
+    "  read_zipfraw  point reads, contiguous zipf (hot keys share leaves)",
+    "  scan_zipfraw  32-row range scans (the record cache does not serve scans)",
+    "Warmup is in OPERATIONS, not seconds, so both I/O modes start the measured phase",
+    "with the same admitted history (direct I/O runs ~3x fewer ops per second).",
+    "Report seek hit %, cached_records and evictions beside every ops/s."
+  ],
+  "datasets": {"v100": {"records": 4000000, "value_len": 100, "key_spacing": 16}},
+  "defaults": {
+    "dataset": "v100", "repeats": 2, "seconds": 60, "warmup_ops": 2000000,
+    "theta": 0.9, "synchronous": "normal", "journal": "wal", "ops_per_txn": 1,
+    "read_txn": true, "drop_cache": true, "budget_bytes": "36M", "memmax": "auto",
+    "promotion": 30, "copy_on_access": 10
+  },
+  "experiments": [
+    {"name": "read_zipf", "workload": "read=100", "dist": "zipf",
+     "suts": ["stock"], "ring_bytes": "16M", "axes": {"direct_io": [false, true]}},
+    {"name": "read_zipf", "workload": "read=100", "dist": "zipf",
+     "suts": ["bf"], "axes": {"ring_bytes": ["4M", "16M", "32M"], "direct_io": [false, true]}},
+    {"name": "read_zipfraw", "workload": "read=100", "dist": "zipf-raw",
+     "suts": ["stock"], "ring_bytes": "16M", "axes": {"direct_io": [false, true]}},
+    {"name": "read_zipfraw", "workload": "read=100", "dist": "zipf-raw",
+     "suts": ["bf"], "axes": {"ring_bytes": ["4M", "16M", "32M"], "direct_io": [false, true]}},
+    {"name": "scan_zipfraw", "workload": "scan=100", "dist": "zipf-raw", "scan_len": 32,
+     "warmup_ops": 300000,
+     "suts": ["stock"], "ring_bytes": "16M", "axes": {"direct_io": [false, true]}},
+    {"name": "scan_zipfraw", "workload": "scan=100", "dist": "zipf-raw", "scan_len": 32,
+     "warmup_ops": 300000,
+     "suts": ["bf"], "axes": {"ring_bytes": ["4M", "16M", "32M"], "direct_io": [false, true]}}
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "dio_smoke",
+  "_comment": [
+    "H7 tripwire (NOT QUOTABLE): does the direct-I/O path run end to end through the",
+    "runner, and does each direct run prove itself (db resident pages flat)?",
+    "Buffered vs direct, stock vs bf at the 32 MiB ring split, scrambled + contiguous zipf."
+  ],
+  "datasets": {"v100": {"records": 4000000, "value_len": 100, "key_spacing": 16}},
+  "defaults": {
+    "dataset": "v100", "repeats": 1, "seconds": 15, "warmup_ops": 200000,
+    "theta": 0.9, "synchronous": "normal", "journal": "wal", "ops_per_txn": 1,
+    "read_txn": true, "drop_cache": true, "budget_bytes": "36M", "memmax": "auto",
+    "promotion": 30, "copy_on_access": 10, "workload": "read=100"
+  },
+  "experiments": [
+    {"name": "read_zipf", "dist": "zipf", "suts": ["stock", "bf"], "ring_bytes": "32M",
+     "axes": {"direct_io": [false, true]}},
+    {"name": "read_zipfraw", "dist": "zipf-raw", "suts": ["stock", "bf"], "ring_bytes": "32M",
+     "axes": {"direct_io": [false, true]}}
+  ]
+}

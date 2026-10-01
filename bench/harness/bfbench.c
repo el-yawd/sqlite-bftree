@@ -32,6 +32,7 @@
 ** apart at load time so the insert workload has gaps to land in, and so
 ** inserts split leaves that already hold data instead of appending.
 */
+#define _GNU_SOURCE        /* O_DIRECT */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +45,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include "sqlite3.h"
 
 /*----------------------------------------------------------------------------
@@ -310,6 +312,207 @@ static void dropFileCache(const char *zDb){
   }
 }
 
+
+/*----------------------------------------------------------------------------
+** Direct-I/O measurement VFS ("bfdio", --direct-io; plan item H7).
+**
+** WHY.  Under buffered I/O a record-cache hit that avoids a page read usually
+** avoids only an OS page-cache hit -- a memcpy, not a device read -- so BF read
+** 17-29% fewer block bytes than stock and converted almost none of it into
+** throughput.  ../bf-tree measures with direct I/O so that a miss costs a device
+** read.  This shim does the same for BOTH SUTs, in the harness: SQLite core and
+** its unix VFS are untouched, so the comparison is still against stock SQLite.
+**
+** HOW.  A shim over the default VFS.  Every file is the real unix file; for the
+** MAIN DATABASE only, the shim also opens a second descriptor with O_DIRECT and
+** serves xRead -- and page-aligned xWrite -- through it, via an aligned bounce
+** buffer (pcache buffers are not block-aligned, and the 100-byte header read is
+** neither aligned nor block-sized).  Locking, sync, size, truncate and shm stay
+** on the unix file; fsync on either descriptor syncs the same inode.  WAL, shm
+** and journals stay buffered: WAL frame offsets are not block-aligned, and the
+** read campaigns write nothing.  The kernel keeps O_DIRECT coherent with the
+** page cache (it writes back and invalidates the range first), so a buffered
+** write elsewhere cannot make a direct read stale.
+**
+** A filesystem that rejects O_DIRECT fails the run: falling back silently would
+** measure buffered I/O under a direct-I/O label.  One that ACCEPTS it but serves
+** from the page cache anyway (btrfs does, for compressed extents) is caught by
+** the per-run proof in the JSON: db_resident_pages before/after (mincore) must
+** not grow, and read_bytes should track pcache misses x page size.
+*/
+#define DIO_ALIGN 4096
+
+typedef struct DioFile {
+  sqlite3_file base;          /* .pMethods = &dioMethods (or the real ones) */
+  sqlite3_file *pReal;        /* the unix file, allocated right after this */
+  int fd;                     /* O_DIRECT descriptor; -1 when not the main db */
+  unsigned char *aBuf;        /* DIO_ALIGN-aligned bounce buffer */
+  size_t nBuf;
+} DioFile;
+
+static sqlite3_vfs *gDioReal = 0;
+static struct {
+  unsigned long long nRead, nReadBytes, nReadUnaligned, nShort;
+  unsigned long long nWrite, nWriteBytes, nWriteFallback;
+} gDio;
+
+static int dioBuf(DioFile *f, size_t n){
+  if( n<=f->nBuf ) return 1;
+  free(f->aBuf);
+  f->aBuf = 0; f->nBuf = 0;
+  if( posix_memalign((void**)&f->aBuf, DIO_ALIGN, n)!=0 ){ f->aBuf = 0; return 0; }
+  f->nBuf = n;
+  return 1;
+}
+
+static int dioClose(sqlite3_file *pFile){
+  DioFile *f = (DioFile*)pFile;
+  int rc = f->pReal->pMethods ? f->pReal->pMethods->xClose(f->pReal) : SQLITE_OK;
+  if( f->fd>=0 ) close(f->fd);
+  free(f->aBuf);
+  f->fd = -1; f->aBuf = 0; f->nBuf = 0;
+  return rc;
+}
+
+static int dioRead(sqlite3_file *pFile, void *zBuf, int iAmt, sqlite3_int64 iOfst){
+  DioFile *f = (DioFile*)pFile;
+  sqlite3_int64 lo = iOfst & ~(sqlite3_int64)(DIO_ALIGN-1);
+  sqlite3_int64 hi = (iOfst + iAmt + DIO_ALIGN - 1) & ~(sqlite3_int64)(DIO_ALIGN-1);
+  size_t n = (size_t)(hi - lo);
+  ssize_t got;
+  sqlite3_int64 avail;
+  if( f->fd<0 ) return f->pReal->pMethods->xRead(f->pReal, zBuf, iAmt, iOfst);
+  if( !dioBuf(f, n) ) return SQLITE_IOERR_NOMEM;
+  if( lo!=iOfst || (iAmt & (DIO_ALIGN-1))!=0 ) gDio.nReadUnaligned++;
+  do{ got = pread(f->fd, f->aBuf, n, lo); }while( got<0 && errno==EINTR );
+  if( got<0 ){
+    if( errno==EINVAL ) die("--direct-io: O_DIRECT read rejected (EINVAL) -- "
+                            "filesystem or alignment does not support it");
+    return SQLITE_IOERR_READ;
+  }
+  gDio.nRead++;
+  gDio.nReadBytes += (unsigned long long)got;
+  avail = (sqlite3_int64)got - (iOfst - lo);
+  if( avail >= iAmt ){
+    memcpy(zBuf, f->aBuf + (iOfst - lo), iAmt);
+    return SQLITE_OK;
+  }
+  /* Short read past end of file: SQLite's contract is to zero-fill the rest
+  ** and say SQLITE_IOERR_SHORT_READ (os_unix.c unixRead does the same). */
+  if( avail < 0 ) avail = 0;
+  if( avail ) memcpy(zBuf, f->aBuf + (iOfst - lo), (size_t)avail);
+  memset((char*)zBuf + avail, 0, (size_t)(iAmt - avail));
+  gDio.nShort++;
+  return SQLITE_IOERR_SHORT_READ;
+}
+
+static int dioWrite(sqlite3_file *pFile, const void *zBuf, int iAmt,
+                    sqlite3_int64 iOfst){
+  DioFile *f = (DioFile*)pFile;
+  ssize_t put;
+  if( f->fd<0 ) return f->pReal->pMethods->xWrite(f->pReal, zBuf, iAmt, iOfst);
+  if( (iOfst & (DIO_ALIGN-1))!=0 || (iAmt & (DIO_ALIGN-1))!=0 ){
+    gDio.nWriteFallback++;      /* buffered; the kernel keeps them coherent */
+    return f->pReal->pMethods->xWrite(f->pReal, zBuf, iAmt, iOfst);
+  }
+  if( !dioBuf(f, (size_t)iAmt) ) return SQLITE_IOERR_NOMEM;
+  memcpy(f->aBuf, zBuf, iAmt);
+  do{ put = pwrite(f->fd, f->aBuf, (size_t)iAmt, iOfst); }while( put<0 && errno==EINTR );
+  if( put<0 && errno==EINVAL ) die("--direct-io: O_DIRECT write rejected (EINVAL)");
+  if( put!=iAmt ) return put<0 && errno==ENOSPC ? SQLITE_FULL : SQLITE_IOERR_WRITE;
+  gDio.nWrite++;
+  gDio.nWriteBytes += (unsigned long long)iAmt;
+  return SQLITE_OK;
+}
+
+/* Everything else is the unix file's own behaviour. */
+#define DIO_REAL(f) (((DioFile*)(f))->pReal)
+static int dioTruncate(sqlite3_file *p, sqlite3_int64 n){ return DIO_REAL(p)->pMethods->xTruncate(DIO_REAL(p), n); }
+static int dioSync(sqlite3_file *p, int fl){ return DIO_REAL(p)->pMethods->xSync(DIO_REAL(p), fl); }
+static int dioFileSize(sqlite3_file *p, sqlite3_int64 *pn){ return DIO_REAL(p)->pMethods->xFileSize(DIO_REAL(p), pn); }
+static int dioLock(sqlite3_file *p, int e){ return DIO_REAL(p)->pMethods->xLock(DIO_REAL(p), e); }
+static int dioUnlock(sqlite3_file *p, int e){ return DIO_REAL(p)->pMethods->xUnlock(DIO_REAL(p), e); }
+static int dioCheckReserved(sqlite3_file *p, int *pr){ return DIO_REAL(p)->pMethods->xCheckReservedLock(DIO_REAL(p), pr); }
+static int dioFileControl(sqlite3_file *p, int op, void *a){ return DIO_REAL(p)->pMethods->xFileControl(DIO_REAL(p), op, a); }
+static int dioSectorSize(sqlite3_file *p){ return DIO_REAL(p)->pMethods->xSectorSize(DIO_REAL(p)); }
+static int dioDevChar(sqlite3_file *p){ return DIO_REAL(p)->pMethods->xDeviceCharacteristics(DIO_REAL(p)); }
+static int dioShmMap(sqlite3_file *p, int i, int sz, int ext, void volatile **pp){ return DIO_REAL(p)->pMethods->xShmMap(DIO_REAL(p), i, sz, ext, pp); }
+static int dioShmLock(sqlite3_file *p, int o, int n, int fl){ return DIO_REAL(p)->pMethods->xShmLock(DIO_REAL(p), o, n, fl); }
+static void dioShmBarrier(sqlite3_file *p){ DIO_REAL(p)->pMethods->xShmBarrier(DIO_REAL(p)); }
+static int dioShmUnmap(sqlite3_file *p, int del){ return DIO_REAL(p)->pMethods->xShmUnmap(DIO_REAL(p), del); }
+/* mmap would bypass xRead entirely: refuse it (cmdRun also asserts mmap_size=0). */
+static int dioFetch(sqlite3_file *p, sqlite3_int64 o, int n, void **pp){ (void)p; (void)o; (void)n; *pp = 0; return SQLITE_OK; }
+static int dioUnfetch(sqlite3_file *p, sqlite3_int64 o, void *pv){ (void)p; (void)o; (void)pv; return SQLITE_OK; }
+/* (An xFetch that hands back no mapping makes SQLite fall back to xRead, for
+** every file.  Only the main db is ever mmapped, and cmdRun sets mmap_size=0.) */
+
+static const sqlite3_io_methods dioMethods = {
+  3, dioClose, dioRead, dioWrite, dioTruncate, dioSync, dioFileSize,
+  dioLock, dioUnlock, dioCheckReserved, dioFileControl, dioSectorSize,
+  dioDevChar, dioShmMap, dioShmLock, dioShmBarrier, dioShmUnmap,
+  dioFetch, dioUnfetch
+};
+
+static int dioOpen(sqlite3_vfs *pVfs, sqlite3_filename zName, sqlite3_file *pFile,
+                   int flags, int *pOutFlags){
+  DioFile *f = (DioFile*)pFile;
+  int rc;
+  (void)pVfs;
+  memset(f, 0, sizeof(*f));
+  f->fd = -1;
+  f->pReal = (sqlite3_file*)&f[1];
+  rc = gDioReal->xOpen(gDioReal, zName, f->pReal, flags, pOutFlags);
+  if( rc!=SQLITE_OK ){
+    f->pReal->pMethods = 0;
+    return rc;
+  }
+  f->base.pMethods = &dioMethods;
+  if( (flags & SQLITE_OPEN_MAIN_DB)==0 || zName==0 ){
+    return SQLITE_OK;           /* not the main db: fd<0, every call forwards */
+  }
+  f->fd = open(zName, ((flags & SQLITE_OPEN_READONLY) ? O_RDONLY : O_RDWR)
+                      | O_DIRECT | O_CLOEXEC);
+  if( f->fd<0 ){
+    die("--direct-io: open(%s, O_DIRECT) failed: %s", zName, strerror(errno));
+  }
+  return SQLITE_OK;
+}
+
+static sqlite3_vfs gDioVfs;
+static void dioRegister(void){
+  gDioReal = sqlite3_vfs_find(0);
+  if( gDioReal==0 ) die("--direct-io: no default VFS");
+  gDioVfs = *gDioReal;
+  gDioVfs.zName = "bfdio";
+  gDioVfs.szOsFile = (int)sizeof(DioFile) + gDioReal->szOsFile;
+  gDioVfs.xOpen = dioOpen;
+  gDioVfs.pNext = 0;
+  if( sqlite3_vfs_register(&gDioVfs, 0)!=SQLITE_OK ) die("--direct-io: register failed");
+}
+
+/* Resident OS page-cache pages of a file (mincore over a PROT_READ mapping,
+** which faults nothing in).  -1 when it cannot be measured. */
+static long long residentPages(const char *zPath){
+  int fd = open(zPath, O_RDONLY | O_CLOEXEC);
+  struct stat st;
+  long long nRes = -1;
+  if( fd<0 ) return -1;
+  if( fstat(fd, &st)==0 && st.st_size>0 ){
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t nPg = (size_t)((st.st_size + pg - 1) / pg), i;
+    void *pMap = mmap(0, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    unsigned char *aVec = malloc(nPg);
+    if( pMap!=MAP_FAILED && aVec && mincore(pMap, (size_t)st.st_size, aVec)==0 ){
+      nRes = 0;
+      for(i=0; i<nPg; i++) nRes += (aVec[i] & 1);
+    }
+    free(aVec);
+    if( pMap!=MAP_FAILED ) munmap(pMap, (size_t)st.st_size);
+  }
+  close(fd);
+  return nRes;
+}
+
 /*----------------------------------------------------------------------------
 ** SQLite helpers
 */
@@ -432,6 +635,7 @@ typedef struct Config {
   int bNoLatency;
   int bReadTxn;
   int nMmap;
+  int bDirectIo;              /* --direct-io: main db through the bfdio VFS (H7) */
 } Config;
 
 static void configDefaults(Config *p){
@@ -844,6 +1048,7 @@ static int cmdRun(Config *p){
   int memUsed, memHigh;
   double tStart, tEnd, elapsed;
   long long nDone = 0, nTxn = 0;
+  long long nRes0, nRes1;
   int inTxn = 0, i;
   FILE *out;
 
@@ -851,7 +1056,14 @@ static int cmdRun(Config *p){
 
   if( p->bDropCache ) dropFileCache(p->zDb);
 
-  if( sqlite3_open(p->zDb, &db)!=SQLITE_OK ) die("open: %s", sqlite3_errmsg(db));
+  if( p->bDirectIo ){
+    if( p->nMmap > 0 ) die("--direct-io with --mmap: mmap bypasses the VFS read path");
+    dioRegister();
+  }
+  if( sqlite3_open_v2(p->zDb, &db, SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,
+                      p->bDirectIo ? "bfdio" : 0)!=SQLITE_OK ){
+    die("open: %s", sqlite3_errmsg(db));
+  }
   s.db = db;
 
   /* Must come before anything creates a pager: PRAGMA bf_cache swaps the global
@@ -949,6 +1161,8 @@ static int cmdRun(Config *p){
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS,  &dbCacheMiss0, &dummy, 1);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, &dbCacheWrite0,&dummy, 1);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_SPILL, &dbCacheSpill0,&dummy, 1);
+  nRes0 = residentPages(p->zDb);
+  memset(&gDio, 0, sizeof(gDio));     /* direct-I/O counters: measured phase only */
   procIoRead(&io0);
   getrusage(RUSAGE_SELF, &ru0);
 
@@ -1010,6 +1224,7 @@ static int cmdRun(Config *p){
   /* ---- snapshot counters at the end ------------------------------------ */
   getrusage(RUSAGE_SELF, &ru1);
   procIoRead(&io1);
+  nRes1 = residentPages(p->zDb);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_HIT,   &dbCacheHit1,  &dummy, 0);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS,  &dbCacheMiss1, &dummy, 0);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, &dbCacheWrite1,&dummy, 0);
@@ -1059,9 +1274,10 @@ static int cmdRun(Config *p){
           p->nCopyOnAccess, p->nMinRecord,
           p->bInsertReplace ? "replace" : "plain");
   fprintf(out, "    \"ops_per_txn\": %d, \"seed\": %llu, "
-               "\"read_txn\": %d, \"drop_cache\": %d\n",
+               "\"read_txn\": %d, \"drop_cache\": %d,\n",
           p->nOpsPerTxn, (unsigned long long)p->seed, p->bReadTxn,
           p->bDropCache);
+  fprintf(out, "    \"direct_io\": %d\n", p->bDirectIo);
   fprintf(out, "  },\n");
 
   fprintf(out, "  \"result\": {\n");
@@ -1112,6 +1328,18 @@ static int cmdRun(Config *p){
                "\"db_bytes_after\": %lld, \"wal_bytes_before\": %lld, "
                "\"wal_bytes_after\": %lld, \"wal_bytes_max\": %lld},\n",
           dbSize0, dbSize1, walSize0, walSize1, walMax);
+
+  /* Direct-I/O proof (H7): with --direct-io the db's OS-cached pages must not
+  ** grow over the measured phase; reported for buffered runs too, where they
+  ** show how much of the file the OS cache is quietly serving. */
+  fprintf(out, "    \"dio\": {\"direct_io\": %d, \"db_resident_pages_before\": %lld, "
+               "\"db_resident_pages_after\": %lld, \"reads\": %llu, "
+               "\"read_bytes\": %llu, \"reads_unaligned\": %llu, "
+               "\"short_reads\": %llu, \"writes\": %llu, \"write_bytes\": %llu, "
+               "\"write_fallbacks\": %llu},\n",
+          p->bDirectIo, nRes0, nRes1, gDio.nRead, gDio.nReadBytes,
+          gDio.nReadUnaligned, gDio.nShort, gDio.nWrite, gDio.nWriteBytes,
+          gDio.nWriteFallback);
 
   fprintf(out, "    \"pcache\": {\"hit\": %d, \"miss\": %d, \"write\": %d, "
                "\"spill\": %d},\n",
@@ -1185,7 +1413,8 @@ static const char zUsage[] =
 "                               size-class ladder (reference cb_min_record_size)\n"
 "  --ops-per-txn N              --autocheckpoint N   --mmap N\n"
 "  --seed N  --label S  --sut S  --json PATH\n"
-"  --drop-cache  --no-latency  --read-txn\n";
+"  --drop-cache  --no-latency  --read-txn\n"
+"  --direct-io                  main db via O_DIRECT (bfdio VFS; plan H7)\n";
 
 int main(int argc, char **argv){
   Config cfg;
@@ -1244,6 +1473,7 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--drop-cache")==0 ){ cfg.bDropCache = 1; }
     else if( strcmp(z,"--no-latency")==0 ){ cfg.bNoLatency = 1; }
     else if( strcmp(z,"--read-txn")==0 ){ cfg.bReadTxn = 1; }
+    else if( strcmp(z,"--direct-io")==0 ){ cfg.bDirectIo = 1; }
     else if( strcmp(z,"--help")==0 ){ fputs(zUsage, stderr); return 0; }
     else die("unknown option %s", z);
 #undef NEEDVAL
