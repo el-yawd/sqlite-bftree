@@ -588,6 +588,8 @@ are the write path and the unswept retention knobs, not the eviction machinery:
 0b. **Eight more D1 correctness bugs — FIXED 2026-09-24, UNCOMMITTED** (several were
    committed-data loss on ordinary SQL; see D1).  Committing them is the next action once the gate in §9 is
    green; nothing downstream is quotable on a tree that loses rows on `ROLLBACK`.
+0c. **H7 — direct-I/O measurement VFS** (owner, 2026-10-01): next, now that the gate is green.
+   It is what makes every read number in this plan priceable; P1's preview port waits for it.
 1. **D1 / D2** — the remaining durability contracts. Nothing downstream is quotable until an
    acknowledged commit means something definite.
 2. ~~**H1b**~~ — **DONE 2026-09-24**: retention is not the constraint (see the H1b item).
@@ -1056,7 +1058,9 @@ zipf point reads and on contiguous range scans.  Page caching winning per byte o
 - [ ] copy-on-access and eviction for full pages
 - [ ] report raw and scrambled zipf separately
 
-### H2 — the point-read CPU path (M2's residual gap) — **profiled 2026-10-01; 3 accidents fixed, 1 correctness bug**
+### P1 — the point-read CPU path (M2's residual gap) — **profiled 2026-10-01; 3 accidents fixed, 1 correctness bug**
+*Named "H2" in commits `86229da` and `5a04bdb` and in two §9 entries of 2026-10-01; renamed P1
+the same day because H2 is already the paper-shape warmup milestone below.*
 *From: M2's finding 2.*  perf on zipf-raw point reads, 32 MiB ring + 4 MiB pcache vs stock at
 36 MiB pcache (frame-pointer builds of the campaign amalgamation; 100 s warmup, 40 s sampled
 under the campaign cgroup).  BF spent 17-22% of samples in libc (stock 5%).  What the data named:
@@ -1106,6 +1110,42 @@ under the campaign cgroup).  BF spent 17-22% of samples in libc (stock 5%).  Wha
       (`mov (%rsi),%rdx`), a cache miss per search step; 8% more is the preview byte.  That is
       the cost the preview exists to avoid, so the preview-prefix port above is next, now on
       evidence.
+
+### H7 — direct-I/O measurement VFS — **NEXT (owner, 2026-10-01): first thing after the gate**
+*Why now.*  Every read result so far shows BF avoiding bytes (17-29% fewer block reads) and
+converting almost none of it into throughput, because under buffered I/O an avoided miss is
+usually an OS page-cache hit (§2.4, §7.1).  P1's profile confirms it from the other side: at
+contiguous zipf the extra page-cache misses BF does take are `pread`s served from the OS cache,
+syscall cost only.  `../bf-tree` measures with direct I/O precisely so a miss costs a device
+read.  Until we can do the same, "BF saves I/O" cannot be priced.
+
+This does **not** reverse §7.1: SQLite core and its unix VFS stay untouched, and stock remains
+the comparison.  The VFS is harness-side, both SUTs use it, and it is reported as a second
+I/O mode beside buffered, never instead of it.
+
+- [ ] `bfbench --direct-io`: register a shim VFS over `unix` (`sqlite3_vfs_register`, not
+      default for anything else) that opens **the main database only** with `O_DIRECT`.  Bounce
+      buffers aligned to the logical block size for every read/write, since pcache buffers are
+      not 4 KiB-aligned and the 100-byte header read is neither aligned nor block-sized.  WAL,
+      shm and journals stay buffered (unaligned WAL frame offsets; the read campaigns write
+      nothing).  `mmap_size=0` asserted.
+- [ ] verify the filesystem honours it: the work dir is btrfs (zstd mount, `nodatacow` on the
+      dir) over LUKS -- btrfs falls back to buffered I/O for compressed extents.  Proof per run,
+      not assumed: `/proc/self/io` `read_bytes` ≈ pcache misses x page size, and the data file's
+      resident page-cache pages (`fincore`/`mincore`) do not grow during the measured window.
+      If btrfs will not cooperate, use a dedicated ext4/xfs loop image or partition and record
+      it in the manifest.
+- [ ] correctness: the shim must be invisible.  `bfbench verify`-style full read (count +
+      checksum of every row) identical across buffered/direct for stock and bf, plus the
+      integrity check; a short read/write mixed run under direct I/O for both SUTs.
+- [ ] `runner.py` key `direct_io` (default false) forwarded to every SUT; manifest records the
+      mode, fs type and alignment; `report.py` labels direct-I/O cells.
+- [ ] `configs/dio_smoke.json` (tripwire, not quotable), then `configs/dio.json`: the m2_split
+      arms (scrambled + contiguous point reads, scans) at the 32 MiB ring split and the
+      default, buffered vs direct inside ONE campaign, shuffled.  The cgroup cap stays, but
+      under direct I/O it no longer decides the result.
+- [ ] read the outcome against §6's three outcomes: a win that appears only under direct I/O
+      is outcome 2 quantified -- the thesis's central measurement claim.
 
 ### D4 — the 64 B write-amplification question, still open
 *From: perf plan Stage 4.*  `pg frames/commit` regressed 1.00 → 3.74 at 64 B payloads (write
@@ -1468,6 +1508,8 @@ bundle.
   cache-retention experiments failed to pay for themselves: under buffered I/O an avoided
   miss is usually an OS page-cache hit.  Keep it as a sensitivity experiment, not a
   prerequisite.
+  **2026-10-01: that sensitivity experiment is now item H7** -- a harness-side `O_DIRECT`
+  VFS shim used by both SUTs, which leaves SQLite core and the comparison unchanged.
 * **CPR snapshots** (`src/snapshot.rs`).  SQLite has its own durability model; the
   record-granular physiological WAL is the deliberate replacement.
 * **Write concurrency.**  `BtShared` serialization stays.  Read concurrency is in scope (S1).
@@ -2146,3 +2188,13 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   dropping it; owner: "keep it and commit".
 - Re-profile: the remaining gap is the key-byte cache miss in `bfBinarySearch` -- the preview
   port (fence prefix) is the evidence-backed next step.
+
+
+### 2026-10-01 (cont.) — Claude Opus 5.5 — probe memo committed; H7 direct-I/O VFS queued next
+
+- Owner kept the probe memo: committed `5a04bdb` after the full gate (50/50, difftest 1581/1581).
+- Correction (rule 11, append): the two entries above call the point-read item "H2"; that ID
+  was already the paper-shape warmup milestone.  The item is now **P1**.
+- Owner: set up a direct-I/O test through a VFS so the gains from avoided disk reads can be
+  measured reliably, after the test suite.  Added as **H7**, ranked first in §5's order.
+  Pending behind it: P1's preview port, the `d3_ckpt` rerun.
