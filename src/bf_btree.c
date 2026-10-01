@@ -99,8 +99,22 @@ static BfCache *btreeGetBfCache(BtShared *pBt){
 ** all BF record operations so lookups and writes are consistent).
 */
 static void bfEncodeRowid(i64 rowid, u8 *pBuf){
+  /* Sign bit flipped (2026-10-01), so that byte order -- the order of every
+  ** mini-page and of the merge scans that walk one -- is numeric order.  Plain
+  ** two's complement sorted -1 after +5: a buffered negative rowid came back
+  ** last from ORDER BY id, was missed by WHERE id<0, and a merge scan built
+  ** from it returned rows out of order.  The bytes are logged verbatim, so
+  ** this changed the WAL payload to v4 (bf_wal.h). */
+  u64 u = (u64)rowid ^ ((u64)1<<63);
   int i;
-  for(i=7; i>=0; i--){ pBuf[i]=(u8)(rowid&0xff); rowid>>=8; }
+  for(i=7; i>=0; i--){ pBuf[i]=(u8)(u&0xff); u>>=8; }
+}
+void sqlite3BfEncodeRowid(i64 rowid, u8 *pBuf){ bfEncodeRowid(rowid, pBuf); }
+static i64 bfDecodeRowid(const u8 *pKey){
+  u64 u = 0;
+  int i;
+  for(i=0; i<8; i++) u = (u<<8) | pKey[i];
+  return (i64)(u ^ ((u64)1<<63));
 }
 
 /*
@@ -178,12 +192,12 @@ static int bfApplyOneRecord(void *pCtx, const u8 *pKey, int nKey,
   if( opType==BFOP_INSERT ){
     BtreePayload payload;
     i64 rowid = 0;
-    int ki;
+
 #ifdef SQLITE_BF_RECOVERY_TRACE
     int probeLoc = 0;
     Pgno probeLeaf = 0;
 #endif
-    for(ki=0; ki<8; ki++) rowid = (rowid<<8) | pKey[ki];
+    rowid = bfDecodeRowid(pKey);
 
 #ifdef SQLITE_BF_RECOVERY_TRACE
     rc = sqlite3BtreeTableMoveto(pCur, rowid, 0, &probeLoc);
@@ -211,8 +225,8 @@ static int bfApplyOneRecord(void *pCtx, const u8 *pKey, int nKey,
     }
   }else if( opType==BFOP_DELETE ){
     i64 rowid = 0;
-    int ki, loc = 0;
-    for(ki=0; ki<8; ki++) rowid = (rowid<<8) | pKey[ki];
+    int loc = 0;
+    rowid = bfDecodeRowid(pKey);
 
     rc = sqlite3BtreeTableMoveto(pCur, rowid, 0, &loc);
     if( rc==SQLITE_OK && loc==0 ){
@@ -1263,7 +1277,7 @@ static void bfNoteMaxRowid(BfCache *pBf, u32 root, const void *pKey){
   i64 rowid = 0;
   int i;
   if( root<=1 || pBf->bMaxRowidUnknown ) return;
-  for(i=0; i<8; i++){ rowid = (rowid<<8) | p[i]; }
+  rowid = bfDecodeRowid(p);
   for(i=0; i<pBf->nMaxRowid; i++){
     if( pBf->aMaxRoot[i]==root ){
       if( rowid > pBf->aMaxRowid[i] ) pBf->aMaxRowid[i] = rowid;
@@ -1952,7 +1966,7 @@ int sqlite3BfBtreeMergeNextInsert(
   n = sqlite3BfMiniPageCount(pMini);
   for(ix=*pIx; ix<n; ix++){
     const u8 *pKey, *pVal;
-    int nKey, nVal, k;
+    int nKey, nVal;
     i64 r = 0;
     u8 op;
     if( !sqlite3BfMiniPageAt(pMini, ix, &pKey, &nKey, &pVal, &nVal, &op) ){
@@ -1960,7 +1974,7 @@ int sqlite3BfBtreeMergeNextInsert(
     }
     if( op!=BFOP_INSERT ) continue;       /* skip clean cache/phantom records */
     if( nKey!=8 || nVal>nCap ) return -1; /* unexpected ⇒ bail */
-    for(k=0; k<8; k++){ r = (r<<8) | pKey[k]; }
+    r = bfDecodeRowid(pKey);
     *pRowid = r;
     if( nVal>0 ) memcpy(pBuf, pVal, nVal);
     *pnVal = nVal;
@@ -2011,7 +2025,7 @@ int sqlite3BfBtreeMergePrevInsert(
   if( ix>n-1 ) ix = n-1;                /* clamp the "start at the end" entry */
   for(; ix>=0; ix--){
     const u8 *pKey, *pVal;
-    int nKey, nVal, k;
+    int nKey, nVal;
     i64 r = 0;
     u8 op;
     if( !sqlite3BfMiniPageAt(pMini, ix, &pKey, &nKey, &pVal, &nVal, &op) ){
@@ -2019,7 +2033,7 @@ int sqlite3BfBtreeMergePrevInsert(
     }
     if( op!=BFOP_INSERT ) continue;       /* skip clean cache/phantom records */
     if( nKey!=8 || nVal>nCap ) return -1; /* unexpected ⇒ bail */
-    for(k=0; k<8; k++){ r = (r<<8) | pKey[k]; }
+    r = bfDecodeRowid(pKey);
     *pRowid = r;
     if( nVal>0 ) memcpy(pBuf, pVal, nVal);
     *pnVal = nVal;
@@ -2165,6 +2179,41 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
   return 1;
 }
 
+
+/*
+** Per-cursor scratch (the buffer a BF-served row's payload is copied into).
+** A point-read statement opens and closes its cursor on every execution, so
+** a scratch allocated per cursor was one 4 KiB malloc+free per read (2% of
+** point-read cycles, 2026-09-30 profile).  The cache keeps one spare across
+** cursor lifetimes.  Get returns SQLITE_OK with pCur->pBfScratch holding
+** BF_MAX_MINI_PAGE bytes, or SQLITE_NOMEM; Put releases the cursor's buffer.
+*/
+int sqlite3BfBtreeScratchGet(BtCursor *pCur){
+  BfCache *pBf;
+  char *p;
+  if( pCur->nBfScratch>=(int)BF_MAX_MINI_PAGE ) return SQLITE_OK;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( pBf && pBf->pSpareScratch && pCur->pBfScratch==0 ){
+    pCur->pBfScratch = pBf->pSpareScratch;
+    pBf->pSpareScratch = 0;
+  }else{
+    p = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
+    if( p==0 ) return SQLITE_NOMEM_BKPT;
+    pCur->pBfScratch = p;
+  }
+  pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
+  return SQLITE_OK;
+}
+void sqlite3BfBtreeScratchPut(BtCursor *pCur){
+  BfCache *pBf = pCur->pBfScratch ? btreeGetBfCache(pCur->pBt) : 0;
+  if( pBf && pBf->pSpareScratch==0 && pCur->nBfScratch==(int)BF_MAX_MINI_PAGE ){
+    pBf->pSpareScratch = pCur->pBfScratch;
+  }else{
+    sqlite3_free(pCur->pBfScratch);
+  }
+  pCur->pBfScratch = 0;
+  pCur->nBfScratch = 0;
+}
 
 /*
 ** Descent shortcut fast read: copy the clean cached record for the BF-served

@@ -45,7 +45,8 @@
 /* Batch-payload header: magic(4) version(2) nRec(2) nUsed(4) = 12 bytes.  op
 ** values reuse the mini-page BFOP_* space; only the dirty ops are ever logged. */
 #define BFWAL_MAGIC     0x42465731u   /* "BFW1" */
-#define BFWAL_VERSION   3             /* v3: BFWAL_OP_CLEAR (2026-09-24) */
+#define BFWAL_VERSION   4             /* v3: BFWAL_OP_CLEAR (2026-09-24); v4: rowid
+                                      ** keys sign-flipped (2026-10-01, bfEncodeRowid) */
 #define BFWAL_HDRSIZE   12
 #define BFWAL_OP_INSERT 0             /* == BFOP_INSERT */
 #define BFWAL_OP_DELETE 1             /* == BFOP_DELETE (valLen==0) */

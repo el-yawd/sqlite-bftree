@@ -5048,7 +5048,7 @@ int sqlite3BtreeCloseCursor(BtCursor *pCur){
     sqlite3_free(pCur->aOverflow);
     sqlite3_free(pCur->pKey);
 #ifndef SQLITE_OMIT_BF_CACHE
-    sqlite3_free(pCur->pBfScratch);
+    sqlite3BfBtreeScratchPut(pCur);
 #endif
     if( (pBt->openFlags & BTREE_SINGLE) && pBt->pCursor==0 ){
       /* Since the BtShared is not sharable, there is no need to
@@ -6211,13 +6211,7 @@ static int bfMergePickPrev(BtCursor *pCur){
 ** is allocated.  Returns SQLITE_OK or SQLITE_NOMEM.
 */
 static int bfMergeEnsureScratch(BtCursor *pCur){
-  if( pCur->nBfScratch < (int)BF_MAX_MINI_PAGE ){
-    char *p = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
-    if( p==0 ) return SQLITE_NOMEM_BKPT;
-    pCur->pBfScratch = p;
-    pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
-  }
-  return SQLITE_OK;
+  return sqlite3BfBtreeScratchGet(pCur);
 }
 #endif /* SQLITE_BF_INSERT_BUFFERING */
 
@@ -6457,12 +6451,7 @@ bf_last_no_flush:
 */
 static int btreeBfParkOnMini(BtCursor *pCur, i64 intKey){
   int nServe;
-  if( pCur->nBfScratch<(int)BF_MAX_MINI_PAGE ){
-    char *pNew = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
-    if( pNew==0 ) return SQLITE_NOMEM_BKPT;
-    pCur->pBfScratch = pNew;
-    pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
-  }
+  if( sqlite3BfBtreeScratchGet(pCur) ) return SQLITE_NOMEM_BKPT;
   pCur->info.nKey = intKey;
   nServe = sqlite3BfBtreeReadCachedRecord(pCur, pCur->pBfScratch,
                                           pCur->nBfScratch);
@@ -6545,12 +6534,7 @@ static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey){
 
   /* One scratch buffer per cursor, sized once to the max record class and
   ** reused across serves (BF records never exceed BF_MAX_MINI_PAGE). */
-  if( pCur->nBfScratch<(int)BF_MAX_MINI_PAGE ){
-    char *pNew = sqlite3_realloc(pCur->pBfScratch, (int)BF_MAX_MINI_PAGE);
-    if( pNew==0 ) return SQLITE_NOTFOUND;
-    pCur->pBfScratch = pNew;
-    pCur->nBfScratch = (int)BF_MAX_MINI_PAGE;
-  }
+  if( sqlite3BfBtreeScratchGet(pCur) ) return SQLITE_NOTFOUND;
 
   /* Single mini-page lookup + search, copying straight into the scratch.  The
   ** cursor is not touched until this succeeds, so a miss leaves no flags to
@@ -11000,9 +10984,8 @@ int sqlite3BtreeInsert(
    && btreeGetBfCache(pCur->pBt)!=0
   ){
     u8 keyBuf[8];
-    i64 rid = pX->nKey;
-    int ki, bfrc;
-    for(ki=7; ki>=0; ki--){ keyBuf[ki]=(u8)(rid&0xff); rid>>=8; }
+    int bfrc;
+    sqlite3BfEncodeRowid(pX->nKey, keyBuf);
     bfrc = sqlite3BfBtreeInsertCell(pCur, keyBuf, 8, pX->pData, pX->nData);
     if( bfrc==SQLITE_OK ){
       /* Buffered — no base cell.  Invalidate the cursor; a later read re-seeks

@@ -15,6 +15,13 @@ shape the insert hook buffers).  Inserts deliberately use rowids that fall
 *between* existing rows (random within the active id range) so a full scan must
 interleave them — the merge's whole job.
 
+Negative rowids (2026-10-01): a third of the seeds shift every key down by
+KOFF so the table straddles zero.  BF stored rowid keys as plain big-endian
+two's complement, which sorts -1 AFTER +5; a buffered negative row came back
+last from ORDER BY id and was missed by WHERE id<0, and no generator ever
+produced one.  KOFF and the sign-boundary queries draw from their own RNG, so
+seeds with KOFF==0 emit exactly the script they always did.
+
 Usage: gen_merge_stress.py <seed> [n_txns]
 """
 import sys
@@ -27,8 +34,13 @@ def main():
     seed = int(sys.argv[1])
     n_txns = int(sys.argv[2]) if len(sys.argv) > 2 else 400
     rng = random.Random(seed)
+    rng2 = random.Random(seed * 7919 + 17)
+    koff = -rng2.randint(5, 600) if rng2.random() < 0.34 else 0
     out = []
     w = out.append
+
+    def K(i):                       # model id -> SQL rowid
+        return i + koff
 
     w("PRAGMA page_size=4096;")
     w("PRAGMA synchronous=OFF;")
@@ -46,7 +58,7 @@ def main():
     for _ in range(rng.randint(5, 40)):
         i = id_hi; id_hi += 1
         v = rand_text(); live[i] = v
-        w("INSERT INTO t VALUES(%d,'%s');" % (i, v))
+        w("INSERT INTO t VALUES(%d,'%s');" % (K(i), v))
     w("COMMIT;")
 
     for _ in range(n_txns):
@@ -64,7 +76,7 @@ def main():
                     i += 1
                 id_hi = max(id_hi, i + 1)
             v = rand_text(); live[i] = v
-            w("INSERT INTO t VALUES(%d,'%s');" % (i, v))
+            w("INSERT INTO t VALUES(%d,'%s');" % (K(i), v))
 
         # Full-table forward scans WHILE inserts are buffered (drives merge).
         choice = rng.random()
@@ -75,6 +87,13 @@ def main():
         else:
             # Aggregate that still forces a full ordered walk.
             w("SELECT 'SUMID', sum(id), min(id), max(id) FROM t;")
+        if koff:
+            # Sign-boundary seeks and scans, both directions, while buffered.
+            b = rng2.randint(-3, 3)
+            w("SELECT group_concat(id) FROM t WHERE id<%d;" % b)
+            w("SELECT id FROM t WHERE id>=%d ORDER BY id LIMIT 8;" % b)
+            w("SELECT id FROM t WHERE id<=%d ORDER BY id DESC LIMIT 8;" % b)
+            w("SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY id DESC);")
 
         # Occasionally update/delete (these flush the buffer mid-txn, exercising
         # the merge->plain transition), then scan again.
@@ -82,10 +101,10 @@ def main():
             tid = rng.choice(tuple(live.keys()))
             if rng.random() < 0.5:
                 v = rand_text(); live[tid] = v
-                w("UPDATE t SET v='%s' WHERE id=%d;" % (v, tid))
+                w("UPDATE t SET v='%s' WHERE id=%d;" % (v, K(tid)))
             else:
                 del live[tid]
-                w("DELETE FROM t WHERE id=%d;" % tid)
+                w("DELETE FROM t WHERE id=%d;" % K(tid))
             w("SELECT id,v FROM t ORDER BY id;")   # post-mutation full scan
 
         # Savepoint with a scan inside, then release (side-effect free span).
@@ -93,7 +112,7 @@ def main():
             w("SAVEPOINT sp;")
             i = id_hi; id_hi += 1
             v = rand_text()
-            w("INSERT INTO t VALUES(%d,'%s');" % (i, v))
+            w("INSERT INTO t VALUES(%d,'%s');" % (K(i), v))
             w("SELECT count(*) FROM t;")           # scan with sp-buffered insert
             w("ROLLBACK TO sp;")
             w("RELEASE sp;")

@@ -429,9 +429,12 @@ static sqlite3_pcache_page *bfCacheFetch(
     if( pRecycle != &pCache->lru ){
       /* Remove from LRU and hash */
       bfCacheRemoveFromHash(pCache, pRecycle, 0);
-      /* Reuse the page structure */
+      /* Reuse the page structure.  The buffer is NOT zeroed: the pcache
+      ** contract leaves a fetched page's content undefined (the pager reads
+      ** it, or zeroes it itself past end-of-file), and pcache1 does not zero
+      ** either.  This memset cost 4 KiB of stores per page-cache miss -- 7%
+      ** of point-read cycles on this box's E-cores (2026-09-30 profile). */
       pPage = pRecycle;
-      memset(pPage->page.pBuf, 0, pCache->base.szPage);
     }else{
       pPage = 0;
     }
@@ -667,6 +670,8 @@ static void bfCacheDestroy(sqlite3_pcache *p){
   pCache->base.aFlushed = 0;
   sqlite3_free(pCache->base.aLeafBit);
   pCache->base.aLeafBit = 0;
+  sqlite3_free(pCache->base.pSpareScratch);
+  pCache->base.pSpareScratch = 0;
   pCache->base.nLeafBit = 0;
   pCache->base.nFlushed = 0;
   pCache->base.nFlushedAlloc = 0;

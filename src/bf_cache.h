@@ -587,6 +587,8 @@ struct BfCache {
   ** is only ever a claim about the CURRENT snapshot. */
   u8 *aLeafBit;
   u32 nLeafBit;             /* bytes in aLeafBit */
+  char *pSpareScratch;      /* one BF_MAX_MINI_PAGE cursor scratch kept across
+                            ** cursor close/open (sqlite3BfBtreeScratchGet) */
   u64 nBlindInserts;        /* upserts buffered without reading the leaf */
   u64 nBlindNoLeaf;         /* armed, but the child was not a known leaf */
   u64 nBlindRefused;        /* reached a known leaf, but the mini-page refused */
@@ -799,6 +801,9 @@ SQLITE_PRIVATE int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg,
 /* Length of the clean cached record for the BF-served cursor's leaf key, or -1. */
 /* Copy the clean cached record into pBuf (cap nCap) in one read; len or -1. */
 SQLITE_PRIVATE int sqlite3BfBtreeReadCachedRecord(BtCursor *pCur, void *pBuf, int nCap);
+SQLITE_PRIVATE void sqlite3BfEncodeRowid(i64 rowid, u8 *pBuf);
+SQLITE_PRIVATE int sqlite3BfBtreeScratchGet(BtCursor *pCur);
+SQLITE_PRIVATE void sqlite3BfBtreeScratchPut(BtCursor *pCur);
 /* Re-descend a BF-served (BTCF_BfLeaf) cursor onto its real leaf page. */
 SQLITE_PRIVATE int sqlite3BfBtreeMaterializeLeaf(BtCursor *pCur);
 /* Adjust the descent-shortcut suppression counter (+1 suppress, -1 release). */

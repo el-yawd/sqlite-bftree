@@ -1056,6 +1056,44 @@ zipf point reads and on contiguous range scans.  Page caching winning per byte o
 - [ ] copy-on-access and eviction for full pages
 - [ ] report raw and scrambled zipf separately
 
+### H2 — the point-read CPU path (M2's residual gap) — **profiled 2026-10-01; 3 accidents fixed, 1 correctness bug**
+*From: M2's finding 2.*  perf on zipf-raw point reads, 32 MiB ring + 4 MiB pcache vs stock at
+36 MiB pcache (frame-pointer builds of the campaign amalgamation; 100 s warmup, 40 s sampled
+under the campaign cgroup).  BF spent 17-22% of samples in libc (stock 5%).  What the data named:
+
+| frame | share of BF samples | verdict |
+|---|---|---|
+| `memset` of the whole 4 KiB recycled page in `bfCacheFetch` | 7% E-cores, 0.9% P-cores | **accident**: pcache content is undefined on fetch; pcache1 never zeroes.  Removed. |
+| libc `memcmp` per binary-search step (`bfKeyCompare`) | 4% | **accident** for 8-byte rowid keys.  Inline big-endian u64 compare. |
+| 4 KiB cursor scratch `realloc`+`free` per statement | 2% | **accident**: one spare kept in `BfCache`.  `sqlite3BfBtreeScratchGet/Put`. |
+| `btreeBfServeFromCache` (map lookup + mini-page search at the leaf edge) | ~19% incl. | the shortcut's probe; paid on every seek, hit or miss |
+| leaf-exit `KeyTombstoned` + `fetchPayload` `RecordExists` + promotion | ~7% incl. | re-probes the mini-page the shortcut just missed in |
+| +27% pcache misses (0.48 vs 0.375 per op) -> more `pread`s from the OS cache | sys time | the split: 4 MiB pcache; block-layer bytes are equal |
+
+- [x] the three accidents; quick + full gate green
+- [x] A/B, within one session, ABBA order, 40 s after 100 s warmup, campaign cgroup (**smoke
+      grade, not quotable**): stock 47.4k ops/s (2 runs), pre-fix 41.8k (3 runs, 0.88x), fixed
+      43.8k (3 runs, 0.925x).  Every fixed run beat every pre-fix run.  The letter campaign
+      must re-measure it.
+- [x] **Correctness bug found reading the compare code: rowid keys sorted negatives AFTER
+      positives.**  `bfEncodeRowid` wrote plain big-endian two's complement, and a second
+      encoder in `sqlite3BtreeInsert` did the same.  With buffered rows a table returned
+      `ORDER BY id` as `-10,1,2,3,5,-4,-1`, `WHERE id<0` missed buffered negatives, and an
+      auto-rowid after a buffered max returned the wrong `max(id)`.  Fixed by flipping the
+      sign bit in the one encoder (`sqlite3BfEncodeRowid`) and one decoder (`bfDecodeRowid`,
+      replacing five inline loops).  The bytes are logged verbatim: **WAL payload v4**.
+      `gen_merge_stress.py` now straddles zero in ~1/3 of seeds (its own RNG, so old seeds
+      emit the same script); the unfixed HEAD fails 36/216 of its runs, the fix passes.
+- [ ] parity gap, not fixed: the reference's 2-byte `preview` is taken AFTER the leaf's common
+      key prefix (`leaf_node.rs:96`, prefix from the fences).  Ours takes the first two bytes
+      of an 8-byte big-endian rowid -- constant for every row in a leaf, so the preview never
+      decides a comparison and every search step dereferences the key bytes.  Needs a
+      per-mini-page prefix (fences) to port faithfully.
+- [ ] redundant probes: after a shortcut miss at leaf L for key K, the same seek re-probes L for
+      K up to three times (tombstone, dirty-op, record-exists).  A per-cursor "missed (L,K)"
+      note would skip them; `KeyTombstoned` also lacks `KeyDirtyOp`'s `bDirtyInserts` early-out.
+- [ ] re-profile after these; then decide whether what remains is structural (the probe cost)
+
 ### D4 — the 64 B write-amplification question, still open
 *From: perf plan Stage 4.*  `pg frames/commit` regressed 1.00 → 3.74 at 64 B payloads (write
 volume 182 → 924 MiB) when the derived size classes landed.  Two candidate causes were never
@@ -2074,3 +2112,15 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Proposed next, pending the owner: (a) profile the BF point-read path on zipf-raw at a 32 MiB
   ring (perf, per CLAUDE.md's loop) to find the CPU overhead; (b) make the harness default split
   ring-heavy (pcache sized to interior pages), since it dominates the current default.
+
+### 2026-10-01 — Claude Opus 5.5 — H2: point-read path profiled; three accidents, one sort-order bug
+
+- Owner: "go for it" on the M2 follow-up (profile first).  New item H2 holds the profile table.
+- Fixed: recycled-page `memset` in `bfCacheFetch`, libc `memcmp` per 8-byte key compare,
+  per-statement scratch malloc.  Smoke A/B (not quotable): 0.88x -> 0.925x of stock on
+  zipf-raw point reads.
+- Found and fixed: negative rowids sorted after positive ones inside every mini-page (wrong
+  ORDER BY / range results with buffered negatives).  Sign-flipped encoding, WAL payload v4,
+  merge generator extended and mutation-checked (HEAD 180/216, fix 216/216).
+- Gate: quick 12/12, full 50/50 (difftest 1581/1581).  All SUTs rebuilt from this tree.
+- Still pending: rerun `d3_ckpt`; the H2 open boxes (preview prefix, redundant probes).
