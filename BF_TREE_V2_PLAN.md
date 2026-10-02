@@ -1111,7 +1111,7 @@ under the campaign cgroup).  BF spent 17-22% of samples in libc (stock 5%).  Wha
       the cost the preview exists to avoid, so the preview-prefix port above is next, now on
       evidence.
 
-### H7 — direct-I/O measurement VFS — **NEXT (owner, 2026-10-01): first thing after the gate**
+### H7 — direct-I/O measurement VFS — **DONE 2026-10-01: built, campaign run (`results/dio`)**
 *Why now.*  Every read result so far shows BF avoiding bytes (17-29% fewer block reads) and
 converting almost none of it into throughput, because under buffered I/O an avoided miss is
 usually an OS page-cache hit (§2.4, §7.1).  P1's profile confirms it from the other side: at
@@ -1161,6 +1161,41 @@ I/O mode beside buffered, never instead of it.
       on contiguous zipf, BF at 32+4 read MORE block bytes than stock (2441 vs 1534 B/op) --
       the 4 MiB pcache cannot hold hot leaves stock's 36 MiB does; on scrambled zipf it read
       13% less.
+- [x] **`results/dio` (2026-10-01, 48/48 runs, 108 min, shuffled, clean `ea90ee3`; every direct
+      run proven -- db resident pages 4 -> 4 in all 24; buffered runs held ~73.8k of the db's
+      111k pages in the OS cache).**  Medians of 2, bf/stock ops/s, block bytes/op stock/bf:
+
+      | arm | mode | stock ops/s | ring 4M (+32 pc) | ring 16M (+20) | ring 32M (+4) |
+      |---|---|---|---|---|---|
+      | point, scrambled zipf | buffered | 33.6k | 0.88x, 0.96x B | 0.98x, 1.04x B | 1.12x, 1.21x B |
+      | point, scrambled zipf | **direct** | 14.1k | **1.09x, 1.12x B** | **1.26x, 1.32x B** | **1.49x, 1.45x B** |
+      | point, contiguous zipf | buffered | 67.8k | 0.91x, 0.98x B | 0.95x, 0.99x B | 0.90x, 1.01x B |
+      | point, contiguous zipf | **direct** | 23.5k | 1.02x, 0.96x B | 0.82x, 0.89x B | **0.79x, 0.78x B** |
+      | 32-row scan, contiguous | buffered | 17.9k | 0.84x | 0.85x | 0.82x |
+      | 32-row scan, contiguous | **direct** | 9.2k | 0.85x, 0.96x B | 0.79x, 0.84x B | **0.60x, 0.57x B** |
+
+      Seek hit / cached_records / evictions (direct, measured phase): 36.4% / 21k / 179k at 4M,
+      48.6% / 82k / 129k at 16M, 56.5% / 159k / 92k at 32M (scrambled; buffered within 0.1 pt).
+      Spreads: most cells <=15%; the bf 32M scrambled direct cell is 1.3%, its stock 14.9%.
+      Powersave governor throughout.
+
+      **What it says.**
+      1. **The point-read win is real once a miss is a device read.**  Scrambled zipf: 1.49x
+         at a 32 MiB ring, against 1.12x buffered from the same bytes saved.  This is the
+         first within-campaign measurement where BF's avoided I/O converts into throughput at
+         the paper's order of magnitude -- outcome 2 of §6, quantified.
+      2. **Clustered access reverses the split.**  Contiguous zipf under direct I/O: every MiB
+         moved from pcache to ring costs MORE disk reads (0.96x -> 0.78x B/op) and throughput
+         (1.02x -> 0.79x).  A 4 KiB page holds ~36 hot rows; the ring spends ~178 B per
+         record.  Pages win per byte when hot keys share leaves.  **This reopens M2**: its
+         "non-transfer" verdict was measured under buffered I/O, where the page arm was
+         nearly free.  With real misses the reference's answer -- one pool that holds full
+         pages for hot leaves and records for scattered keys -- has a measured case.
+      3. **Scans pay twice.**  The ring never serves a scan, yet scans promote: evictions 182k-
+         442k with 0% seek hits, while the pcache shrinks.  At 32+4, 0.60x and 1.77x the disk
+         bytes of stock.  M3 (separate, lower scan promotion rate, as the reference has) is
+         now a measured problem, not a parity checkbox.
+      4. No single fixed split wins: 32+4 for scattered keys, page-heavy for clustered/scans.
 - [ ] read the outcome against §6's three outcomes: a win that appears only under direct I/O
       is outcome 2 quantified -- the thesis's central measurement claim.
 
@@ -2215,3 +2250,13 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Owner: set up a direct-I/O test through a VFS so the gains from avoided disk reads can be
   measured reliably, after the test suite.  Added as **H7**, ranked first in §5's order.
   Pending behind it: P1's preview port, the `d3_ckpt` rerun.
+
+### 2026-10-01 (cont.) — Claude Opus 5.5 — H7 built and measured: the read win appears under direct I/O
+
+- `ea90ee3`: bfdio O_DIRECT shim in bfbench, per-run mincore proof, `dio_smoke` + `dio` configs.
+- `results/dio` 48/48, all direct runs proven: scrambled point reads **1.49x** stock at a 32 MiB
+  ring under direct I/O (1.12x buffered); contiguous point reads and scans get WORSE as the
+  ring grows (0.79x / 0.60x at 32+4) because pages beat records per byte when hot keys cluster.
+- Consequences (owner to rank): reopen **M2** (unified page+record pool) on this evidence;
+  **M3** (scan promotion) is now a measured cost; P1's preview port is CPU-side and matters
+  less where misses dominate.  Still pending: `d3_ckpt` rerun.
