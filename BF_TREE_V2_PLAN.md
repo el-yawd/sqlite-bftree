@@ -2321,4 +2321,4 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   whole buf oracle ran under ASan+UBSan, all 4 variants: clean after these fixes.
 - S1 note added: two connections writing one file diverge from stock with or without M2.
 - `gate.py --full` GREEN 51/51 (difftest 1797/1797); quick gate re-run after the repro's path
-  fix GREEN 13/13.  UNCOMMITTED.  Next: commit; then the M2 campaign (M2 item checkbox).
+  fix GREEN 13/13.  Committed `2698253`.  Next: the M2 campaign (M2 item checkbox).
