@@ -3024,6 +3024,18 @@ static int readDbPage(PgHdr *pPg){
   Pager *pPager = pPg->pPager; /* Pager object associated with page pPg */
   int rc = SQLITE_OK;          /* Return code */
 
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_FULL_PAGE)
+  /* M2: a BF full page is an exact copy of this leaf as this pager would read
+  ** it (dropped on any write, move, free or reset -- bf_cache.c), so the read
+  ** is a memcpy from the record ring instead of a WAL or database read. */
+  if( pPager->pBfCache && pPg->pgno>1
+   && sqlite3BfFullPageRead((BfCache*)pPager->pBfCache, pPg->pgno,
+                            pPg->pData, (int)pPager->pageSize) ){
+    PAGER_INCR(pPager->nRead);
+    return SQLITE_OK;
+  }
+#endif
+
 #ifndef SQLITE_OMIT_WAL
   u32 iFrame = 0;              /* Frame of WAL containing pgno */
 
@@ -3832,6 +3844,18 @@ int sqlite3PagerSetPagesize(Pager *pPager, u32 *pPageSize, int nReserve){
       pager_reset(pPager);
       rc = sqlite3PcacheSetPageSize(pPager->pPCache, pageSize);
     }
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* A shared pBfCache IS the pcache2 instance, which SetPageSize just
+    ** destroyed and replaced: re-bind, or every BF hook uses freed memory.
+    ** (VACUUM of a non-default page size: attach, then BtreeSetPageSize.)
+    ** The page size only changes on an empty database, so the old instance
+    ** held nothing; per-cache PRAGMA knobs set before this are reset. */
+    if( rc==SQLITE_OK && pPager->bBfCacheShared ){
+      pPager->pBfCache = 0;
+      pPager->bBfCacheShared = 0;
+      sqlite3PagerOpenBfCache(pPager);
+    }
+#endif
     if( rc==SQLITE_OK ){
       sqlite3PageFree(pPager->pTmpSpace);
       pPager->pTmpSpace = pNew;
@@ -6308,6 +6332,12 @@ static int pager_write(PgHdr *pPg){
   );
   assert( assert_pager_state(pPager) );
   assert( pPager->errCode==0 );
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_FULL_PAGE)
+  /* M2: the page is about to differ from any full-page copy of it. */
+  if( pPager->pBfCache ){
+    sqlite3BfFullPageDrop((BfCache*)pPager->pBfCache, pPg->pgno);
+  }
+#endif
   assert( pPager->readOnly==0 );
   CHECK_PAGE(pPg);
 
@@ -7461,6 +7491,16 @@ int sqlite3PagerMovepage(Pager *pPager, DbPage *pPg, Pgno pgno, int isCommit){
     rc = sqlite3PagerWrite(pPg);
     if( rc ) return rc;
   }
+#if !defined(SQLITE_OMIT_BF_CACHE) && !defined(SQLITE_BF_NO_FULL_PAGE)
+  /* M2: both page numbers change content.  Defensive: the only caller is
+  ** relocatePage (auto-vacuum), and BF never caches an auto-vacuum database
+  ** (btreeUsesBfCache), so no copy can exist here today.  A mutation that
+  ** removes this drop is therefore undetectable by the oracles. */
+  if( pPager->pBfCache ){
+    sqlite3BfFullPageDrop((BfCache*)pPager->pBfCache, pPg->pgno);
+    sqlite3BfFullPageDrop((BfCache*)pPager->pBfCache, pgno);
+  }
+#endif
 
   /* If the page being moved is dirty and has not been saved by the latest
   ** savepoint, then save the current contents of the page into the

@@ -1058,6 +1058,38 @@ zipf point reads and on contiguous range scans.  Page caching winning per byte o
 - [ ] copy-on-access and eviction for full pages
 - [ ] report raw and scrambled zipf separately
 
+**2026-10-03 -- M2 BUILT (reopened by H7's `results/dio`), correctness-gated, NOT measured.**
+The reference's read-side trigger, in the same ring as records, served at the pager:
+- *Trigger* (`mini_page_op.rs:932-956`, reached by read promotion, `tree.rs:1419`): a CLEAN
+  mini-page whose next size class would be >= page size (or no class fits) gets a
+  `BFOP_CACHE`/`PHANTOM` write answered `BF_WANT_FULL`; `sqlite3BfBtreePromoteRecord` then copies
+  the leaf (`pCur->pPage->aData`, refused if the page is WRITEABLE/DIRTY) into one slab
+  (`BfMiniPage` header, flag `BF_MINI_F_FULL`, + page bytes; map `BF_LOC_FULL`).  Scattered keys
+  stay records, clustered leaves become pages -- adaptive by construction, one FIFO /
+  second-chance pool (`bfFullCopyOnAccess`; `evictCallback` unlinks full pages).
+- *Served at the pager:* `readDbPage` asks `sqlite3BfFullPageRead` first (memcpy, no WAL/db read).
+- *Coherence -- every drop point, and how each is tested:*
+
+  | drop | why | caught by |
+  |---|---|---|
+  | `pager_write` (first write of the page) | page about to differ | `gen_fullpage_stress`: mutant fails 29-32/54 per variant |
+  | `bfCacheTruncate` -> `FullPageDropFrom` | shrink, or pager reset after ANOTHER connection wrote | `bench/fullpage_reset_repro.sh` (two pagers, one file): mutant serves 51/301 changed rows |
+  | `ForgetPage` | page freed | redundant in one connection (reuse goes through `pager_write`); kept defensively |
+  | `sqlite3PagerMovepage` (both pgnos) | renumbering | unreachable: only caller is auto-vacuum `relocatePage`, and BF is off on auto-vacuum DBs (`btreeUsesBfCache`) |
+  | `ClearCache`, `RecordWrite` (INSERT/DELETE on a FULL entry) | rollback; buffered mutation needs a mini-page | covered by the suites |
+
+  Full slabs never go on the free list (size is not a class); an unlinked one is an orphan the
+  sweep reclaims.  `nodeSize` is u16, so 64 KiB pages never make full pages.
+- Ablation `SQLITE_BF_NO_FULL_PAGE`; SUT `bf_nofull` (`build_suts.sh --all`).  Counters
+  `full_page_creates / reads / drops / evictions` in `bf_cache_stats`.
+- `bench/gen_fullpage_stress.py` (in difftest `BUF_GENS` and `stress_buf.sh`): hot-leaf
+  promotion under a tiny pcache, then every way a leaf changes -- txn / rollback / savepoint,
+  splits, page reuse via DROP+CREATE, VACUUM, checkpoints -- at 1 KiB and 4 KiB pages.
+- [ ] **Campaign** (the M2 letter gate): dio-style, direct_io true/false; bf vs bf_nofull vs
+      stock; rings 4/16/32 MiB; zipf + zipf-raw point arms and the scan arm; warmup in ops;
+      shuffled.  Question: does it recover H7's clustered-read and scan reversal without
+      costing scrambled reads?
+
 ### P1 — the point-read CPU path (M2's residual gap) — **profiled 2026-10-01; 3 accidents fixed, 1 correctness bug**
 *Named "H2" in commits `86229da` and `5a04bdb` and in two §9 entries of 2026-10-01; renamed P1
 the same day because H2 is already the paper-shape warmup milestone below.*
@@ -1247,6 +1279,11 @@ comparison is the foundation the harness rests on.
       a read-modify-write on `valueLenAndRef` — the same `u16` carrying the value length and
       the WAL-logged flag, so a lost update corrupts a length, not a hint — and
       `sqlite3BfMapLookup` walks a directory that `bfMapEnsureCapacity` reallocs under it
+- **Correctness, measured 2026-10-03:** two connections WRITING one file give wrong answers
+  today, M2 or not.  A second-connection branch added to `gen_fullpage_stress` (ATTACH of the
+  same file, autocommit writes through it) diverged from stock in 15/54 runs with M2 and in
+  more without it (`SQLITE_BF_NO_FULL_PAGE`).  So it is not an M2 defect, and the generator does
+  not carry it; but "single-writer" in §4 means single CONNECTION, and nothing enforces it.
 - [ ] **S1b (harness, independent — can land first):** `bfbench --threads N` with per-thread
       connection, prepared statements, RNG and histograms; zipf table and Feistel permutation
       shared read-only; histograms merged at the end; writers keep serialising via
@@ -2260,3 +2297,28 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Consequences (owner to rank): reopen **M2** (unified page+record pool) on this evidence;
   **M3** (scan promotion) is now a measured cost; P1's preview port is CPU-side and matters
   less where misses dominate.  Still pending: `d3_ckpt` rerun.
+
+### 2026-10-03 — Claude Opus 5.5 — M2 built and gated; two older engine bugs found on the way
+
+- **M2 full pages** (design + drop-point table in the M2 item): `src/bf_cache.{c,h}`,
+  `bf_btree.c`, `pager.c`, `bf_config.c`; switch `SQLITE_BF_NO_FULL_PAGE`, SUT `bf_nofull`.
+  New oracle `gen_fullpage_stress` (difftest + `stress_buf.sh`) and `fullpage_reset_repro.sh`
+  (gate `repro:fullpage_reset`).  Mutation-checked: removing the `pager_write` drop fails 29-32
+  of 54 runs per variant; removing the truncate drop fails the reset repro.  Movepage/ForgetPage
+  drops are provably unreachable/redundant today (see the table).
+- **Bug 1, pre-existing (use-after-free):** `sqlite3PagerSetPagesize` replaces the pcache2
+  instance, which a BF pager borrows as its `pBfCache` (`bBfCacheShared`), leaving the pager on
+  freed memory.  Reached by VACUUM of a database whose page size is not the default (it attaches a
+  fresh db, then `BtreeSetPageSize`).  Was latent -- the freed block happened not to be reused --
+  until M2's allocations made `gen_blind_stress` segfault.  Fix: re-bind after the swap.
+- **Bug 2, pre-existing (committed-row loss):** rollback rehydrate's replay had no fallback
+  for `BF_FULL`; `sqlite3BfRecordWrite` reclaims with ONE 16-slab sweep, and right after
+  ClearCache the FIFO head is small orphans, so a ~1.4 KB committed record was dropped
+  (`replay_dropped` 0->1; `gen_update_stress` seed 11, ring variant, WAL).  Fix: replay keeps
+  sweeping until the write fits or the sweep stops progressing.  Residual: a DIRTY head still
+  blocks the sweep, and then a record is still dropped -- counted in `replay_dropped`.
+- Also: zero-length `memcpy(…, NULL, 0)` in `sqlite3BfMiniPageInsert` (UBSan), guarded.  The
+  whole buf oracle ran under ASan+UBSan, all 4 variants: clean after these fixes.
+- S1 note added: two connections writing one file diverge from stock with or without M2.
+- `gate.py --full` GREEN 51/51 (difftest 1797/1797); quick gate re-run after the repro's path
+  fix GREEN 13/13.  UNCOMMITTED.  Next: commit; then the M2 campaign (M2 item checkbox).

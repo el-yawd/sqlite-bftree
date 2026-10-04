@@ -19,6 +19,7 @@
 #   bf_noshortcut -DSQLITE_BF_NO_DESCENT_SHORTCUT
 #   bf_nocompact  -DSQLITE_BF_NO_MINIPAGE_COMPACT
 #   bf_shed       -DSQLITE_BF_UPGRADE_SHED        opt-in: upgrades shed cold records
+#   bf_nofull     -DSQLITE_BF_NO_FULL_PAGE        M2: no full-page (BF_LOC_FULL) copies
 #
 # Usage:
 #   sh bench/harness/build_suts.sh            # core variants (stock, bf, bf_ro)
@@ -93,6 +94,8 @@ if [ "$ALL" = 1 ]; then
   # D3 ablations (2026-09-30): existing-row UPDATE buffering, blind REPLACE.
   build_one bf_noupd      "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPDATE_BUFFER"
   build_one bf_noblind    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_BLIND_INSERT"
+  # M2 ablation (2026-10-03): leaves are never copied whole into the ring.
+  build_one bf_nofull     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_FULL_PAGE"
 fi
 
 # bf_off is the same binary as bf; the runner passes --bf-cache off.

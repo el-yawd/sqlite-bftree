@@ -15,7 +15,8 @@ differential ones exactly, in parallel.
 Tasks, per tier (quick = fewer seeds):
   codec       test/bf/wal_codec_test.c
   difftest    stress + stress_buf (base, ring, group8, promo100) + xtable
-  repro       torn_tail_repro, recover_repro (release + SQLITE_DEBUG), ckpt_repro
+  repro       torn_tail_repro, recover_repro (release + SQLITE_DEBUG), ckpt_repro,
+              fullpage_reset_repro (M2, two connections)
   crash       crash_oracle.py sharded by seed: default, cycling ring, group 8,
               promotion 100, SQLITE_DEBUG
   powerloss   powerloss_oracle.py: FULL, NORMAL, FULL+group 8, FULL+ring
@@ -84,6 +85,8 @@ def main():
     add("repro:recover", f"sh {BENCH}/recover_repro.sh {B} {2000 if full else 250} && "
                          f"sh {BENCH}/recover_repro.sh {DBG} 250")
     add("repro:ckpt", f"sh {BENCH}/ckpt_repro.sh {B}")
+    add("repro:fullpage_reset", f"sh {BENCH}/fullpage_reset_repro.sh {B} {ST} && "
+                                f"sh {BENCH}/fullpage_reset_repro.sh {DBG} {ST}")
 
     # crash oracle, sharded: (label, env extras, seeds)
     if full:

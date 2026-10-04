@@ -401,7 +401,7 @@ int sqlite3BfMiniPageInsert(BfMiniPage *pMini,
   assert( pDst >= (u8*)pMini );
   assert( (pDst + nKey + nVal) <= ((u8*)pMini + pMini->nodeSize) );
   memcpy(pDst, pKey, nKey);
-  memcpy(pDst + nKey, pVal, nVal);
+  if( nVal ) memcpy(pDst + nKey, pVal, nVal);   /* pVal may be NULL (tombstone) */
 
   /* Initialize new metadata */
   pNewMeta = &aMeta[idx];

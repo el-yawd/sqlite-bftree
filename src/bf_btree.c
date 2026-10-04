@@ -1037,6 +1037,10 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[4] = pBf ? pBf->nBlindNoLeaf : 0;
   aOut[5] = pBf ? pBf->nBlindRefused : 0;
   aOut[6] = pBf ? pBf->nProbeMemo : 0;
+  aOut[7] = pBf ? pBf->nFullCreate : 0;
+  aOut[8] = pBf ? pBf->nFullRead : 0;
+  aOut[9] = pBf ? pBf->nFullDrop : 0;
+  aOut[10] = pBf ? pBf->nFullEvict : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){
@@ -2391,6 +2395,7 @@ int sqlite3BfBtreePromoteRecord(
   /* Promote into the mini-page of the leaf the row lives on. */
   {
     u32 leaf = bfCursorLeafPgno(pCur);
+    int rc;
     if( leaf==0 ) return SQLITE_OK;
 
     /* Re-encode rowid key if passed raw. */
@@ -2398,12 +2403,22 @@ int sqlite3BfBtreePromoteRecord(
       u8 keyBuf[8];
       i64 rowid; memcpy(&rowid,pKey,sizeof(i64));
       bfEncodeRowid(rowid, keyBuf);
-      sqlite3BfRecordWrite(pBf, leaf, keyBuf, 8, pData, nData, BFOP_CACHE);
-      bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
+      rc = sqlite3BfRecordWrite(pBf, leaf, keyBuf, 8, pData, nData, BFOP_CACHE);
+    }else{
+      rc = sqlite3BfRecordWrite(pBf, leaf, pKey, nKey, pData, nData, BFOP_CACHE);
+    }
+    if( rc==BF_WANT_FULL ){
+      /* M2: the leaf's mini-page would be as large as the leaf.  Cache the
+      ** leaf itself, copied from the clean page this cursor is reading.  Not
+      ** from a page this transaction has made writeable: that content is not
+      ** what the pager would read back, and the copy must be exactly that. */
+      MemPage *pLeaf = pCur->pPage;
+      if( pLeaf && pLeaf->pgno==leaf && pLeaf->leaf && pLeaf->intKey
+       && (pLeaf->pDbPage->flags & (PGHDR_WRITEABLE|PGHDR_DIRTY))==0 ){
+        (void)sqlite3BfFullPageCreate(pBf, leaf, pCur->pgnoRoot, pLeaf->aData);
+      }
       return SQLITE_OK;
     }
-
-    sqlite3BfRecordWrite(pBf, leaf, pKey, nKey, pData, nData, BFOP_CACHE);
     bfTagLeafRoot(pBf, leaf, pCur->pgnoRoot);
   }
   return SQLITE_OK;
@@ -2519,6 +2534,7 @@ void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno){
   pBf = sqlite3PagerGetBfCache(pBt->pPager);
   if( !pBf ) return;
   sqlite3BfLeafBitClear(pBf, pgno);   /* D3b: freed, so no longer a known leaf */
+  sqlite3BfFullPageDrop(pBf, pgno);   /* M2: the copy describes the old page */
   pEntry = sqlite3BfMapLookup(pBf, pgno);
   if( pEntry && pEntry->locType==BF_LOC_MINI ){
     /* Drop only CLEAN mini-pages.  A dirty mini-page (buffered BFOP_INSERT /

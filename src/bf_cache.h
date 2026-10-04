@@ -286,6 +286,12 @@ struct BfKVMeta {
 ** per transaction the commit-time walk grew with the whole accumulated dirty
 ** set -- 24.9% of cycles on an insert workload, and O(N^2) over N commits. */
 #define BF_MINI_F_UNLOGGED 0x0004
+/* M2 (2026-10-02): this ring slab is a FULL PAGE, not a mini-page -- the
+** BfMiniPage header (nodeSize, ownerPgno, rootPgno, flags) followed by an exact
+** copy of the clean leaf page, mapped as BF_LOC_FULL.  It holds no records:
+** every record-level function looks for BF_LOC_MINI and never sees it. */
+#define BF_MINI_F_FULL     0x0008
+#define BF_FULL_PAGE_DATA(mp)  ((u8*)(mp) + sizeof(BfMiniPage))
 
 struct BfMiniPage {
   u16 nodeSize;             /* Total size of this mini-page */
@@ -595,6 +601,14 @@ struct BfCache {
   u64 nInsertGen;           /* H2: bumped by every sqlite3BfRecordWrite, the one
                             ** path that adds a key to a mini-page */
   u64 nProbeMemo;           /* H2: seeks whose re-probes the probe memo skipped */
+  /* M2 full pages (BF_LOC_FULL).  iMaxFullPgno bounds the pgnos that may hold
+  ** one, so xTruncate -- called on every commit -- skips the map walk. */
+  u32 iMaxFullPgno;
+  u32 iFullDropLimit;        /* bfCacheTruncate -> its map-walk callback */
+  u64 nFullCreate;          /* clean mini-pages replaced by a full-page copy */
+  u64 nFullRead;            /* pager page reads served from a full page */
+  u64 nFullDrop;            /* full pages invalidated (write, free, truncate) */
+  u64 nFullEvict;           /* full pages reclaimed by the FIFO sweep */
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
@@ -622,6 +636,8 @@ struct BfCache {
 #define BF_FULL             2    /* Circular buffer full */
 #define BF_NOT_FOUND        3    /* Record not found in mini-page */
 #define BF_DELETED          5    /* Record was deleted or is a phantom */
+#define BF_WANT_FULL        6    /* M2: a clean mini-page would need a page-sized
+                                 ** slab -- cache the whole leaf instead */
 #define BF_MINI_PAGE_FULL   4    /* Mini-page full, needs upgrade or merge */
 
 /*
@@ -721,6 +737,12 @@ SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfKvIsColdCache(const BfKVMeta *pMeta);
 SQLITE_PRIVATE void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry);
+SQLITE_PRIVATE int sqlite3BfFullPageCreate(BfCache*, u32 pgno, u32 root, const u8 *aData);
+#if !defined(SQLITE_BF_NO_FULL_PAGE)
+SQLITE_PRIVATE int sqlite3BfFullPageRead(BfCache*, u32 pgno, void *pBuf, int szPage);
+SQLITE_PRIVATE void sqlite3BfFullPageDropFrom(BfCache*, u32 iLimit);
+#endif
+SQLITE_PRIVATE void sqlite3BfFullPageDrop(BfCache*, u32 pgno);
 /* A3a: take/release the record-cache lock.  No-ops in a single-threaded build,
 ** and tolerant of a null cache so call sites need no extra guard. */
 #if SQLITE_THREADSAFE

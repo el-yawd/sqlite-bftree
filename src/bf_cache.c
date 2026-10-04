@@ -617,6 +617,11 @@ static void bfCacheTruncate(sqlite3_pcache *p, unsigned int iLimit){
   ** (a shrinking file, or a pager reset after another connection wrote):
   ** whatever they are next, nobody has seen it yet. */
   sqlite3BfLeafBitClearFrom(&pCache->base, iLimit);
+#if !defined(SQLITE_BF_NO_FULL_PAGE)
+  /* M2: full pages at or above iLimit describe a page this pager no longer
+  ** has -- or, on a reset after another connection wrote, no longer trusts. */
+  sqlite3BfFullPageDropFrom(&pCache->base, iLimit);
+#endif
   if( pCache->nHash==0 ) return;
   if( iLimit > pCache->iMaxKey ) return;      /* nothing at or above iLimit */
 
@@ -819,6 +824,148 @@ void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
 }
 
 /*
+** M2 -- full pages (2026-10-02).
+**
+** ../bf-tree turns a leaf whose mini-page cannot grow any further into a FULL
+** PAGE in the same ring: "we are already too large, we need to do whole page
+** cache ... it caches the entire gap" (mini_page_op.rs:932-956, reached by
+** read-promoted BFOP_CACHE records too, tree.rs:1419).  Scattered hot keys
+** therefore stay records and clustered ones become pages, in ONE pool under one
+** FIFO/second-chance policy.  Here the leaf IS a SQLite page, so a full page is
+** an exact copy of the clean pcache page, and it is served at the pager: a
+** pcache miss on that leaf (point read, scan or write) is filled by memcpy
+** from the ring instead of a device read (readDbPage, pager.c).
+**
+** Coherence.  A copy is taken only from a page that is not writeable in the
+** current transaction, i.e. equal to what this pager would read.  It is dropped
+** whenever that stops being true: the first sqlite3PagerWrite of the page
+** (pager_write), a page move, the page being freed (ForgetPage), a shrink or
+** pager reset (bfCacheTruncate), ClearCache, and any buffered record write to
+** the leaf (sqlite3BfRecordWrite).  The slab is never put on the free list --
+** its size is not a size class -- so an unlinked copy is simply an orphan the
+** FIFO sweep reclaims.
+**
+** SQLITE_BF_NO_FULL_PAGE compiles the whole mechanism out.
+*/
+#if !defined(SQLITE_BF_NO_FULL_PAGE)
+int sqlite3BfFullPageCreate(BfCache *pCache, u32 pgno, u32 root, const u8 *aData){
+  BfMapEntry *pEntry;
+  BfMiniPage *pFull;
+  void *pRaw;
+  u32 size;
+
+  if( !pCache || pgno<=1 || !aData || pCache->szPage<=0 ) return BF_ERROR;
+  if( pCache->bBypassActive || pCache->bMergingActive ) return BF_ERROR;
+  size = (u32)sizeof(BfMiniPage) + (u32)pCache->szPage;
+  if( size>0xffff ) return BF_ERROR;     /* nodeSize is u16: 64 KiB pages */
+  pEntry = sqlite3BfMapLookup(pCache, pgno);
+  if( pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage
+   && sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage) ){
+    return BF_ERROR;            /* buffered records: never replace them */
+  }
+  if( pEntry && pEntry->locType==BF_LOC_FULL ) return BF_OK;
+
+  pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, size);
+  if( !pRaw ){
+    sqlite3BfCacheEvict(pCache, 16);
+    pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, size);
+  }
+  if( !pRaw ) return BF_FULL;
+  pFull = (BfMiniPage*)pRaw;
+  memset(pFull, 0, sizeof(BfMiniPage));
+  pFull->nodeSize = (u16)size;
+  pFull->flags = BF_MINI_F_FULL;
+  pFull->baseDiskOffset = -1;
+  pFull->ownerPgno = pgno;
+  pFull->rootPgno = root;
+  memcpy(BF_FULL_PAGE_DATA(pFull), aData, (size_t)pCache->szPage);
+  sqlite3BfCircularBufferMarkReady(pRaw);
+
+  /* Re-read the entry: the evict-and-retry above may have unlinked the clean
+  ** mini-page this replaces, or created nothing yet. */
+  pEntry = sqlite3BfMapGetOrCreate(pCache, pgno);
+  if( !pEntry ) return SQLITE_NOMEM;     /* the slab is an orphan: reclaimed */
+  if( pEntry->locType==BF_LOC_MINI && pEntry->pPage ){
+    if( sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage) ) return BF_ERROR;
+    sqlite3BfCircularBufferDealloc(&pCache->cb, pEntry->pPage);
+  }
+  pEntry->locType = BF_LOC_FULL;
+  pEntry->pPage = pRaw;
+  if( pgno>pCache->iMaxFullPgno ) pCache->iMaxFullPgno = pgno;
+  pCache->nFullCreate++;
+  return BF_OK;
+}
+
+/* Second chance for a full page, as sqlite3BfCacheCopyOnAccess gives a clean
+** mini-page: a whole-slab copy (it has no records to shed).  The old slab is
+** left as an orphan rather than freed -- see the coherence note above. */
+static void bfFullCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
+#if !defined(SQLITE_BF_NO_COPY_ON_ACCESS)
+  BfMiniPage *pOld = (BfMiniPage*)pEntry->pPage;
+  void *pRaw;
+  if( pCache->cb.copyOnAccessRatio <= 0.0 ) return;
+  if( !sqlite3BfCircularBufferIsCopyOnAccess(&pCache->cb, pOld) ) return;
+  pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, pOld->nodeSize);
+  if( !pRaw ) return;
+  memcpy(pRaw, pOld, pOld->nodeSize);
+  sqlite3BfCircularBufferMarkReady(pRaw);
+  pEntry->pPage = pRaw;
+  pCache->nCopyOnAccess++;
+#else
+  UNUSED_PARAMETER(pCache);
+  UNUSED_PARAMETER(pEntry);
+#endif
+}
+
+int sqlite3BfFullPageRead(BfCache *pCache, u32 pgno, void *pBuf, int szPage){
+  BfMapEntry *pEntry;
+  if( !pCache || pgno<=1 || pgno>pCache->iMaxFullPgno ) return 0;
+  if( szPage!=pCache->szPage ) return 0;
+  pEntry = sqlite3BfMapLookup(pCache, pgno);
+  if( !pEntry || pEntry->locType!=BF_LOC_FULL || !pEntry->pPage ) return 0;
+  memcpy(pBuf, BF_FULL_PAGE_DATA(pEntry->pPage), (size_t)szPage);
+  pCache->nFullRead++;
+  bfFullCopyOnAccess(pCache, pEntry);
+  return 1;
+}
+
+void sqlite3BfFullPageDrop(BfCache *pCache, u32 pgno){
+  BfMapEntry *pEntry;
+  if( !pCache || pgno<=1 || pgno>pCache->iMaxFullPgno ) return;
+  pEntry = sqlite3BfMapLookup(pCache, pgno);
+  if( pEntry && pEntry->locType==BF_LOC_FULL ){
+    pEntry->locType = BF_LOC_NULL;     /* slab becomes an orphan */
+    pEntry->pPage = 0;
+    pCache->nFullDrop++;
+  }
+}
+
+static int bfFullDropFromCb(void *pCtx, u32 pgno, BfMapEntry *pEntry){
+  BfCache *pCache = (BfCache*)pCtx;
+  if( pEntry->locType==BF_LOC_FULL && pgno>=pCache->iFullDropLimit ){
+    pEntry->locType = BF_LOC_NULL;
+    pEntry->pPage = 0;
+    pCache->nFullDrop++;
+  }
+  return 0;
+}
+/* Drop every full page at or above iLimit (bfCacheTruncate: a shrinking file,
+** or a pager reset after another connection wrote). */
+void sqlite3BfFullPageDropFrom(BfCache *pCache, u32 iLimit){
+  if( pCache->iMaxFullPgno==0 || pCache->iMaxFullPgno<iLimit ) return;
+  pCache->iFullDropLimit = iLimit;
+  sqlite3BfMapIterate(pCache, bfFullDropFromCb, pCache);
+  pCache->iMaxFullPgno = iLimit>0 ? iLimit-1 : 0;
+}
+#else
+int sqlite3BfFullPageCreate(BfCache *p, u32 g, u32 r, const u8 *a){
+  UNUSED_PARAMETER(p); UNUSED_PARAMETER(g); UNUSED_PARAMETER(r); UNUSED_PARAMETER(a);
+  return BF_ERROR;
+}
+void sqlite3BfFullPageDrop(BfCache *p, u32 g){ UNUSED_PARAMETER(p); UNUSED_PARAMETER(g); }
+#endif /* SQLITE_BF_NO_FULL_PAGE */
+
+/*
 ** Read a record from the cache.
 ** First checks mini-page, then falls through to full page.
 */
@@ -868,6 +1015,15 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   if( !pEntry ){
     BF_ALLOC_TRACE("map-getorcreate-nomem", pCache, (int)pgno);
     return SQLITE_NOMEM;
+  }
+  if( pEntry->locType==BF_LOC_FULL ){
+    /* M2: the whole leaf is already cached; a clean record adds nothing.  A
+    ** buffered mutation needs a mini-page, and the copy is still the base
+    ** image -- but one map slot holds one location, so the copy goes. */
+    if( opType==BFOP_CACHE || opType==BFOP_PHANTOM ) return BF_OK;
+    pEntry->locType = BF_LOC_NULL;
+    pEntry->pPage = 0;
+    pCache->nFullDrop++;
   }
 
   /* Get or create mini-page */
@@ -928,6 +1084,18 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   ** one step from the 64-byte initial allocation reaches only 128. */
   newSize = sqlite3BfMiniPageSizeClassFor(pMini, nKey, nVal,
                                           pCache->aSizeClass);
+#if !defined(SQLITE_BF_NO_FULL_PAGE)
+  /* M2: the reference's trigger.  A clean mini-page that would need a slab as
+  ** large as the page itself (or cannot grow at all) caches the whole leaf
+  ** instead -- a page then holds every row of the leaf for the bytes the
+  ** mini-page would spend on a fraction of them.  The caller holds the page
+  ** (sqlite3BfBtreePromoteRecord) and makes the copy. */
+  if( (opType==BFOP_CACHE || opType==BFOP_PHANTOM) && !wasDirty
+   && pCache->szPage>0
+   && (newSize==0 || newSize >= (u32)pCache->szPage) ){
+    return BF_WANT_FULL;
+  }
+#endif
   if( newSize > 0 && newSize <= BF_MAX_MINI_PAGE ){
     pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, newSize);
     if( !pNew ){
@@ -1166,6 +1334,18 @@ static int bfReplayOnePage(void *pCtx, u32 pgno){
     op = (rec.op==BFWAL_OP_DELETE) ? BFOP_DELETE : BFOP_INSERT;
     wr = sqlite3BfRecordWrite(ctx->pCache, pgno, rec.pKey, (int)rec.nKey,
                               rec.pVal, (int)rec.nVal, op);
+    /* A normal write that gets BF_FULL falls back to the base page; replay
+    ** has no fallback, so it must not give up while the ring can still yield
+    ** space.  sqlite3BfRecordWrite's own reclaim is one 16-slab sweep, and
+    ** right after a rollback's ClearCache the FIFO head is a run of small
+    ** orphans: 16 of them did not free room for one ~1.4 KB record, and the
+    ** committed row was dropped (gen_update_stress seed 11, ring variant,
+    ** 2026-10-03).  Sweep until it fits or the sweep stops progressing (empty
+    ** ring, or a dirty slab at the head). */
+    while( wr==BF_FULL && sqlite3BfCacheEvict(ctx->pCache, 64)>0 ){
+      wr = sqlite3BfRecordWrite(ctx->pCache, pgno, rec.pKey, (int)rec.nKey,
+                                rec.pVal, (int)rec.nVal, op);
+    }
     if( wr==BF_OK ){
       BfMapEntry *pEntry = sqlite3BfMapLookup(ctx->pCache, pgno);
       if( pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage ){
@@ -1295,6 +1475,12 @@ static int evictCallback(void *pCtx, void *ptr){
   if( (void*)pMini == pCache->pEvictProtect ) return BF_ERROR;
 
   pEntry = sqlite3BfMapLookup(pCache, pMini->ownerPgno);
+  if( pEntry && pEntry->locType==BF_LOC_FULL && pEntry->pPage==pMini ){
+    pEntry->locType = BF_LOC_NULL;   /* M2: a full page is always clean */
+    pEntry->pPage = 0;
+    pCache->nFullEvict++;
+    return BF_OK;
+  }
   if( pEntry == 0 || pEntry->locType != BF_LOC_MINI || pEntry->pPage != pMini ){
     return BF_OK;            /* Case 1: orphaned */
   }
