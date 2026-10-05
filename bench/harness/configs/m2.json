@@ -1,0 +1,144 @@
+{
+ "name": "m2",
+ "_comment": [
+  "M2 letter gate: do full pages (BF_LOC_FULL) recover H7's clustered-read and scan",
+  "reversal (results/dio) without costing scrambled reads?  bf vs bf_nofull",
+  "(-DSQLITE_BF_NO_FULL_PAGE) vs stock, buffered vs direct I/O, ONE shuffled campaign.",
+  "Same arms, budget, splits and op-count warmup as dio.json; stock = 36 MiB pcache.",
+  "Report seek hit %, cached_records, evictions AND full_page_* beside every ops/s."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "warmup_ops": 2000000,
+  "theta": 0.9,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "36M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10
+ },
+ "experiments": [
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "16M",
+   "axes": {
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "suts": [
+    "bf",
+    "bf_nofull"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M",
+     "32M"
+    ],
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "16M",
+   "axes": {
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "suts": [
+    "bf",
+    "bf_nofull"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M",
+     "32M"
+    ],
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "16M",
+   "axes": {
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "bf",
+    "bf_nofull"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M",
+     "32M"
+    ],
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  }
+ ]
+}
