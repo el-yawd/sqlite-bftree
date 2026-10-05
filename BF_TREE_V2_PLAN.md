@@ -1275,7 +1275,54 @@ merging into a base page that then goes to the WAL as a page image.
 `read_promotion_rate` in the reference (`config.rs:38`).  One knob for both means scans either
 thrash the ring or point reads under-admit.
 
-- [ ] `PRAGMA bf_scan_promotion`
+- [x] `PRAGMA bf_scan_promotion` -- **built 2026-10-05, `89ccce2`, gate GREEN 51/51.**
+  The reference's scans promote PAGES only (`range_scan.rs:406/461/493`, each behind
+  `should_promote_scan_page`, `tree.rs:466`; default 30 = its read rate, `config.rs:23,130`).
+  Ours used to treat every row a scan read as a read-promotion candidate.  Now:
+  - *Scan rows:* `BtCursor.bfScan` is set by `TableMovetoForScan` (wrapper), `First`, `Last`, and
+    cleared by a point `TableMoveto` (kept across `btreeMoveto`'s restore re-seek).  In
+    `sqlite3BfBtreePromoteRecord` a scan row goes to `bfScanPromoteLeaf` and promotes no record.
+  - *Per leaf:* the first row a scan reads on a leaf (`bfScanLeaf`) rolls `bf_scan_promotion`
+    once; on success the clean leaf (same WRITEABLE/DIRTY rule as M2) becomes a full page.
+    A leaf with buffered records is skipped (the reference merges first; a read txn cannot).
+  - Counters `scan_leaves`, `scan_promotions`; config echo `scan_promotion_rate`.  Ablation
+    `SQLITE_BF_NO_SCAN_PROMOTION` (SUT `bf_noscan`); harness `--scan-promotion` /
+    runner key `scan_promotion`.
+  - Oracle: `promo100` variants (difftest + crash) also set `bf_scan_promotion=100`;
+    `gen_fullpage_stress` reaches it heavily (1742 scan promotions, 7289 full-page reads at
+    seed 3).  Mutant without the clean-page check: 36/360 divergences.
+  - Smoke (NOT quotable, direct, 32M): scans 0.841 device reads/op bf vs 0.940 noscan vs
+    0.697 stock; mixed 90/10 scrambled: scan full pages displace point-read records (cached
+    146k -> 24k, seek hit 27% -> 12%) at ~equal device reads.
+- [x] campaign `configs/m3.json` -> `results/m3` (64 runs): scan_zipfraw + mix_zipf, bf vs
+      bf_noscan vs stock, rings 4/16/32, buffered/direct, + scan_promotion 0/100 sweep.
+- **`results/m3` (2026-10-05, `89ccce2`, 64/64, 121 min, `--shuffle 7`, all direct runs proven).**
+  Device wait held at 74-81 us/read except runs 59, 60, 62 (86-132 us), so throughput is
+  usable this time from the unaffected repeat; device reads/op deterministic as before.
+  Direct I/O, device reads/op (ops/s in brackets, the clean repeat):
+
+  | arm | stock | ring 4M bf / noscan | ring 16M bf / noscan | ring 32M bf / noscan |
+  |---|---|---|---|---|
+  | 32-row scans, contiguous | 0.698 (9.9k) | 0.724 / 0.724 (9.1k / 8.6k) | **0.764 / 0.804** (8.8k / 8.2k) | **0.844 / 0.943** (8.2k / 7.4k) |
+  | 90% point + 10% scan, scrambled | 0.715 (12.9k) | 0.722 / 0.724 | 0.681 / 0.693 (13.0k / 12.7k) | 0.723 / 0.734 (12.4k / 12.1k) |
+
+  `bf_scan_promotion` sweep at 32M, direct:
+
+  | arm | 0 | 30 (default) | 100 |
+  |---|---|---|---|
+  | scans | 1.232 (6.3k) | **0.844** (8.2k) | 0.879 (7.9k) |
+  | 90/10 mix | **0.580** (15.0k = **1.17x stock**; seek hit 51%, 172k records) | 0.723 (12.4k; hit 10.5%, 23k records) | 0.777 (11.6k; hit 6.8%, 9k records) |
+
+  1. **Pure scans: M3 helps** -- -10.5% device reads and +11% ops/s vs `bf_noscan` at 32M,
+     -5% / +7% at 16M; BF still reads more than stock (0.83x ops at 32M), because the
+     page cache it gave up is LRU and the ring's copies are FIFO.  30 beats 100 (more churn).
+  2. **Mixed scrambled: the reference default is the wrong setting here.**  Pre-M3, scan rows
+     halved the point-read hit rate (24.7% vs 51% with scans caching nothing).  M3 at 30 is
+     slightly better than that in bytes (-1.5%) but its full pages displace even more records
+     (hit 10.5%).  `bf_scan_promotion=0` -- scans cache nothing -- is the best mixed result
+     this project has measured: **19% fewer device reads than stock, 1.17x throughput**.
+  3. So the scan rate is a workload knob, as the reference makes it.  **Owner decision:** keep
+     the faithful default 30 (best for scan-heavy) or default 0 (best for point-dominated mixes).
 
 ### M4 — eviction batching
 *From: parity plan B5, handoff P6.*  **No longer blocked** — M1 landed, and the dirty head it
@@ -2363,3 +2410,11 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   full pages cost scrambled reads nothing, cut scan device reads 23% at a 32 MiB ring, and
   clustered point reads only 5%; BF stays above stock on both clustered arms (1.21x / 1.35x
   reads).  Detail in the M2 item.  Next candidate: M3 (scan promotion), owner to rank.
+
+### 2026-10-05 (cont.) — Claude Opus 5.5 — M3 built: scans promote pages, not records
+
+- `89ccce2`: per-leaf scan promotion (`PRAGMA bf_scan_promotion`, default 30), faithful to
+  `range_scan.rs`; design, counters, ablation and oracle coverage in the M3 item.  Gate `--full`
+  GREEN 51/51.  `results/m3` done: scans -10.5% device reads / +11% ops vs bf_noscan at 32M;
+  a 90/10 scrambled mix is best with `bf_scan_promotion=0` (1.17x stock, -19% device reads),
+  where the default 30 lets scan full pages displace hot records.  Default = owner decision.
