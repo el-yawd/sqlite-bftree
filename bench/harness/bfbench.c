@@ -933,8 +933,7 @@ static void doInsert(RunState *s, Config *p){
 
 static void doScan(RunState *s, Config *p, long long key){
   int rc;
-  sqlite3_bind_int64(s->pScan, 1, key);
-  sqlite3_bind_int(s->pScan, 2, p->nScanLen);
+  sqlite3_bind_int64(s->pScan, 1, key);   /* LIMIT is bound once, at prepare */
   while( (rc = sqlite3_step(s->pScan))==SQLITE_ROW ){
     /* Touch the payload so the scan cannot be optimised into an index-only
     ** walk that never materialises a row. */
@@ -1119,6 +1118,13 @@ static int cmdRun(Config *p){
                       ? "INSERT OR REPLACE INTO usertable VALUES(?,?)"
                       : "INSERT INTO usertable VALUES(?,?)");
   s.pScan   = prep(db, "SELECT id,v FROM usertable WHERE id>=? ORDER BY id LIMIT ?");
+  /* Bind LIMIT ONCE.  SQLite reads a bound LIMIT at prepare time
+  ** (sqlite3ExprIsInteger -> sqlite3VdbeSetVarmask, expr.c), and re-binding a
+  ** masked parameter -- even to the same value -- expires the statement
+  ** (vdbeapi.c vdbeUnbind), so binding it per scan recompiled the SQL on every
+  ** scan: 43.6% of stock's scan CPU was sqlite3Reprepare (perf, 2026-10-05).
+  ** Every scan campaign before this fix paid it, all SUTs alike. */
+  sqlite3_bind_int(s.pScan, 2, p->nScanLen);
 
   s.aVal = malloc(p->nValueLen);
   if( s.aVal==0 ) die("out of memory");
