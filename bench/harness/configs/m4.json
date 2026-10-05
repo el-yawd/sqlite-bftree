@@ -1,0 +1,123 @@
+{
+ "name": "m4",
+ "_comment": [
+  "M4 letter gate: eviction batching.  bf_evict_target 0 (pre-M4: 16 entries, one retry) vs",
+  "1024 (the reference's TARGET_EVICT_SIZE, retry until it fits) vs 4096, at a 32 MiB ring,",
+  "direct I/O, on the three arms that evict hardest: scrambled point reads (records),",
+  "contiguous point reads (full pages) and 32-row scans.  QUOTE device reads/op",
+  "(dio.reads/ops); report cached_records and evictions beside it."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "warmup_ops": 2000000,
+  "theta": 0.9,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "36M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true
+ },
+ "experiments": [
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "32M"
+  },
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "ring_bytes": "32M",
+   "axes": {
+    "evict_target": [
+     0,
+     1024,
+     4096
+    ]
+   }
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "32M"
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "ring_bytes": "32M",
+   "axes": {
+    "evict_target": [
+     0,
+     1024,
+     4096
+    ]
+   }
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "32M"
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "bf"
+   ],
+   "ring_bytes": "32M",
+   "axes": {
+    "evict_target": [
+     0,
+     1024,
+     4096
+    ]
+   }
+  }
+ ]
+}

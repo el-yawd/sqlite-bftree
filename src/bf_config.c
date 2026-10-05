@@ -22,6 +22,7 @@
 **   PRAGMA bf_cache_stats        - Show cache statistics
 **   PRAGMA bf_promotion_rate     - Get/set read promotion rate
 **   PRAGMA bf_scan_promotion     - Get/set per-leaf scan (full page) rate
+**   PRAGMA bf_evict_target       - Get/set bytes per eviction batch (M4)
 **   PRAGMA bf_deferred_commit    - Bounded deferred durability window (N txns)
 **   PRAGMA bf_group_commit       - Old name of bf_deferred_commit, kept
 **   PRAGMA bf_min_record         - Size-class ladder base
@@ -43,6 +44,7 @@ typedef struct BfConfig {
   int nGroupCommit;           /* Transactions per record-frame group (0/1=off) */
   int nMinRecord;             /* Size-class ladder base; see bf_min_record */
   int nScanPromotion;         /* M3: per-leaf scan promotion rate (0-100) */
+  int nEvictTarget;           /* M4: bytes per eviction batch; 0 = legacy 16 */
 } BfConfig;
 
 static BfConfig bfConfig = {
@@ -52,8 +54,18 @@ static BfConfig bfConfig = {
   BF_DEFAULT_COPY_ON_ACCESS,  /* 10% copy-on-access region */
   0,                          /* Group commit off: one flush per commit */
   BF_DEFAULT_MIN_RECORD,      /* ours, measured; the reference's default is 4 */
-  BF_DEFAULT_SCAN_PROMOTION   /* the reference's scan_promotion_rate default */
+  BF_DEFAULT_SCAN_PROMOTION,  /* the reference's scan_promotion_rate default */
+  BF_DEFAULT_EVICT_TARGET     /* the reference's TARGET_EVICT_SIZE */
 };
+
+/*
+** M4: bytes one eviction batch reclaims before the allocation is retried
+** (../bf-tree TARGET_EVICT_SIZE, tree.rs:1012).  0 = the pre-M4 sweep of a
+** fixed 16 entries with a single retry.  See PRAGMA bf_evict_target.
+*/
+int sqlite3BfCacheEvictTarget(void){
+  return bfConfig.nEvictTarget;
+}
 
 /*
 ** Number of transactions a record-frame group may span (Phase 2 group commit).
@@ -240,6 +252,10 @@ void sqlite3PragmaBfCacheStats(
   sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nScanPromotion, 2);
   sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
 
+  sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "evict_target", P4_STATIC);
+  sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nEvictTarget, 2);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
   {
     sqlite3 *db = pParse->db;
     int iDb = sqlite3FindDbName(db, zDb);
@@ -366,16 +382,17 @@ void sqlite3PragmaBfCacheStats(
         "buffered_updates", "update_fallbacks", "shadow_serves",
         "blind_inserts", "blind_no_leaf", "blind_refused", "probe_memo",
         "full_page_creates", "full_page_reads", "full_page_drops",
-        "full_page_evictions", "scan_leaves", "scan_promotions"
+        "full_page_evictions", "scan_leaves", "scan_promotions",
+        "evict_batches", "evicted_bytes"
       };
-      u64 aUpd[13];
+      u64 aUpd[15];
       int iU;
       memset(aUpd, 0, sizeof(aUpd));
       if( pBt ){
         extern void sqlite3BfBtreeUpdateStat(Btree*, u64*);
         sqlite3BfBtreeUpdateStat(pBt, aUpd);
       }
-      for(iU=0; iU<13; iU++){
+      for(iU=0; iU<15; iU++){
         sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, azUpd[iU], P4_STATIC);
         sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&aUpd[iU], P4_INT64);
         sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
@@ -654,6 +671,33 @@ void sqlite3PragmaBfScanPromotion(
     if( rate < 0 ) rate = 0;
     if( rate > 100 ) rate = 100;
     bfConfig.nScanPromotion = rate;
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_evict_target  (M4)
+**
+** PRAGMA bf_evict_target;        -- bytes per eviction batch
+** PRAGMA bf_evict_target = N;    -- set it; 0 = pre-M4 fixed 16-entry sweep
+*/
+void sqlite3PragmaBfEvictTarget(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  UNUSED_PARAMETER(zDb);
+  if( zValue == 0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nEvictTarget, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_evict_target", SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    int n = sqlite3Atoi(zValue);
+    if( n < 0 ) n = 0;
+    if( n > (1<<20) ) n = 1<<20;
+    bfConfig.nEvictTarget = n;
   }
 }
 

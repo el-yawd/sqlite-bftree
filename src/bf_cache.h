@@ -125,6 +125,12 @@ typedef struct BfFreeList BfFreeList;
 /* M3: per-leaf scan promotion (full page) rate; the reference's default for
 ** scan_promotion_rate is the same 30 as its read rate (config.rs:23,130). */
 #define BF_DEFAULT_SCAN_PROMOTION 30
+/* M4: bytes one eviction batch aims to reclaim, and the entry cap per batch --
+** ../bf-tree TARGET_EVICT_SIZE = 1024 and retry_cnt < 10 (tree.rs:1012-1018).
+** PRAGMA bf_evict_target = 0 restores the pre-M4 fixed 16-entry sweep. */
+#define BF_DEFAULT_EVICT_TARGET 1024
+#define BF_EVICT_BATCH_MAX_ENTRIES 10
+#define BF_LEGACY_EVICT_ENTRIES 16
 /* Upper bound on PRAGMA bf_group_commit: how many transactions may share one
 ** open record batch before it is forced out to the WAL.  A crash loses at most
 ** this many committed transactions, so keep it small enough to stay a
@@ -515,7 +521,10 @@ struct BfCache {
   u64 nPageFetchMiss;       /* pcache2 xFetch that allocated/recycled a page */
   u64 nFullPageHit;         /* Lookups found in full page cache */
   u64 nMergeToBase;         /* Mini-pages merged to base page */
-  u64 nEvictions;           /* Total evictions */
+  u64 nEvictBytes;          /* Bytes the eviction sweeps reclaimed (was misnamed
+                            ** nEvictions; the reported entry count is
+                            ** cb.nEvictions) */
+  u64 nEvictBatches;        /* M4: eviction batches (alloc-failure rounds) */
   u64 nUpgrades;            /* Mini-page size upgrades */
   u64 nMergeScans;          /* Forward scans that armed merge-iteration (2.2) */
   u64 nMergeInserts;        /* Buffered inserts emitted by merge-iteration */
@@ -958,6 +967,7 @@ SQLITE_PRIVATE int sqlite3BfCachePromotionRate(void);
 #if !defined(SQLITE_BF_NO_SCAN_PROMOTION)
 SQLITE_PRIVATE int sqlite3BfCacheScanPromotion(void);
 #endif
+SQLITE_PRIVATE int sqlite3BfCacheEvictTarget(void);
 
 /*
 ** Per-pager cache management (P0.3).

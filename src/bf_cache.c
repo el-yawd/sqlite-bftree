@@ -847,6 +847,7 @@ void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
 **
 ** SQLITE_BF_NO_FULL_PAGE compiles the whole mechanism out.
 */
+static void *bfAllocEvicting(BfCache*, u32);   /* M4, below */
 #if !defined(SQLITE_BF_NO_FULL_PAGE)
 int sqlite3BfFullPageCreate(BfCache *pCache, u32 pgno, u32 root, const u8 *aData){
   BfMapEntry *pEntry;
@@ -865,11 +866,7 @@ int sqlite3BfFullPageCreate(BfCache *pCache, u32 pgno, u32 root, const u8 *aData
   }
   if( pEntry && pEntry->locType==BF_LOC_FULL ) return BF_OK;
 
-  pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, size);
-  if( !pRaw ){
-    sqlite3BfCacheEvict(pCache, 16);
-    pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, size);
-  }
+  pRaw = bfAllocEvicting(pCache, size);
   if( !pRaw ) return BF_FULL;
   pFull = (BfMiniPage*)pRaw;
   memset(pFull, 0, sizeof(BfMiniPage));
@@ -1031,17 +1028,13 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     pMini = (BfMiniPage*)pEntry->pPage;
   }else{
     /* Allocate new mini-page */
-    pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, pCache->aSizeClass[0]);
-    if( !pNew ){
-      /* Ring full: reclaim clean/orphaned mini-pages from the FIFO head and
-      ** retry once.  The sweep refuses dirty mini-pages (evictCallback), so
-      ** buffered writes are never dropped; if the head is dirty the sweep
-      ** aborts, the retry fails and the caller falls back to the base-page
-      ** path.  Safe here: pEntry has no mini-page linked yet, so the sweep
-      ** cannot reclaim anything this call still references. */
-      sqlite3BfCacheEvict(pCache, 16);
-      pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, pCache->aSizeClass[0]);
-    }
+    /* Ring full: reclaim clean/orphaned mini-pages from the FIFO head and
+    ** retry (bfAllocEvicting, M4).  The sweep refuses dirty mini-pages
+    ** (evictCallback), so buffered writes are never dropped; if the head is
+    ** dirty the sweep aborts, the retry fails and the caller falls back to the
+    ** base-page path.  Safe here: pEntry has no mini-page linked yet, so the
+    ** sweep cannot reclaim anything this call still references. */
+    pNew = bfAllocEvicting(pCache, pCache->aSizeClass[0]);
     if( !pNew ){
       BF_ALLOC_TRACE("cbuf-alloc-null", &pCache->cb, (int)pCache->aSizeClass[0]);
       return BF_FULL;
@@ -1099,7 +1092,8 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   if( newSize > 0 && newSize <= BF_MAX_MINI_PAGE ){
     pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, newSize);
     if( !pNew ){
-      /* Ring full: reclaim from the FIFO head and retry, exactly as the
+      /* Ring full: reclaim from the FIFO head and retry (M4: bfAllocEvicting
+      ** loops in batches), exactly as the
       ** create-a-mini-page path above does.  Without this the upgrade simply
       ** fails and the record is not cached -- and because nothing else ever
       ** calls sqlite3BfCacheEvict, a full ring meant a leaf could never grow
@@ -1109,9 +1103,8 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
       ** is 71.5%.  The sweep refuses dirty mini-pages, so buffered writes are
       ** never dropped. */
       pCache->pEvictProtect = pMini;
-      sqlite3BfCacheEvict(pCache, 16);
+      pNew = bfAllocEvicting(pCache, newSize);
       pCache->pEvictProtect = 0;
-      pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, newSize);
     }
     if( pNew ){
       sqlite3BfCircularBufferMarkReady(pNew);
@@ -1207,9 +1200,8 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
       pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, curSize);
       if( !pNew ){
         pCache->pEvictProtect = pMini;     /* same reclaim-and-retry */
-        sqlite3BfCacheEvict(pCache, 16);
+        pNew = bfAllocEvicting(pCache, curSize);
         pCache->pEvictProtect = 0;
-        pNew = sqlite3BfCircularBufferAlloc(&pCache->cb, curSize);
       }
       if( pNew ){
         sqlite3BfCircularBufferMarkReady(pNew);
@@ -1515,8 +1507,53 @@ int sqlite3BfCacheEvict(BfCache *pCache, int nTarget){
   nEvicted = sqlite3BfCircularBufferEvictN(&pCache->cb, nTarget,
       evictCallback, pCache);
 
-  pCache->nEvictions += nEvicted;
+  pCache->nEvictBytes += nEvicted;
   return nEvicted;
+}
+
+/*
+** M4 -- eviction batching (2026-10-05).  ../bf-tree evicts lazily and in small
+** batches: an operation whose ring allocation fails calls
+** evict_from_circular_buffer, which evicts entries one at a time until
+** TARGET_EVICT_SIZE = 1024 bytes are reclaimed or 10 entries have gone
+** (tree.rs:1008-1027), and then RETRIES THE OPERATION, looping until it fits
+** (tree.rs:1097-1102, 1164-1170, 1214-1220).  This fork used to evict a fixed
+** 16 entries -- 64 KiB when the head is full pages, 16 x 64 B when it is small
+** orphans -- and retry once, then fall back (write-through, or the promotion
+** dropped).
+**
+** bfAllocEvicting is that loop around one allocation.  It stops when the
+** allocation fits, or when a batch reclaims nothing: the ring is empty, the
+** head is dirty (evictCallback refuses), or it is pEvictProtect.  Batches never
+** pass a refused slab, exactly as before.  PRAGMA bf_evict_target sets the byte
+** target; 0 is the pre-M4 behaviour (one 16-entry sweep, one retry).
+*/
+static int bfEvictBatch(BfCache *pCache, int nTarget){
+  int nBytes = 0, i;
+  pCache->pgnoEvictStall = 0;          /* see sqlite3BfCacheEvict */
+  for(i=0; i<BF_EVICT_BATCH_MAX_ENTRIES && nBytes<nTarget; i++){
+    int n = sqlite3BfCircularBufferEvictOne(&pCache->cb, evictCallback, pCache);
+    if( n<=0 ) break;
+    nBytes += n;
+  }
+  pCache->nEvictBytes += nBytes;
+  pCache->nEvictBatches++;
+  return nBytes;
+}
+
+static void *bfAllocEvicting(BfCache *pCache, u32 size){
+  void *p = sqlite3BfCircularBufferAlloc(&pCache->cb, size);
+  int nTarget;
+  if( p ) return p;
+  nTarget = sqlite3BfCacheEvictTarget();
+  if( nTarget<=0 ){
+    sqlite3BfCacheEvict(pCache, BF_LEGACY_EVICT_ENTRIES);
+    return sqlite3BfCircularBufferAlloc(&pCache->cb, size);
+  }
+  while( !p && bfEvictBatch(pCache, nTarget)>0 ){
+    p = sqlite3BfCircularBufferAlloc(&pCache->cb, size);
+  }
+  return p;
 }
 
 /*

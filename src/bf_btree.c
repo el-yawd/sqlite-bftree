@@ -1043,6 +1043,8 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[10] = pBf ? pBf->nFullEvict : 0;
   aOut[11] = pBf ? pBf->nScanLeaves : 0;
   aOut[12] = pBf ? pBf->nScanPromote : 0;
+  aOut[13] = pBf ? pBf->nEvictBatches : 0;
+  aOut[14] = pBf ? pBf->nEvictBytes : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){

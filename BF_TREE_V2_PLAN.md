@@ -1323,6 +1323,8 @@ thrash the ring or point reads under-admit.
      this project has measured: **19% fewer device reads than stock, 1.17x throughput**.
   3. So the scan rate is a workload knob, as the reference makes it.  **Owner decision:** keep
      the faithful default 30 (best for scan-heavy) or default 0 (best for point-dominated mixes).
+  4. **Decided 2026-10-05 (owner): default stays 30**, the reference's.  `bf_scan_promotion=0`
+     is reported as the point-dominated-mix setting, not adopted as default.
 
 ### M4 — eviction batching
 *From: parity plan B5, handoff P6.*  **No longer blocked** — M1 landed, and the dirty head it

@@ -917,6 +917,11 @@ void sqlite3Pragma(
     sqlite3PragmaBfMinRecord(pParse, zDb, zRight);
     break;
   }
+  case PragTyp_BF_EVICT_TARGET: {
+    extern void sqlite3PragmaBfEvictTarget(Parse*, const char*, const char*);
+    sqlite3PragmaBfEvictTarget(pParse, zDb, zRight);
+    break;
+  }
   case PragTyp_BF_SCAN_PROMOTION: {
     extern void sqlite3PragmaBfScanPromotion(Parse*, const char*, const char*);
     sqlite3PragmaBfScanPromotion(pParse, zDb, zRight);
