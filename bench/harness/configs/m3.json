@@ -1,0 +1,151 @@
+{
+ "name": "m3",
+ "_comment": [
+  "M3 letter gate: per-leaf scan promotion (full pages at bf_scan_promotion, scans promote",
+  "no records -- ../bf-tree range_scan.rs) vs bf_noscan (pre-M3: scan rows promote records at",
+  "the read rate) vs stock.  Same budget/splits as m2.json.  QUOTE device reads/op under direct",
+  "I/O (dio.reads/ops, deterministic); throughput drifted 2x within results/m2.",
+  "  scan_zipfraw   32-row scans, contiguous zipf (H7/M2's reversed arm)",
+  "  mix_zipf       90% point reads + 10% scans, scrambled zipf: do scans still evict hot records?",
+  "  *_sweep        bf at scan_promotion 0 / 100, 32 MiB ring, direct I/O"
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "warmup_ops": 2000000,
+  "theta": 0.9,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "36M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10
+ },
+ "experiments": [
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "16M",
+   "axes": {
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "bf",
+    "bf_noscan"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M",
+     "32M"
+    ],
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "scan_zipfraw_sweep",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "bf"
+   ],
+   "ring_bytes": "32M",
+   "direct_io": true,
+   "axes": {
+    "scan_promotion": [
+     0,
+     100
+    ]
+   }
+  },
+  {
+   "name": "mix_zipf",
+   "workload": "read=90,scan=10",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 1000000,
+   "suts": [
+    "stock"
+   ],
+   "ring_bytes": "16M",
+   "axes": {
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "mix_zipf",
+   "workload": "read=90,scan=10",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 1000000,
+   "suts": [
+    "bf",
+    "bf_noscan"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M",
+     "32M"
+    ],
+    "direct_io": [
+     false,
+     true
+    ]
+   }
+  },
+  {
+   "name": "mix_zipf_sweep",
+   "workload": "read=90,scan=10",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 1000000,
+   "suts": [
+    "bf"
+   ],
+   "ring_bytes": "32M",
+   "direct_io": true,
+   "axes": {
+    "scan_promotion": [
+     0,
+     100
+    ]
+   }
+  }
+ ]
+}

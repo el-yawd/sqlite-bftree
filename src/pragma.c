@@ -917,6 +917,11 @@ void sqlite3Pragma(
     sqlite3PragmaBfMinRecord(pParse, zDb, zRight);
     break;
   }
+  case PragTyp_BF_SCAN_PROMOTION: {
+    extern void sqlite3PragmaBfScanPromotion(Parse*, const char*, const char*);
+    sqlite3PragmaBfScanPromotion(pParse, zDb, zRight);
+    break;
+  }
   case PragTyp_BF_PROMOTION_RATE: {
     extern void sqlite3PragmaBfPromotionRate(Parse*, const char*, const char*);
     sqlite3PragmaBfPromotionRate(pParse, zDb, zRight);

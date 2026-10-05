@@ -383,6 +383,8 @@ def build_argv(run, dbpath, jsonpath, page_floor):
             argv += ["--group-commit", str(run["group_commit"])]
         if run.get("promotion") is not None:
             argv += ["--promotion", str(run["promotion"])]
+        if run.get("scan_promotion") is not None:
+            argv += ["--scan-promotion", str(run["scan_promotion"])]
         if run.get("min_record") is not None:
             argv += ["--min-record", str(run["min_record"])]
         if run.get("copy_on_access") is not None:

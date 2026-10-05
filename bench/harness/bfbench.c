@@ -573,7 +573,8 @@ static void bfStatsRead(sqlite3 *db, BfStats *p){
 ** echoes like buffer_size must NOT be differenced. */
 static int bfStatIsCumulative(const char *z){
   static const char *az[] = {
-    "enabled", "buffer_size", "promotion_rate", "group_pending",
+    "enabled", "buffer_size", "promotion_rate", "scan_promotion_rate",
+    "group_pending",
     /* Live gauges (current state, not a running total): differencing these
     ** across a run would report nonsense such as a negative cache size. */
     "cb_capacity", "map_batches", "map_entries", "live_mini_pages", "cached_records",
@@ -622,6 +623,7 @@ typedef struct Config {
   const char *zJournal;
   int nGroupCommit;
   int nPromotion;
+  int nScanPromotion;      /* M3: PRAGMA bf_scan_promotion, -1 = build default */
   int nMinRecord;             /* PRAGMA bf_min_record; -1 leaves the default */
   int nCopyOnAccess;          /* PRAGMA bf_copy_on_access, percent; -1 = default */
   int bInsertReplace;         /* --insert-mode replace: INSERT OR REPLACE (upsert),
@@ -662,6 +664,7 @@ static void configDefaults(Config *p){
   p->zJournal = "wal";
   p->nGroupCommit = -1;
   p->nPromotion = -1;
+  p->nScanPromotion = -1;
   p->bfEnable = -1;
   p->nOpsPerTxn = 1;
   p->nAutoCheckpoint = -1;
@@ -1095,6 +1098,9 @@ static int cmdRun(Config *p){
   ** capacity, so it has to see the capacity this run actually wants. */
   if( p->nMinRecord > 0 )    execFmt(db, "PRAGMA bf_min_record=%d;", p->nMinRecord);
   if( p->nPromotion >= 0 )   execFmt(db, "PRAGMA bf_promotion_rate=%d;", p->nPromotion);
+  if( p->nScanPromotion >= 0 ){
+    execFmt(db, "PRAGMA bf_scan_promotion=%d;", p->nScanPromotion);
+  }
   /* A global the ring re-reads on every (re)initialisation, so its order
   ** relative to bf_cache_size / bf_min_record does not matter. */
   if( p->nCopyOnAccess >= 0 ) execFmt(db, "PRAGMA bf_copy_on_access=%d;", p->nCopyOnAccess);
@@ -1268,9 +1274,11 @@ static int cmdRun(Config *p){
           p->bfCacheBytes, p->pageCacheBytes);
   fprintf(out, "    \"synchronous\": \"%s\", \"journal_mode\": \"%s\", "
                "\"group_commit\": %d, \"promotion_rate\": %d, "
+               "\"scan_promotion\": %d, "
                "\"copy_on_access\": %d, \"min_record\": %d, "
                "\"insert_mode\": \"%s\",\n",
           p->zSync, p->zJournal, p->nGroupCommit, p->nPromotion,
+          p->nScanPromotion,
           p->nCopyOnAccess, p->nMinRecord,
           p->bInsertReplace ? "replace" : "plain");
   fprintf(out, "    \"ops_per_txn\": %d, \"seed\": %llu, "
@@ -1406,6 +1414,7 @@ static const char zUsage[] =
 "  --bf-cache-bytes N           --page-cache-bytes N\n"
 "  --synchronous off|normal|full  --journal wal|delete\n"
 "  --group-commit N             --promotion N    --bf-cache on|off\n"
+"  --scan-promotion N           per-leaf scan full-page rate (M3)\n"
 "  --copy-on-access N           PRAGMA bf_copy_on_access, percent of the ring\n"
 "  --insert-mode plain|replace  insert as INSERT (default) or INSERT OR REPLACE\n"
 "                               (reference cb_copy_on_access_ratio; -1 default)\n"
@@ -1455,6 +1464,9 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--journal")==0 ){ NEEDVAL; cfg.zJournal = zVal; }
     else if( strcmp(z,"--group-commit")==0 ){ NEEDVAL; cfg.nGroupCommit = atoi(zVal); }
     else if( strcmp(z,"--promotion")==0 ){ NEEDVAL; cfg.nPromotion = atoi(zVal); }
+    else if( strcmp(z,"--scan-promotion")==0 ){
+      NEEDVAL; cfg.nScanPromotion = atoi(zVal);
+    }
     else if( strcmp(z,"--min-record")==0 ){ NEEDVAL; cfg.nMinRecord = atoi(zVal); }
     else if( strcmp(z,"--copy-on-access")==0 ){ NEEDVAL; cfg.nCopyOnAccess = atoi(zVal); }
     else if( strcmp(z,"--insert-mode")==0 ){ NEEDVAL;

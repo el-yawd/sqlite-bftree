@@ -21,6 +21,7 @@
 **   PRAGMA bf_cache_size         - Get/set cache size
 **   PRAGMA bf_cache_stats        - Show cache statistics
 **   PRAGMA bf_promotion_rate     - Get/set read promotion rate
+**   PRAGMA bf_scan_promotion     - Get/set per-leaf scan (full page) rate
 **   PRAGMA bf_deferred_commit    - Bounded deferred durability window (N txns)
 **   PRAGMA bf_group_commit       - Old name of bf_deferred_commit, kept
 **   PRAGMA bf_min_record         - Size-class ladder base
@@ -41,6 +42,7 @@ typedef struct BfConfig {
   double copyOnAccessRatio;   /* Copy-on-access threshold (0.0-1.0) */
   int nGroupCommit;           /* Transactions per record-frame group (0/1=off) */
   int nMinRecord;             /* Size-class ladder base; see bf_min_record */
+  int nScanPromotion;         /* M3: per-leaf scan promotion rate (0-100) */
 } BfConfig;
 
 static BfConfig bfConfig = {
@@ -49,7 +51,8 @@ static BfConfig bfConfig = {
   BF_DEFAULT_PROMOTION_RATE,  /* see bf_cache.h for why 30 */
   BF_DEFAULT_COPY_ON_ACCESS,  /* 10% copy-on-access region */
   0,                          /* Group commit off: one flush per commit */
-  BF_DEFAULT_MIN_RECORD       /* ours, measured; the reference's default is 4 */
+  BF_DEFAULT_MIN_RECORD,      /* ours, measured; the reference's default is 4 */
+  BF_DEFAULT_SCAN_PROMOTION   /* the reference's scan_promotion_rate default */
 };
 
 /*
@@ -98,6 +101,18 @@ double sqlite3BfCacheCopyOnAccessRatio(void){
 int sqlite3BfCachePromotionRate(void){
   return bfConfig.nPromotionRate;
 }
+
+/*
+** M3: the scan promotion rate -- the chance, per leaf a range scan visits,
+** that the leaf is copied into the ring as a full page.  The reference's
+** scan_promotion_rate (config.rs:38, tree.rs:466, range_scan.rs:406/461/493),
+** distinct from the read rate.  See PRAGMA bf_scan_promotion.
+*/
+#if !defined(SQLITE_BF_NO_SCAN_PROMOTION)
+int sqlite3BfCacheScanPromotion(void){
+  return bfConfig.nScanPromotion;
+}
+#endif
 
 /*
 ** Implementation of PRAGMA bf_cache
@@ -219,6 +234,10 @@ void sqlite3PragmaBfCacheStats(
 
   sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "promotion_rate", P4_STATIC);
   sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nPromotionRate, 2);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+  sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "scan_promotion_rate", P4_STATIC);
+  sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nScanPromotion, 2);
   sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
 
   {
@@ -347,16 +366,16 @@ void sqlite3PragmaBfCacheStats(
         "buffered_updates", "update_fallbacks", "shadow_serves",
         "blind_inserts", "blind_no_leaf", "blind_refused", "probe_memo",
         "full_page_creates", "full_page_reads", "full_page_drops",
-        "full_page_evictions"
+        "full_page_evictions", "scan_leaves", "scan_promotions"
       };
-      u64 aUpd[11];
+      u64 aUpd[13];
       int iU;
       memset(aUpd, 0, sizeof(aUpd));
       if( pBt ){
         extern void sqlite3BfBtreeUpdateStat(Btree*, u64*);
         sqlite3BfBtreeUpdateStat(pBt, aUpd);
       }
-      for(iU=0; iU<11; iU++){
+      for(iU=0; iU<13; iU++){
         sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, azUpd[iU], P4_STATIC);
         sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&aUpd[iU], P4_INT64);
         sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
@@ -603,6 +622,38 @@ void sqlite3PragmaBfPromotionRate(
     if( rate < 0 ) rate = 0;
     if( rate > 100 ) rate = 100;
     bfConfig.nPromotionRate = rate;
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_scan_promotion  (M3)
+**
+** PRAGMA bf_scan_promotion;      -- Returns current per-leaf scan rate (0-100)
+** PRAGMA bf_scan_promotion = N;  -- Set it
+**
+** Rows a range scan reads never promote records (as in ../bf-tree, whose
+** scans promote PAGES only); instead each leaf the scan enters is copied in
+** as a full page with probability N%.  Inert under SQLITE_BF_NO_SCAN_PROMOTION
+** (scans then promote records at bf_promotion_rate, the pre-M3 behaviour).
+*/
+void sqlite3PragmaBfScanPromotion(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  UNUSED_PARAMETER(zDb);
+  if( zValue == 0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nScanPromotion, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_scan_promotion", SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    int rate = sqlite3Atoi(zValue);
+    if( rate < 0 ) rate = 0;
+    if( rate > 100 ) rate = 100;
+    bfConfig.nScanPromotion = rate;
   }
 }
 

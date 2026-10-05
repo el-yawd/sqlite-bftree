@@ -20,6 +20,7 @@
 #   bf_nocompact  -DSQLITE_BF_NO_MINIPAGE_COMPACT
 #   bf_shed       -DSQLITE_BF_UPGRADE_SHED        opt-in: upgrades shed cold records
 #   bf_nofull     -DSQLITE_BF_NO_FULL_PAGE        M2: no full-page (BF_LOC_FULL) copies
+#   bf_noscan     -DSQLITE_BF_NO_SCAN_PROMOTION   M3: scans promote records at the read rate
 #
 # Usage:
 #   sh bench/harness/build_suts.sh            # core variants (stock, bf, bf_ro)
@@ -96,6 +97,8 @@ if [ "$ALL" = 1 ]; then
   build_one bf_noblind    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_BLIND_INSERT"
   # M2 ablation (2026-10-03): leaves are never copied whole into the ring.
   build_one bf_nofull     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_FULL_PAGE"
+  # M3 ablation (2026-10-05): scan rows promote records (pre-M3), no per-leaf dice.
+  build_one bf_noscan     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_SCAN_PROMOTION"
 fi
 
 # bf_off is the same binary as bf; the runner passes --bf-cache off.

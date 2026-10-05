@@ -172,6 +172,8 @@ def metrics(r):
                                  if "full_page_reads" in bf and res.get("ops")
                                  else None),
         "bf_full_evictions": bf.get("full_page_evictions"),
+        # M3: per-leaf scan promotions (full pages created by a scan).
+        "bf_scan_promotions": bf.get("scan_promotions"),
         "read_errors": res.get("read_errors", 0) + res.get("read_misses", 0),
     }
 
@@ -354,20 +356,20 @@ def main():
             W("")
             W("| config | sut | ring MiB | cached recs | B/record | recs/page | "
               "evictions | upgrades | buffered% | rec frames/commit | "
-              "pg frames/commit | full creates | full reads/op | full evict |")
-            W("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+              "pg frames/commit | full creates | full reads/op | full evict | scan promos |")
+            W("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for ax, s, ms in det:
                 def med(metric, nd=1):
                     vs = [m[metric] for m in ms if m[metric] is not None]
                     return fmt(median(vs), nd) if vs else "-"
-                W("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                W("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
                     ax, s, med("bf_ring_MiB"), med("bf_cached_records", 0),
                     med("bf_bytes_per_record", 0), med("bf_records_per_page", 2),
                     med("bf_evictions", 0), med("bf_upgrades", 0),
                     med("bf_buffered_pct"), med("bf_record_frames_per_commit", 2),
                     med("bf_page_frames_per_commit", 2),
                     med("bf_full_creates", 0), med("bf_full_reads_per_op", 3),
-                    med("bf_full_evictions", 0)))
+                    med("bf_full_evictions", 0), med("bf_scan_promotions", 0)))
             # A "-" in these columns can mean the counter does not exist in
             # that build rather than that it read zero.  The space gauges
             # (cb_capacity, cached_records) and the record/page hit-rate split

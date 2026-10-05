@@ -898,8 +898,14 @@ static int btreeMoveto(
     }
     sqlite3DbFree(pCur->pKeyInfo->db, pIdxKey);
   }else{
+#ifndef SQLITE_OMIT_BF_CACHE
+    u8 bfScan = pCur->bfScan;    /* M3: a restore re-seek is not a point seek */
+#endif
     pIdxKey = 0;
     rc = sqlite3BtreeTableMoveto(pCur, nKey, bias, pRes);
+#ifndef SQLITE_OMIT_BF_CACHE
+    pCur->bfScan = bfScan;
+#endif
   }
   return rc;
 }
@@ -4929,6 +4935,8 @@ static int btreeCursor(
   pCur->bfAbsentLeaf = 0;
   pCur->bfAbsentKey = 0;
   pCur->bfAbsentGen = 0;
+  pCur->bfScan = 0;
+  pCur->bfScanLeaf = 0;
 #endif
   pCur->pKeyInfo = pKeyInfo;
   pCur->pBtree = p;
@@ -6230,6 +6238,8 @@ int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
 #ifndef SQLITE_OMIT_BF_CACHE
+  pCur->bfScan = 1;          /* M3: a full scan; see BtCursor.bfScan */
+  pCur->bfScanLeaf = 0;
   /* Forward full scans merge-iterate buffered inserts instead of flushing
   ** (Stage 2.2).  When merge is not armed, flush BF-buffered inserts BEFORE
   ** moveToRoot: if all rows are in the BF mini-page (base B-tree empty),
@@ -6357,6 +6367,10 @@ static SQLITE_NOINLINE int btreeLast(BtCursor *pCur, int *pRes){
 int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+#ifndef SQLITE_OMIT_BF_CACHE
+  pCur->bfScan = 1;          /* M3: a reverse full scan; see BtCursor.bfScan */
+  pCur->bfScanLeaf = 0;
+#endif
 
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
   /* Reverse merge scan (Stage 2.4): a read cursor on a rowid table iterates the
@@ -6590,6 +6604,9 @@ int sqlite3BtreeTableMoveto(
   assert( pRes );
   assert( pCur->pKeyInfo==0 );
   assert( pCur->eState!=CURSOR_VALID || pCur->curIntKey!=0 );
+#ifndef SQLITE_OMIT_BF_CACHE
+  pCur->bfScan = 0;          /* M3: a point seek; TableMovetoForScan re-arms */
+#endif
 
   /* If the cursor is already positioned at the point we are trying
   ** to move to, then just return without doing any work */
@@ -7098,7 +7115,28 @@ static int bfMergeSeekRev(BtCursor *pCur, i64 intKey, int *pRes){
 }
 #endif /* SQLITE_BF_INSERT_BUFFERING */
 
+static int btreeTableMovetoForScan(
+  BtCursor *pCur,
+  i64 intKey,
+  int biasRight,
+  int *pRes,
+  int bForward
+);
 int sqlite3BtreeTableMovetoForScan(
+  BtCursor *pCur,
+  i64 intKey,
+  int biasRight,
+  int *pRes,
+  int bForward
+){
+  int rc = btreeTableMovetoForScan(pCur, intKey, biasRight, pRes, bForward);
+#ifndef SQLITE_OMIT_BF_CACHE
+  pCur->bfScan = 1;          /* M3: rows read from here on are scan rows */
+  pCur->bfScanLeaf = 0;
+#endif
+  return rc;
+}
+static int btreeTableMovetoForScan(
   BtCursor *pCur,
   i64 intKey,
   int biasRight,

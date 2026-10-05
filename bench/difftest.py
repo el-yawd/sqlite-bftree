@@ -45,7 +45,7 @@ VARIANTS = {
     "base": [],
     "ring": ["PRAGMA bf_cache_size=262144;"],
     "group8": ["PRAGMA bf_group_commit=8;"],
-    "promo100": ["PRAGMA bf_promotion_rate=100;"],
+    "promo100": ["PRAGMA bf_promotion_rate=100;", "PRAGMA bf_scan_promotion=100;"],
 }
 NOPS = int(os.environ.get("NOPS", "4000"))
 

@@ -589,6 +589,13 @@ struct BtCursor {
   Pgno bfAbsentLeaf;
   i64 bfAbsentKey;
   u64 bfAbsentGen;
+  /* M3 scan promotion (2026-10-05): the cursor was positioned by a range entry
+  ** point (TableMovetoForScan, First, Last) and has not point-seeked since, so
+  ** the rows it reads are SCAN rows.  As in ../bf-tree (range_scan.rs), those
+  ** never promote records; each leaf the scan enters (bfScanLeaf = the last one
+  ** it rolled for) may instead become a full page.  SQLITE_BF_NO_SCAN_PROMOTION. */
+  u8 bfScan;
+  Pgno bfScanLeaf;
 #endif
   i8 iPage;                 /* Index of current page in apPage */
   u8 curIntKey;             /* Value of apPage[0]->intKey */

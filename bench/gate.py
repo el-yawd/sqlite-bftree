@@ -92,7 +92,7 @@ def main():
     if full:
         crash = [("default", "", range(1, 41)), ("ring", 'BF_PRAGMAS="PRAGMA bf_cache_size=262144;"', range(1, 31)),
                  ("group8", "BF_GROUP=8", range(1, 41)),
-                 ("promo100", 'BF_PRAGMAS="PRAGMA bf_promotion_rate=100;"', range(41, 61)),
+                 ("promo100", 'BF_PRAGMAS="PRAGMA bf_promotion_rate=100; PRAGMA bf_scan_promotion=100;"', range(41, 61)),
                  ("debug", f"BUF={DBG}", range(1, 9))]
         shard = 5
     else:

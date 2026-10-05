@@ -122,6 +122,9 @@ typedef struct BfFreeList BfFreeList;
 ** is promoted too.  30 keeps most of the win.  PRAGMA bf_promotion_rate tunes
 ** it per connection. */
 #define BF_DEFAULT_PROMOTION_RATE 30              /* 30% read promotion rate */
+/* M3: per-leaf scan promotion (full page) rate; the reference's default for
+** scan_promotion_rate is the same 30 as its read rate (config.rs:23,130). */
+#define BF_DEFAULT_SCAN_PROMOTION 30
 /* Upper bound on PRAGMA bf_group_commit: how many transactions may share one
 ** open record batch before it is forced out to the WAL.  A crash loses at most
 ** this many committed transactions, so keep it small enough to stay a
@@ -609,6 +612,8 @@ struct BfCache {
   u64 nFullRead;            /* pager page reads served from a full page */
   u64 nFullDrop;            /* full pages invalidated (write, free, truncate) */
   u64 nFullEvict;           /* full pages reclaimed by the FIFO sweep */
+  u64 nScanLeaves;          /* M3: leaves a range scan entered (dice rolled) */
+  u64 nScanPromote;         /* M3: of those, copied in as a full page */
   u64 nCopyOnAccess;        /* Mini-pages relocated to the tail on a read hit
                             ** (the second chance; PRAGMA bf_copy_on_access) */
   u64 nCopyOnAccessShed;    /* Cold cache records dropped by those relocations */
@@ -950,6 +955,9 @@ SQLITE_PRIVATE int sqlite3BfBtreeApplyDelete(Pager *pPager, Pgno pgno,
 SQLITE_PRIVATE int sqlite3BfCacheEnabled(void);
 SQLITE_PRIVATE u64 sqlite3BfCacheBufferSize(void);
 SQLITE_PRIVATE int sqlite3BfCachePromotionRate(void);
+#if !defined(SQLITE_BF_NO_SCAN_PROMOTION)
+SQLITE_PRIVATE int sqlite3BfCacheScanPromotion(void);
+#endif
 
 /*
 ** Per-pager cache management (P0.3).

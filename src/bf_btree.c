@@ -1041,6 +1041,8 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[8] = pBf ? pBf->nFullRead : 0;
   aOut[9] = pBf ? pBf->nFullDrop : 0;
   aOut[10] = pBf ? pBf->nFullEvict : 0;
+  aOut[11] = pBf ? pBf->nScanLeaves : 0;
+  aOut[12] = pBf ? pBf->nScanPromote : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){
@@ -2346,8 +2348,55 @@ int sqlite3BfBtreeMaterializeLeaf(BtCursor *pCur){
 */
 
 /*
+** M3 -- scan promotion (2026-10-05).  A row read by a range scan promotes no
+** record: ../bf-tree's scans promote PAGES only (range_scan.rs:406/461/493,
+** each guarded by should_promote_scan_page, tree.rs:466), at
+** scan_promotion_rate, separate from the read rate.  Before this, every row a
+** 32-row scan read was a read-promotion candidate, so scans filled the ring
+** with records no point read asked for (results/dio: 182k-442k evictions at a
+** 0% seek-hit rate).
+**
+** Here: the first row a scan reads on a leaf rolls the scan dice once for that
+** leaf, and on success the clean leaf is copied in as a full page (M2), which
+** the pager then serves on the leaf's next pcache miss.  A leaf with buffered
+** records is left alone (sqlite3BfFullPageCreate refuses a dirty mini-page; the
+** reference would merge it first, which a read transaction may not do here).
+** Without full pages (SQLITE_BF_NO_FULL_PAGE) a scan promotes nothing, as in
+** the reference with no full-page support.  SQLITE_BF_NO_SCAN_PROMOTION
+** restores the old behaviour: scan rows promote records at the read rate.
+*/
+#if !defined(SQLITE_BF_NO_SCAN_PROMOTION)
+static void bfScanPromoteLeaf(BtCursor *pCur, BfCache *pBf){
+  MemPage *pLeaf = pCur->pPage;
+  int rate;
+  if( !pLeaf || !pLeaf->leaf || !pLeaf->intKey ) return;
+  if( pLeaf->pgno==pCur->bfScanLeaf ) return;     /* rolled for this leaf */
+  pCur->bfScanLeaf = pLeaf->pgno;
+  pBf->nScanLeaves++;
+  rate = sqlite3BfCacheScanPromotion();
+  if( rate<=0 ) return;
+  if( rate<100 ){
+    u32 r = pBf->promoteRng ? pBf->promoteRng : 0x9E3779B9u;
+    r ^= r<<13; r ^= r>>17; r ^= r<<5;            /* xorshift32 */
+    pBf->promoteRng = r;
+    if( (r%100)>=(u32)rate ) return;
+  }
+  /* Same rule as the M2 trigger below: copy only a page equal to what the
+  ** pager would read back. */
+  if( pLeaf->pDbPage->flags & (PGHDR_WRITEABLE|PGHDR_DIRTY) ) return;
+  {
+    u64 nBefore = pBf->nFullCreate;
+    (void)sqlite3BfFullPageCreate(pBf, pLeaf->pgno, pCur->pgnoRoot,
+                                  pLeaf->aData);
+    if( pBf->nFullCreate!=nBefore ) pBf->nScanPromote++;
+  }
+}
+#endif
+
+/*
 ** Promote a record read from the base page into the BF cache (BFOP_CACHE).
-** Probabilistic — governed by promotionRate.
+** Probabilistic — governed by promotionRate.  A scan row goes to
+** bfScanPromoteLeaf instead (M3).
 */
 int sqlite3BfBtreePromoteRecord(
   BtCursor *pCur,
@@ -2370,6 +2419,12 @@ int sqlite3BfBtreePromoteRecord(
   pBt = pCur->pBt;
   pBf = btreeGetBfCache(pBt);
   if( !pBf ) return SQLITE_OK;
+#if !defined(SQLITE_BF_NO_SCAN_PROMOTION)
+  if( pCur->bfScan ){
+    bfScanPromoteLeaf(pCur, pBf);
+    return SQLITE_OK;
+  }
+#endif
 
   /* Read the rate from the one place PRAGMA bf_promotion_rate writes it.
   **
