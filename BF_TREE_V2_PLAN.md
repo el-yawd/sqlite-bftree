@@ -1085,10 +1085,36 @@ The reference's read-side trigger, in the same ring as records, served at the pa
 - `bench/gen_fullpage_stress.py` (in difftest `BUF_GENS` and `stress_buf.sh`): hot-leaf
   promotion under a tiny pcache, then every way a leaf changes -- txn / rollback / savepoint,
   splits, page reuse via DROP+CREATE, VACUUM, checkpoints -- at 1 KiB and 4 KiB pages.
-- [ ] **Campaign** (the M2 letter gate): dio-style, direct_io true/false; bf vs bf_nofull vs
+- [x] **Campaign** (the M2 letter gate): dio-style, direct_io true/false; bf vs bf_nofull vs
       stock; rings 4/16/32 MiB; zipf + zipf-raw point arms and the scan arm; warmup in ops;
       shuffled.  Question: does it recover H7's clustered-read and scan reversal without
       costing scrambled reads?
+- **`results/m2` (2026-10-05, `e61864f`, 84/84, 209 min, `--shuffle 7`, every direct run proven).**
+  **Throughput is NOT quotable from this campaign:** device wait per direct read stepped from
+  ~72 us (runs 0-38) to ~135 us (runs 39-83) and CPU/op drifted with it (powersave laptop);
+  bf and bf_nofull are behaviourally identical on scrambled zipf (0 full pages, same hit rate,
+  same reads) yet differ up to 1.7x in ops/s.  What IS quotable: **device reads per op under
+  direct I/O**, identical across repeats to 3 decimals (pcache misses minus full-page reads):
+
+  | arm (direct) | stock | ring 4M bf / nofull | ring 16M bf / nofull | ring 32M bf / nofull | full-page reads/op at 32M |
+  |---|---|---|---|---|---|
+  | point, scrambled zipf | 0.644 | 0.577 / 0.577 | 0.489 / 0.489 | 0.442 / 0.442 | 0 (no full pages made) |
+  | point, contiguous zipf | 0.375 | 0.389 / 0.389 | 0.409 / 0.421 | **0.453 / 0.478** | 0.178 |
+  | 32-row scan, contiguous | 0.698 | 0.724 / 0.724 | 0.804 / 0.830 | **0.943 / 1.232** | 0.289 |
+
+  1. **Scrambled reads: no cost**, by construction -- no leaf ever reaches the trigger.
+     BF still reads 1.46x fewer device pages than stock at 32M (H7's win, replicated in bytes).
+  2. **Scans: M2 recovers most of what the ring took** at 32M (-23% device reads vs nofull),
+     but BF is still 1.35x stock.  The rest is scan promotion itself -- M3.
+  3. **Clustered point reads: a small recovery** (-5% at 32M, -3% at 16M); BF stays 1.21x
+     stock at 32M.  Full pages replace the hot records instead of adding to them: record
+     hit 54% -> 4% and cached_records 175k -> 126k, so the leaf now comes back through the pager
+     (pcache miss -> memcpy) instead of the descent shortcut.  At 4M the ring churns full pages
+     before any reuse (1094 creates, 0 reads), a pure displacement with no device effect
+     because the 32 MiB pcache holds those leaves anyway.
+  4. **Verdict:** M2 is a partial recovery, not a closing of H7's reversal: the remaining gap is
+     a fixed pcache too small to hold the hot leaves (4 MiB at 32+4) plus scan promotion.
+     A throughput figure needs a re-run on a quiet, `performance`-governor machine (owner).
 
 ### P1 — the point-read CPU path (M2's residual gap) — **profiled 2026-10-01; 3 accidents fixed, 1 correctness bug**
 *Named "H2" in commits `86229da` and `5a04bdb` and in two §9 entries of 2026-10-01; renamed P1
@@ -2322,3 +2348,18 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - S1 note added: two connections writing one file diverge from stock with or without M2.
 - `gate.py --full` GREEN 51/51 (difftest 1797/1797); quick gate re-run after the repro's path
   fix GREEN 13/13.  Committed `2698253`.  Next: the M2 campaign (M2 item checkbox).
+
+### 2026-10-05 — Claude Opus 5.5 — M2 letter-gate campaign started
+
+- `e61864f`: `configs/m2.json` (= `dio.json` arms, budget, splits and op-count warmup, with
+  `bf_nofull` beside `bf`; 84 runs, `--shuffle 7`, ~3 h) + `m2_smoke.json`; `report.py` gains
+  `full creates / full reads/op / full evict` columns.  SUTs rebuilt from a clean tree (the
+  `bin/` set predated M2).
+- `m2_smoke` (direct I/O, 32 MiB ring, NOT quotable): scrambled zipf 0 full pages (stays
+  records, as designed); zipf-raw 226 creates, 0.055 full-page reads/op; 32-row scans 3391
+  creates, 0.29 reads/op, and bf 7.1k vs bf_nofull 5.4k vs stock 9.5k ops/s.
+- `results/m2` done (84/84, 209 min).  Throughput unquotable (device latency stepped ~72 -> ~135
+  us/read at run 39; CPU/op drifted); device reads/op are deterministic and answer the question:
+  full pages cost scrambled reads nothing, cut scan device reads 23% at a 32 MiB ring, and
+  clustered point reads only 5%; BF stays above stock on both clustered arms (1.21x / 1.35x
+  reads).  Detail in the M2 item.  Next candidate: M3 (scan promotion), owner to rank.
