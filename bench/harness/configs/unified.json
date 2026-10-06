@@ -1,0 +1,152 @@
+{
+ "name": "unified",
+ "_comment": [
+  "Unified pool vs the split design vs stock (2026-10-05).  Direct I/O, 32 MiB budget.",
+  "  stock          32 MiB page cache (+64 KiB: the unified cells' token page store)",
+  "  bf split16/4   ring 16 / 4 MiB, page cache the rest (today's design)",
+  "  bf unified     ring = 32 MiB, leaves ONLY in the ring; page 1 + interior pages",
+  "                 resident OUTSIDE the budget (~1.2 MiB here; owner decision, as the",
+  "                 reference's inner nodes), 16-page store for anything else.",
+  "QUOTE device reads/op (dio.reads/ops).  Scan throughput is clean since 24d7ada."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "warmup_ops": 2000000,
+  "theta": 0.9,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true
+ },
+ "experiments": [
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock"
+   ],
+   "unified_pool": true
+  },
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M"
+    ]
+   }
+  },
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "unified_pool": true
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock"
+   ],
+   "unified_pool": true
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M"
+    ]
+   }
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "unified_pool": true
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "stock"
+   ],
+   "unified_pool": true
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "ring_bytes": [
+     "4M",
+     "16M"
+    ]
+   }
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "scan_len": 32,
+   "warmup_ops": 300000,
+   "suts": [
+    "bf"
+   ],
+   "unified_pool": true
+  }
+ ]
+}
