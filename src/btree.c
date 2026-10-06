@@ -10906,6 +10906,26 @@ int sqlite3BtreeInsert(
       int wasOnMini = pCur->bfOnMini;
       bfrc = sqlite3BfBtreeUpdateCell(pCur, pX->nKey, pX->pData, pX->nData);
       if( bfrc==SQLITE_FULL && !wasOnMini ){
+        /* Item 3: the same merge-on-eviction relief the insert path has.  A
+        ** refusal here is usually a ring wedged behind a DIRTY slab; merge it,
+        ** re-seek (the merge replays through its own cursor and can
+        ** rebalance) and retry once. */
+        if( sqlite3BfBtreeRelieveEvictStall(pCur) ){
+          rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
+          if( rc ) return rc;
+          if( loc==0 && pCur->eState==CURSOR_VALID && pCur->pPage
+           && pCur->pPage->leaf && !pCur->bfOnMini ){
+            bfrc = sqlite3BfBtreeUpdateCell(pCur, pX->nKey, pX->pData,
+                                            pX->nData);
+            if( bfrc==SQLITE_OK ){
+              sqlite3BfBtreeNoteDirtyEvictRetry(pCur);
+              pCur->eState = CURSOR_INVALID;
+              pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+              return SQLITE_OK;
+            }
+            if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+          }
+        }
         goto bf_update_declined;      /* base cell, nothing buffered: as before */
       }
       if( bfrc==SQLITE_OK ){

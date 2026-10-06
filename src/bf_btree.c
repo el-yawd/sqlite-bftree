@@ -1051,6 +1051,8 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[18] = pBf ? pBf->nCoaFullAllocFail : 0;
   aOut[19] = pBf ? pBf->nPoolLeafDiscard : 0;
   aOut[20] = pBf ? (u64)sqlite3BfCacheRetainedPages(pBf) : 0;
+  aOut[21] = pBf ? pBf->nAllocFail : 0;
+  aOut[22] = pBf ? (u64)pBf->nDirtyPg : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){
@@ -1865,78 +1867,82 @@ int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur){
   return 0;
 #else
   BfCache *pBf;
-  BfMapEntry *pEntry;
-  BfMiniPage *pMini;
-  u32 pgnoStall;
+  int nMerged;
 
   if( !pCur || !pCur->pBt || !pCur->pBtree ) return 0;
   pBf = btreeGetBfCache(pCur->pBt);
   if( !pBf || pBf->pgnoEvictStall==0 ) return 0;
 
-  /* Take and clear the stall up front: every path below must consume it, or a
-  ** leaf we cannot flush would be retried on every single insert. */
-  pgnoStall = pBf->pgnoEvictStall;
-  pBf->pgnoEvictStall = 0;
-
   /* bfFlushOneMiniPage writes base pages, so it needs a write transaction, and
   ** it must not run inside another flush replay or a merge scan. */
   if( pCur->pBtree->inTrans!=TRANS_WRITE
    || pBf->bBypassActive || pBf->bMergingActive ){
+    pBf->pgnoEvictStall = 0;
     pBf->nDirtyEvictRefused++;
     return 0;
   }
 
-  pEntry = sqlite3BfMapLookup(pBf, pgnoStall);
-  if( pEntry==0 || pEntry->locType!=BF_LOC_MINI || pEntry->pPage==0 ){
-    return 0;                       /* already reclaimed or re-pointed */
-  }
-  pMini = (BfMiniPage*)pEntry->pPage;
-  if( !sqlite3BfMiniPageIsDirty(pMini) ) return 0;   /* flushed meanwhile */
-
-  /* The slab the caller is mid-copy of must never be flushed out from under it
-  ** (same hazard pEvictProtect exists for). */
-  if( (void*)pMini == pBf->pEvictProtect ) return 0;
-
-  /* Do not flush the leaf the cursor is about to buffer INTO: that writes its
-  ** records to base and then immediately dirties it again.  M1 exists to
-  ** unstick the ring when it is wedged behind SOME OTHER leaf.
+  /* Item 3 (2026-10-06): merge on eviction, as ../bf-tree does.  Its eviction
+  ** callback merges a dirty mini-page into its base leaf and moves on
+  ** (tree.rs:1543-1602, try_merge_mini_page); ours cannot -- evictCallback has
+  ** no Btree and runs inside the allocator -- so it records the leaf that
+  ** stopped the sweep and the write path merges it here, where there is a
+  ** cursor and a write transaction.  ONE leaf per stall, like the reference,
+  ** not the whole table (the M1 version flushed the stalled leaf's TABLE: on a
+  ** single-table update workload that materialised every buffered row at every
+  ** stall).  After each merge the sweep runs again, and a run of dirty slabs at
+  ** the head is merged leaf by leaf, up to BF_EVICT_MERGE_MAX.
   **
-  ** This is an efficiency choice, NOT a correctness one.  It began as a
-  ** workaround: the same-leaf case lost an INSERT outright, with
-  ** sqlite3BfRecordWrite returning BF_OK and sqlite3BfRecordRead returning
-  ** BF_NOT_FOUND for the same key one instruction later.  The cause was a
-  ** PRE-EXISTING bug this path merely reached first — evictCallback ignored
-  ** pEvictProtect — and it is fixed at its root in bf_cache.c.  The workload
-  ** is byte-identical to stock with or without this guard now. */
-  if( pgnoStall==bfCursorLeafPgno(pCur) ){
-    pBf->nDirtyEvictRefused++;
-    return 0;
-  }
+  ** Measured before this change (results/dirty_probe, update=100, unified pool,
+  ** 32 MiB): 24,101 stalled sweeps, 24,053 allocations with no room and 9,141
+  ** update fallbacks to page writes -- the relief was wired to the INSERT path
+  ** only, so buffered UPDATEs (D3) never reached it. */
+  for(nMerged=0; nMerged<BF_EVICT_MERGE_MAX; ){
+    BfMapEntry *pEntry;
+    BfMiniPage *pMini;
+    u32 pgnoStall = pBf->pgnoEvictStall;
 
-  /* WAL v2 restores rootPgno during recovery. Keep this guard as corruption
-  ** containment: a replay cursor must never open on an unknown root, since
-  ** treating the owner leaf as a root creates a nested malformed B-tree when
-  ** that leaf splits. Count refusals so an invalid recovery root is visible. */
-  if( pMini->rootPgno<=1 ){
-    pBf->nDirtyEvictRefused++;
-    return 0;
+    pBf->pgnoEvictStall = 0;        /* every path below consumes the stall */
+    if( pgnoStall==0 ) break;
+    pEntry = sqlite3BfMapLookup(pBf, pgnoStall);
+    if( pEntry==0 || pEntry->locType!=BF_LOC_MINI || pEntry->pPage==0 ) break;
+    pMini = (BfMiniPage*)pEntry->pPage;
+    if( !sqlite3BfMiniPageIsDirty(pMini) ) break;           /* flushed meanwhile */
+    /* The slab a caller is mid-copy of must never be flushed out from under
+    ** it (same hazard pEvictProtect exists for). */
+    if( (void*)pMini == pBf->pEvictProtect ) break;
+    /* Not the leaf the cursor is about to buffer INTO: merging it only to
+    ** re-dirty it at once is self-defeating (efficiency, not correctness). */
+    if( pgnoStall==bfCursorLeafPgno(pCur) ){
+      pBf->nDirtyEvictRefused++;
+      break;
+    }
+    /* WAL v2 restores rootPgno during recovery; keep the guard as corruption
+    ** containment -- a replay cursor must never open on an unknown root. */
+    if( pMini->rootPgno<=1 ){
+      pBf->nDirtyEvictRefused++;
+      break;
+    }
+    if( bfFlushOneMiniPage(pBf, pCur->pBtree, (Pgno)pMini->rootPgno, pMini)
+          !=SQLITE_OK ){
+      pBf->nDirtyEvictRefused++;
+      break;
+    }
+    /* Re-look-up: the replay may have rebalanced and re-pointed the entry. */
+    pEntry = sqlite3BfMapLookup(pBf, pgnoStall);
+    if( pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage
+     && sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage) ){
+      pBf->nDirtyEvictRefused++;      /* nothing applied; still stuck */
+      break;
+    }
+    nMerged++;
+    pBf->nDirtyEvictFlush++;
+    /* Let the sweep advance past the now-clean slab; a further dirty slab
+    ** behind it sets a new stall and is merged on the next iteration. */
+    (void)sqlite3BfCacheEvict(pBf, BF_EVICT_BATCH_MAX_ENTRIES);
   }
-
-  /* Flush the stalled leaf's whole TABLE, not just that one leaf.
-  **
-  ** Measured, 12 tables interleaved under a 256 KiB ring: flushing the single
-  ** leaf relieved 52 stalls but rescued only 4 inserts.  The reason is that the
-  ** ring head holds a RUN of dirty slabs from the other tables, so cleaning one
-  ** lets the sweep advance exactly one slab and stall on the next.  Flushing the
-  ** table clears the run, which is also what the fallback path already does for
-  ** the cursor's own table (sqlite3BfBtreeFlushTableForMutation) -- this is the
-  ** same move applied to the table that actually blocked the ring. */
-  if( bfFlushTableDirty(pBf, pCur->pBtree, (Pgno)pMini->rootPgno)<=0 ){
-    pBf->nDirtyEvictRefused++;      /* nothing applied; still stuck */
-    return 0;
-  }
-  pBf->nDirtyEvictFlush++;
-  return 1;
+  pBf->pgnoEvictStall = 0;
+  return nMerged>0;
 #endif
 }
 

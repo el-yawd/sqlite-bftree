@@ -2543,3 +2543,23 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Gate `--full` GREEN 51/51 with the pool as default (difftest 1797/1797); quick gate re-run
   after the bf_ro compile guard GREEN 13/13.  All ablation variants compile.
 - Parity matrix (§3.3) updated: full pages (read side), scan promotion, eviction batching done.
+
+### 2026-10-06 (cont.) — Claude Opus 5.5 — item 3: merge-on-eviction for dirty mini-pages
+
+- Reference: `eviction_callback` (`tree.rs:1543-1602`) merges a dirty mini-page into its base leaf
+  (`try_merge_mini_page`) -- eviction never refuses.  Ours refused and stopped the sweep; M1's
+  relief merged from the INSERT path only, by flushing the stalled leaf's whole TABLE.
+- Probe first (`results/dirty_probe`, unified pool, direct I/O, 32 MiB, 1 run each; new gauges
+  `alloc_fails`, `dirty_list_pages`): update=100 -> 24,101 stalled sweeps, 24,053 allocations
+  with no room, 9,141 update fallbacks (6.3%), 0 relief -- buffered UPDATEs (D3) never reached
+  it.  Inserts: 71 stalls.  Read/update mixes never filled the ring within the run.
+- Change: `sqlite3BfBtreeRelieveEvictStall` merges ONE stalled leaf (`bfFlushOneMiniPage`), as the
+  reference does, re-sweeps, and merges the next dirty head, up to `BF_EVICT_MERGE_MAX` = 16;
+  the UPDATE refusal path now calls it (merge, re-seek, retry once) like inserts.
+  Switch unchanged: `SQLITE_BF_NO_DIRTY_EVICT`.
+- `results/dirty_probe2`: update=100 stalls 24,101 -> 286, alloc fails 24,053 -> 227, update
+  fallbacks 9,141 -> 63; 68 leaves merged, 63 retries succeeded; page frames/commit unchanged
+  (0.86).  Inserts unaffected (44 stalls).  ops/s not quotable (single unpaired runs; both arms
+  moved, the untouched insert arm included).
+- Open: read-only transactions cannot merge (needs a write txn); whether reads meet a dirty head
+  in practice is unmeasured -- the mixes never filled the ring.  Gate `--full` GREEN 51/51.

@@ -131,6 +131,8 @@ typedef struct BfFreeList BfFreeList;
 #define BF_DEFAULT_EVICT_TARGET 1024
 #define BF_EVICT_BATCH_MAX_ENTRIES 10
 #define BF_LEGACY_EVICT_ENTRIES 16
+/* Item 3: most dirty leaves one stalled write merges to unstick the ring. */
+#define BF_EVICT_MERGE_MAX 16
 /* Upper bound on PRAGMA bf_group_commit: how many transactions may share one
 ** open record batch before it is forced out to the WAL.  A crash loses at most
 ** this many committed transactions, so keep it small enough to stay a
@@ -529,6 +531,8 @@ struct BfCache {
   u64 nCoaAllocFail;        /* ... whose second-chance copy found no room (skipped) */
   u64 nCoaFullAttempt;      /* the same two, full pages only */
   u64 nPoolLeafDiscard;     /* unified pool: table leaves dropped at unpin */
+  u64 nAllocFail;           /* ring allocations that found no room even after
+                            ** evicting (empty ring, dirty head, protected) */
   u64 nCoaFullAllocFail;
   u64 nUpgrades;            /* Mini-page size upgrades */
   u64 nMergeScans;          /* Forward scans that armed merge-iteration (2.2) */

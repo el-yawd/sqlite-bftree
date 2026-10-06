@@ -1666,6 +1666,7 @@ static void *bfAllocEvicting(BfCache *pCache, u32 size){
   while( !p && bfEvictBatch(pCache, nTarget)>0 ){
     p = sqlite3BfCircularBufferAlloc(&pCache->cb, size);
   }
+  if( !p ) pCache->nAllocFail++;
   return p;
 }
 

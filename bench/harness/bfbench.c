@@ -574,7 +574,7 @@ static void bfStatsRead(sqlite3 *db, BfStats *p){
 static int bfStatIsCumulative(const char *z){
   static const char *az[] = {
     "enabled", "buffer_size", "promotion_rate", "scan_promotion_rate",
-    "evict_target", "pool_retained_pages",
+    "evict_target", "pool_retained_pages", "dirty_list_pages",
     "group_pending",
     /* Live gauges (current state, not a running total): differencing these
     ** across a run would report nonsense such as a negative cache size. */
