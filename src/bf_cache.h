@@ -525,6 +525,10 @@ struct BfCache {
                             ** nEvictions; the reported entry count is
                             ** cb.nEvictions) */
   u64 nEvictBatches;        /* M4: eviction batches (alloc-failure rounds) */
+  u64 nCoaAttempt;          /* accessed slabs found in the copy-on-access region */
+  u64 nCoaAllocFail;        /* ... whose second-chance copy found no room (skipped) */
+  u64 nCoaFullAttempt;      /* the same two, full pages only */
+  u64 nCoaFullAllocFail;
   u64 nUpgrades;            /* Mini-page size upgrades */
   u64 nMergeScans;          /* Forward scans that armed merge-iteration (2.2) */
   u64 nMergeInserts;        /* Buffered inserts emitted by merge-iteration */

@@ -9,11 +9,12 @@ fp`.  Warmup is recorded too -- it is the same workload; pass --warmup-ops to
 shorten it.
 
   python3 bench/tools/profile_arm.py RESULTS.jsonl INDEX BINARY OUTDIR \
-      [--seconds 20] [--warmup-ops N] [--set FLAG=VALUE ...]
+      [--seconds 20] [--warmup-ops N] [--set=FLAG=VALUE ...]
 
   INDEX   0-based line of results.jsonl to replay
   BINARY  frame-pointer bfbench build (build_suts.sh --profile, or by hand)
-  --set   override/add a bfbench flag, e.g. --set --evict-target=0
+  --set   override/add a bfbench flag, e.g. --set=--evict-target=0 (the "=" is
+          required: argparse would read a bare "--evict-target=0" as its own option)
 
 Writes OUTDIR/{perf.data, flame.svg, self.txt, callers.txt, run.json}.
 kernel.perf_event_paranoid=2 here: user-space samples only.

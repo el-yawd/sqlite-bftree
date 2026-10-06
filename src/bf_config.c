@@ -383,16 +383,18 @@ void sqlite3PragmaBfCacheStats(
         "blind_inserts", "blind_no_leaf", "blind_refused", "probe_memo",
         "full_page_creates", "full_page_reads", "full_page_drops",
         "full_page_evictions", "scan_leaves", "scan_promotions",
-        "evict_batches", "evicted_bytes"
+        "evict_batches", "evicted_bytes",
+        "coa_attempts", "coa_alloc_fails", "coa_full_attempts",
+        "coa_full_alloc_fails"
       };
-      u64 aUpd[15];
+      u64 aUpd[19];
       int iU;
       memset(aUpd, 0, sizeof(aUpd));
       if( pBt ){
         extern void sqlite3BfBtreeUpdateStat(Btree*, u64*);
         sqlite3BfBtreeUpdateStat(pBt, aUpd);
       }
-      for(iU=0; iU<15; iU++){
+      for(iU=0; iU<19; iU++){
         sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, azUpd[iU], P4_STATIC);
         sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&aUpd[iU], P4_INT64);
         sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);

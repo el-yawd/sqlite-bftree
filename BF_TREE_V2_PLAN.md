@@ -1332,7 +1332,58 @@ was supposed to be blocked by turns out not to arise on the write path at all.  
 at three call sites — a fixed **16 entries**.  The reference accumulates toward
 `TARGET_EVICT_SIZE = 1024` **bytes** with a retry cap of 10 (`tree.rs:1012-1018`).
 
-- [ ] byte-target sweep + retry cap, `SQLITE_BF_NO_EVICT_BATCH`
+- [x] byte-target sweep + retry cap -- **built 2026-10-05, `a23720e`, gate GREEN 51/51.**
+  `bfAllocEvicting` (bf_cache.c): a failed ring alloc evicts one entry at a time until
+  `PRAGMA bf_evict_target` bytes (default 1024 = `TARGET_EVICT_SIZE`) or 10 entries, then retries,
+  looping until it fits or a batch reclaims nothing -- the reference's caller loops
+  (`tree.rs:1097-1102, 1164-1170, 1214-1220`).  All four alloc sites.  Ablation is the pragma:
+  `bf_evict_target=0` = the pre-M4 16-entry sweep + one retry (no `SQLITE_BF_NO_*` needed).
+  Counters `evict_batches`, `evicted_bytes` (the old `pCache->nEvictions` summed bytes and was read
+  by nothing; reported `evictions` was always `cb.nEvictions`, entries).
+- **`results/m4` -- STOPPED by the owner at 21/24 runs (2026-10-05)**; `read_zipf` 1024 and
+  `read_zipfraw` 0 / 1024 have one repeat.  Direct I/O, 32 MiB ring, every run proven (3-4
+  resident pages); device wait 69-80 us/read throughout, so throughput is usable this time.
+  Device reads/op (ops/s), target 0 (pre-M4) / 1024 (default) / 4096:
+
+  | arm | stock | 0 | 1024 | 4096 |
+  |---|---|---|---|---|
+  | point, scrambled zipf | 0.644 (15.0k) | 0.443 (20.9k) | 0.444 (20.5k) | 0.443 (20.8k) |
+  | point, contiguous zipf | 0.375 (26.1k) | **0.454 (20.7k)** | **0.494 (19.0k)** | 0.469 (20.0k) |
+  | 32-row scans | 0.698 (9.9k) | **0.844 (8.2k)** | **0.876 (8.0k)** | 0.876 (7.9k) |
+
+  1. **Scrambled point reads: neutral** -- same reads, hit 56.5%, cached records +5% at 1024
+     (167k vs 159k) buying nothing.  BF is 1.39x stock here (vs 1.49x in `results/dio`).
+  2. **Clustered point reads and scans: the reference-faithful batching costs reads** --
+     +9% (single repeat each, but 4096's two repeats sit between, 0.469/0.468) and +4%.
+     What moves: full-page reads/op fall (zipf-raw 0.179 -> 0.123; scans 0.388 -> 0.356) while
+     records rise (125k -> 142k).  On scans every batch is exactly one entry (a full page is
+     > 1 KiB), so evict_batches == evictions.
+  3. **Mechanism NOT established.**  Pre-M4 evicts MORE entries in total (scans 123k vs 111k)
+     and yet serves more full-page reads, so "evicts less, holds more" is not the story.
+     Candidates, untested: the copy-on-access region (second-chance copies are allocs that
+     evict too, and a 16-entry jump moves the head past the 10% region differently than
+     one-entry steps); wrap waste at the ring end.  Per §1's rule, the null hypothesis is
+     our integration, not a non-transfer.
+  4. **Default left at 1024** pending the owner: keep it (faithful), or set 0 until (3) is
+     explained.
+  5. **(3) EXPLAINED 2026-10-05 by telemetry, and fixed.**  New counters `coa_attempts /
+     coa_alloc_fails` (+ `coa_full_*`): the second-chance copy allocated WITHOUT evicting and
+     skipped when the ring was full.  M4 evicts just enough for the requesting alloc, so the
+     ring is always exactly full: 100% of copies skipped on scans, 99% of full-page copies on
+     zipf-raw (pre-M4 sweep: 7% / 43%, thanks to the 16-entry slack).  Hot full pages then fell
+     off the head.  Fix `bfCoaAlloc`: the copy evicts for room like every alloc, protecting
+     its source slab (evictCallback Case 0); `SQLITE_BF_COA_NO_EVICT` restores the old path.
+     Gate `--full` GREEN 51/51.  Re-measured (profile_arm.py replays of results/m4 cells,
+     direct I/O; perf attached, so ops/s not quotable):
+
+     | cell | target | coa fails | device reads/op |
+     |---|---|---|---|
+     | scans | 0 | 0 / 5941 (was 344 / 4952) | 0.843 (was 0.848) |
+     | scans | 1024 | 6 / 6111 (was 6477 / 6477) | **0.843 (was 0.876)** |
+     | zipf-raw | 0 | 0 / 1949 (was 758 / 2476) | 0.454 (was 0.453) |
+     | zipf-raw | 1024 | (pending) | (was 0.490) |
+
+     M4's read cost on scans is gone; batching itself is neutral once copies can make room.
 
 ### S1 — one shared record cache per database file, and threaded readers
 *From: parity plan A3, handoff P7.*  **A project, larger than every M item put together.**
@@ -2420,3 +2471,25 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   GREEN 51/51.  `results/m3` done: scans -10.5% device reads / +11% ops vs bf_noscan at 32M;
   a 90/10 scrambled mix is best with `bf_scan_promotion=0` (1.17x stock, -19% device reads),
   where the default 30 lets scan full pages displace hot records.  Default = owner decision.
+
+### 2026-10-05 (cont.) — Claude Opus 5.5 — M4 built; campaign stopped at 21/24; D4 prepared
+
+- `a23720e`: M4 eviction batching (`bf_evict_target`, default 1024), gate GREEN.  `results/m4`
+  (owner stopped it at 21/24): neutral on scrambled reads; +9% device reads on clustered point
+  reads and +4% on scans vs the pre-M4 sweep, mechanism unexplained -- see the M4 item.
+- `configs/d4.json` written (64 B write-amp re-measure: insert, v32/v64/v100/v200, bf vs stock,
+  autocheckpoint 0, group 1); NOT run -- the owner stopped it before it started.
+
+### 2026-10-05 (cont.) — Claude Opus 5.5 — profiling + telemetry: a harness bug and M4's mechanism
+
+- `24d7ada`: perf on the scan arm showed 43.6% of CPU in `sqlite3Reprepare` -- bfbench re-bound
+  `LIMIT ?` per scan, which expires the statement (SQLite varmask).  Fixed; stock scans 9.2k ->
+  11.4k ops/s.  Every scan THROUGHPUT ratio from H7/M2/M3/M4 was compressed toward 1; device
+  reads/op are unaffected.  New `bench/tools/profile_arm.py` replays a campaign cell under perf.
+- Copy-on-access telemetry explained M4's regression (second-chance copies starved by a
+  just-full ring) and `bfCoaAlloc` fixes it -- see the M4 item, point 5.
+- Residual scan CPU: `sqlite3BfBtreeRecordExists` still runs per scan row (3.8% self) though
+  scan rows no longer promote records -- small, open.
+- Design note raised by the owner: the fork runs a full page store beside the ring (two
+  caches, split budget, leaves cached twice), where the reference has ONE pool.  To be
+  discussed before further tuning of the split design.

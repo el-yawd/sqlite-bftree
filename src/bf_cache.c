@@ -780,6 +780,31 @@ void sqlite3BfCacheDestroy(BfCache *pCache){
 ** records it is walking; shedding records under it would shift those indices.
 ** Relocating clean pages only keeps that invariant by construction.
 */
+/*
+** Allocation for a second-chance copy (2026-10-05).  The copy used to take
+** whatever room the ring happened to have and skip when there was none.  Under
+** M4's just-enough eviction the ring is always exactly full, and telemetry
+** (coa_alloc_fails) showed 91-100% of copies skipped -- hot full pages then fell
+** off the head, which is all of M4's measured read cost (results/m4).  So the
+** copy evicts for its room like every other allocation, protecting the slab it
+** copies FROM (evictCallback Case 0).  SQLITE_BF_COA_NO_EVICT restores the old
+** take-what-is-free behaviour, for attribution.
+*/
+static void *bfAllocEvicting(BfCache*, u32);   /* M4, below */
+static void *bfCoaAlloc(BfCache *pCache, void *pFrom, u32 size){
+#if defined(SQLITE_BF_COA_NO_EVICT)
+  UNUSED_PARAMETER(pFrom);
+  return sqlite3BfCircularBufferAlloc(&pCache->cb, size);
+#else
+  void *pSave = pCache->pEvictProtect;
+  void *p;
+  pCache->pEvictProtect = pFrom;
+  p = bfAllocEvicting(pCache, size);
+  pCache->pEvictProtect = pSave;
+  return p;
+#endif
+}
+
 void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
 #if !defined(SQLITE_BF_NO_COPY_ON_ACCESS)
   BfMiniPage *pMini, *pNew;
@@ -796,8 +821,12 @@ void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
   if( sqlite3BfMiniPageIsDirty(pMini) ) return;
   if( !sqlite3BfCircularBufferIsCopyOnAccess(&pCache->cb, pMini) ) return;
 
-  pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, pMini->nodeSize);
-  if( !pRaw ) return;      /* no room to move it: let the head have it */
+  pCache->nCoaAttempt++;
+  pRaw = bfCoaAlloc(pCache, pMini, pMini->nodeSize);
+  if( !pRaw ){             /* no room to move it: let the head have it */
+    pCache->nCoaAllocFail++;
+    return;
+  }
   sqlite3BfCircularBufferMarkReady(pRaw);
   pNew = (BfMiniPage*)pRaw;
 
@@ -847,7 +876,6 @@ void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
 **
 ** SQLITE_BF_NO_FULL_PAGE compiles the whole mechanism out.
 */
-static void *bfAllocEvicting(BfCache*, u32);   /* M4, below */
 #if !defined(SQLITE_BF_NO_FULL_PAGE)
 int sqlite3BfFullPageCreate(BfCache *pCache, u32 pgno, u32 root, const u8 *aData){
   BfMapEntry *pEntry;
@@ -902,8 +930,14 @@ static void bfFullCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
   void *pRaw;
   if( pCache->cb.copyOnAccessRatio <= 0.0 ) return;
   if( !sqlite3BfCircularBufferIsCopyOnAccess(&pCache->cb, pOld) ) return;
-  pRaw = sqlite3BfCircularBufferAlloc(&pCache->cb, pOld->nodeSize);
-  if( !pRaw ) return;
+  pCache->nCoaAttempt++;
+  pCache->nCoaFullAttempt++;
+  pRaw = bfCoaAlloc(pCache, pOld, pOld->nodeSize);
+  if( !pRaw ){
+    pCache->nCoaAllocFail++;
+    pCache->nCoaFullAllocFail++;
+    return;
+  }
   memcpy(pRaw, pOld, pOld->nodeSize);
   sqlite3BfCircularBufferMarkReady(pRaw);
   pEntry->pPage = pRaw;
