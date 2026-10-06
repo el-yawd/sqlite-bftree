@@ -176,6 +176,7 @@ def metrics(r):
         "bf_scan_promotions": bf.get("scan_promotions"),
         # M4: alloc-failure eviction batches (0 under bf_evict_target=0).
         "bf_evict_batches": bf.get("evict_batches"),
+        "bf_pool_discards": bf.get("pool_leaf_discards"),
         "read_errors": res.get("read_errors", 0) + res.get("read_misses", 0),
     }
 

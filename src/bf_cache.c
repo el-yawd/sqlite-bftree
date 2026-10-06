@@ -91,6 +91,7 @@ struct BfPage {
 
 #define BF_PAGE_DIRTY    0x01
 #define BF_PAGE_PINNED   0x02
+#define BF_PAGE_RETAINED 0x04   /* unified pool: kept unpinned, off the LRU */
 
 /*
 ** Extended BfCache structure with internal state.
@@ -115,7 +116,17 @@ struct BfCacheInt {
   /* Configuration */
   int nMin;                      /* Minimum pages to keep */
   int nMax;                      /* Maximum pages */
+
+  /* Unified pool (PRAGMA bf_unified_pool, 2026-10-05).  Retained pages --
+  ** page 1 and interior pages -- live in the hash, unpinned, NOT on the LRU,
+  ** and are excluded from nMax and xPagecount, as ../bf-tree keeps its inner
+  ** nodes on the heap outside the buffer budget.  pFree recycles the BfPage
+  ** structs of discarded leaves so a leaf read is not a malloc. */
+  int nRetained;                 /* Pages carrying BF_PAGE_RETAINED */
+  BfPage *pFree;                 /* Pool of discarded page structs */
+  int nFree;                     /* Entries on pFree */
 };
+#define BF_PAGE_POOL_MAX 64
 
 /*
 ** Forward declarations.
@@ -284,7 +295,7 @@ static void bfCacheCachesize(sqlite3_pcache *p, int nMax){
 */
 static int bfCachePagecount(sqlite3_pcache *p){
   BfCacheInt *pCache = (BfCacheInt*)p;
-  return pCache->nPage;
+  return pCache->nPage - pCache->nRetained;   /* retained: outside the budget */
 }
 
 /*
@@ -293,6 +304,18 @@ static int bfCachePagecount(sqlite3_pcache *p){
 static BfPage *bfCacheAllocPage(BfCacheInt *pCache){
   BfPage *pPage;
   int szAlloc;
+
+  if( pCache->pFree ){
+    /* Unified pool: a struct a discarded leaf gave back.  Its buffer content
+    ** is undefined by the pcache contract; the header is reset by the caller
+    ** (bfCacheFetch Step 5's "Initialize the page"). */
+    pPage = pCache->pFree;
+    pCache->pFree = pPage->pNext;
+    pCache->nFree--;
+    pPage->pNext = 0;
+    pPage->pMiniPage = 0;
+    return pPage;
+  }
 
   szAlloc = sizeof(BfPage) + pCache->base.szPage + pCache->base.szExtra;
   pPage = (BfPage*)sqlite3Malloc(szAlloc);
@@ -359,9 +382,20 @@ static void bfCacheRemoveFromHash(BfCacheInt *pCache, BfPage *pPage, int freeFla
   }
 
   pCache->nPage--;
+  if( pPage->flags & BF_PAGE_RETAINED ){
+    pPage->flags &= ~BF_PAGE_RETAINED;
+    pCache->nRetained--;
+  }
 
   if( freeFlag ){
-    bfCacheFreePage(pPage);
+    if( pCache->nFree<BF_PAGE_POOL_MAX && pPage->pMiniPage==0
+     && sqlite3BfCacheUnifiedPool() ){
+      pPage->pNext = pCache->pFree;
+      pCache->pFree = pPage;
+      pCache->nFree++;
+    }else{
+      bfCacheFreePage(pPage);
+    }
   }
 }
 
@@ -369,6 +403,12 @@ static void bfCacheRemoveFromHash(BfCacheInt *pCache, BfPage *pPage, int freeFla
 ** Pin a page (remove from LRU list).
 */
 static BfPage *bfCachePinPage(BfPage *pPage){
+  if( pPage->flags & BF_PAGE_RETAINED ){
+    BfCacheInt *pCache = (BfCacheInt*)pPage->pCache;
+    pPage->flags &= ~BF_PAGE_RETAINED;   /* re-classified at its next unpin */
+    pCache->nRetained--;
+    pCache->nPinned++;
+  }
   if( pPage->pLruNext ){
     pPage->pLruPrev->pLruNext = pPage->pLruNext;
     pPage->pLruNext->pLruPrev = pPage->pLruPrev;
@@ -418,13 +458,14 @@ static sqlite3_pcache_page *bfCacheFetch(
   /* Step 3: Check if we can create a new page */
   if( createFlag == 1 ){
     /* Soft create - fail if at capacity */
-    if( pCache->nPage >= pCache->nMax && pCache->nRecyclable == 0 ){
+    if( pCache->nPage - pCache->nRetained >= pCache->nMax
+     && pCache->nRecyclable == 0 ){
       return 0;
     }
   }
 
   /* Step 4: Try to recycle an unpinned page */
-  if( pCache->nPage >= pCache->nMax ){
+  if( pCache->nPage - pCache->nRetained >= pCache->nMax ){
     BfPage *pRecycle = pCache->lru.pLruPrev;
     if( pRecycle != &pCache->lru ){
       /* Remove from LRU and hash */
@@ -503,7 +544,30 @@ static void bfCacheUnpin(
   pPage->flags &= ~BF_PAGE_PINNED;
   pCache->nPinned--;
 
-  if( reuseUnlikely || pCache->nPage > pCache->nMax ){
+  if( sqlite3BfCacheUnifiedPool() && !reuseUnlikely ){
+    /* Unified pool, as ../bf-tree: a table leaf is cached only in the ring
+    ** (mini-page or full page); unreferenced, its page buffer is dropped like
+    ** the reference's per-operation tmp_buffer (mini_page_op.rs:257), and the
+    ** next read comes from a ring full page (readDbPage) or from disk.  Inner
+    ** nodes live outside the ring budget, always resident (inner_node.rs:
+    ** heap-allocated, never evicted): page 1 and interior pages are retained
+    ** off the LRU.  The known-leaf bitmap is exact for non-root table leaves;
+    ** a root leaf is never marked and stays on the LRU.  SQLite only unpins a
+    ** CLEAN page, so dropping one is always safe. */
+    u8 *a = (u8*)pPage->page.pBuf;
+    u8 t = a[pPage->pgno==1 ? 100 : 0];
+    if( sqlite3BfLeafBitTest(&pCache->base, pPage->pgno) ){
+      pCache->base.nPoolLeafDiscard++;
+      bfCacheRemoveFromHash(pCache, pPage, 1);
+      return;
+    }
+    if( pPage->pgno==1 || t==0x05 || t==0x02 ){
+      pPage->flags |= BF_PAGE_RETAINED;
+      pCache->nRetained++;
+      return;
+    }
+  }
+  if( reuseUnlikely || pCache->nPage - pCache->nRetained > pCache->nMax ){
     /* Remove immediately */
     bfCacheRemoveFromHash(pCache, pPage, 1);
   }else{
@@ -661,6 +725,11 @@ static void bfCacheDestroy(sqlite3_pcache *p){
     }
   }
 
+  while( pCache->pFree ){
+    pPage = pCache->pFree;
+    pCache->pFree = pPage->pNext;
+    sqlite3_free(pPage);
+  }
   BF_ALLOC_TRACE("cache-destroy", pCache, 0);
   sqlite3_free(pCache->base.aDirtyPg);
   pCache->base.aDirtyPg = 0;
@@ -705,6 +774,11 @@ static void bfCacheShrink(sqlite3_pcache *p){
     if( pPage == &pCache->lru ) break;
     bfCacheRemoveFromHash(pCache, pPage, 1);
   }
+}
+
+/* Unified pool gauge: page 1 + interior pages held outside the budget. */
+int sqlite3BfCacheRetainedPages(BfCache *p){
+  return p ? ((BfCacheInt*)p)->nRetained : 0;
 }
 
 /*

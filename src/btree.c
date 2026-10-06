@@ -5795,10 +5795,12 @@ static int moveToChild(BtCursor *pCur, u32 newPgno){
   if( rc ){
     pCur->pPage = pCur->apPage[--pCur->iPage];
   }
-#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
- && !defined(SQLITE_BF_NO_BLIND_INSERT)
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* The known-leaf bitmap.  Maintained in every write-buffering build, as its
+  ** clear sites are: D3b's blind insert reads it (unless
+  ** SQLITE_BF_NO_BLIND_INSERT) and so does the unified pool (bfCacheUnpin). */
   else if( pCur->pPage->leaf && pCur->curIntKey ){
-    sqlite3BfBtreeNoteLeaf(pCur);     /* D3b: a non-root table leaf, seen */
+    sqlite3BfBtreeNoteLeaf(pCur);     /* a non-root table leaf, seen */
   }
 #endif
   return rc;

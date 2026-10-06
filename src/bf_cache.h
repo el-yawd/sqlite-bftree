@@ -528,6 +528,7 @@ struct BfCache {
   u64 nCoaAttempt;          /* accessed slabs found in the copy-on-access region */
   u64 nCoaAllocFail;        /* ... whose second-chance copy found no room (skipped) */
   u64 nCoaFullAttempt;      /* the same two, full pages only */
+  u64 nPoolLeafDiscard;     /* unified pool: table leaves dropped at unpin */
   u64 nCoaFullAllocFail;
   u64 nUpgrades;            /* Mini-page size upgrades */
   u64 nMergeScans;          /* Forward scans that armed merge-iteration (2.2) */
@@ -972,6 +973,8 @@ SQLITE_PRIVATE int sqlite3BfCachePromotionRate(void);
 SQLITE_PRIVATE int sqlite3BfCacheScanPromotion(void);
 #endif
 SQLITE_PRIVATE int sqlite3BfCacheEvictTarget(void);
+SQLITE_PRIVATE int sqlite3BfCacheUnifiedPool(void);
+SQLITE_PRIVATE int sqlite3BfCacheRetainedPages(BfCache*);
 
 /*
 ** Per-pager cache management (P0.3).

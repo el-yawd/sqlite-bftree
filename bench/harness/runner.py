@@ -219,6 +219,9 @@ def expand(config, only=None, suts_override=None):
     return runs
 
 
+UNIFIED_PAGE_STORE = 16 * 4096   # 16 pages: page 1, schema, overflow, spill room
+
+
 def split_memory(run, page_floor):
     """Decide the memory split for one experiment cell.
 
@@ -247,6 +250,16 @@ def split_memory(run, page_floor):
     behaviours for comparison with results recorded before this.
     """
     budget = parse_size(run["budget_bytes"])
+    if run.get("unified_pool"):
+        # Unified pool (2026-10-05, owner decisions): ../bf-tree's memory model.
+        # The ring IS the budget; table leaves are cached nowhere else.  The
+        # page store keeps page 1 and interior pages resident OUTSIDE the
+        # budget (as the reference's heap inner nodes are) plus a token
+        # UNIFIED_PAGE_STORE for any other page.  Stock gets the same total.
+        ring = budget
+        if ring & (ring - 1):
+            raise SystemExit("unified_pool needs a power-of-two budget_bytes")
+        return budget + UNIFIED_PAGE_STORE, ring, UNIFIED_PAGE_STORE
     if run.get("ring_bytes") is not None:
         # Explicit split (M2 measurement, 2026-09-30): the ring gets exactly
         # ring_bytes (a power of two, as the ring requires) and the page cache
@@ -387,6 +400,8 @@ def build_argv(run, dbpath, jsonpath, page_floor):
             argv += ["--scan-promotion", str(run["scan_promotion"])]
         if run.get("evict_target") is not None:
             argv += ["--evict-target", str(run["evict_target"])]
+        if run.get("unified_pool"):
+            argv += ["--unified-pool"]
         if run.get("min_record") is not None:
             argv += ["--min-record", str(run["min_record"])]
         if run.get("copy_on_access") is not None:

@@ -431,6 +431,10 @@ set pragma_def {
   TYPE: BF_EVICT_TARGET
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
 
+  NAME: bf_unified_pool
+  TYPE: BF_UNIFIED_POOL
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
   NAME: bf_deferred_commit
   TYPE: BF_GROUP_COMMIT
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
