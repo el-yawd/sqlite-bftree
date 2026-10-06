@@ -117,7 +117,7 @@ struct BfCacheInt {
   int nMin;                      /* Minimum pages to keep */
   int nMax;                      /* Maximum pages */
 
-  /* Unified pool (PRAGMA bf_unified_pool, 2026-10-05).  Retained pages --
+  /* Unified pool (2026-10-05; the only design since 2026-10-06).  Retained pages --
   ** page 1 and interior pages -- live in the hash, unpinned, NOT on the LRU,
   ** and are excluded from nMax and xPagecount, as ../bf-tree keeps its inner
   ** nodes on the heap outside the buffer budget.  pFree recycles the BfPage
@@ -388,8 +388,7 @@ static void bfCacheRemoveFromHash(BfCacheInt *pCache, BfPage *pPage, int freeFla
   }
 
   if( freeFlag ){
-    if( pCache->nFree<BF_PAGE_POOL_MAX && pPage->pMiniPage==0
-     && sqlite3BfCacheUnifiedPool() ){
+    if( pCache->nFree<BF_PAGE_POOL_MAX && pPage->pMiniPage==0 ){
       pPage->pNext = pCache->pFree;
       pCache->pFree = pPage;
       pCache->nFree++;
@@ -544,8 +543,10 @@ static void bfCacheUnpin(
   pPage->flags &= ~BF_PAGE_PINNED;
   pCache->nPinned--;
 
-  if( sqlite3BfCacheUnifiedPool() && !reuseUnlikely ){
-    /* Unified pool, as ../bf-tree: a table leaf is cached only in the ring
+  if( !reuseUnlikely ){
+    /* Unified pool, as ../bf-tree -- the ONLY design (owner, 2026-10-06; the
+    ** split design with a full page store beside the ring is gone, see
+    ** BF_TREE_V2_PLAN.md and results/unified).  A table leaf is cached only in the ring
     ** (mini-page or full page); unreferenced, its page buffer is dropped like
     ** the reference's per-operation tmp_buffer (mini_page_op.rs:257), and the
     ** next read comes from a ring full page (readDbPage) or from disk.  Inner
@@ -556,11 +557,15 @@ static void bfCacheUnpin(
     ** CLEAN page, so dropping one is always safe. */
     u8 *a = (u8*)pPage->page.pBuf;
     u8 t = a[pPage->pgno==1 ? 100 : 0];
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+    /* The known-leaf bitmap exists only in write-buffering builds; without
+    ** it (bf_ro) leaves cannot be told apart and stay on the LRU. */
     if( sqlite3BfLeafBitTest(&pCache->base, pPage->pgno) ){
       pCache->base.nPoolLeafDiscard++;
       bfCacheRemoveFromHash(pCache, pPage, 1);
       return;
     }
+#endif
     if( pPage->pgno==1 || t==0x05 || t==0x02 ){
       pPage->flags |= BF_PAGE_RETAINED;
       pCache->nRetained++;

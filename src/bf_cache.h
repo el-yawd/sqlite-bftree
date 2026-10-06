@@ -973,7 +973,6 @@ SQLITE_PRIVATE int sqlite3BfCachePromotionRate(void);
 SQLITE_PRIVATE int sqlite3BfCacheScanPromotion(void);
 #endif
 SQLITE_PRIVATE int sqlite3BfCacheEvictTarget(void);
-SQLITE_PRIVATE int sqlite3BfCacheUnifiedPool(void);
 SQLITE_PRIVATE int sqlite3BfCacheRetainedPages(BfCache*);
 
 /*

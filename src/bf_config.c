@@ -23,7 +23,6 @@
 **   PRAGMA bf_promotion_rate     - Get/set read promotion rate
 **   PRAGMA bf_scan_promotion     - Get/set per-leaf scan (full page) rate
 **   PRAGMA bf_evict_target       - Get/set bytes per eviction batch (M4)
-**   PRAGMA bf_unified_pool       - Leaves cached only in the ring (one pool)
 **   PRAGMA bf_deferred_commit    - Bounded deferred durability window (N txns)
 **   PRAGMA bf_group_commit       - Old name of bf_deferred_commit, kept
 **   PRAGMA bf_min_record         - Size-class ladder base
@@ -46,7 +45,6 @@ typedef struct BfConfig {
   int nMinRecord;             /* Size-class ladder base; see bf_min_record */
   int nScanPromotion;         /* M3: per-leaf scan promotion rate (0-100) */
   int nEvictTarget;           /* M4: bytes per eviction batch; 0 = legacy 16 */
-  int bUnifiedPool;           /* one pool: leaves only in the ring (see pragma) */
 } BfConfig;
 
 static BfConfig bfConfig = {
@@ -57,16 +55,8 @@ static BfConfig bfConfig = {
   0,                          /* Group commit off: one flush per commit */
   BF_DEFAULT_MIN_RECORD,      /* ours, measured; the reference's default is 4 */
   BF_DEFAULT_SCAN_PROMOTION,  /* the reference's scan_promotion_rate default */
-  BF_DEFAULT_EVICT_TARGET,    /* the reference's TARGET_EVICT_SIZE */
-  0                           /* unified pool off: the split design */
+  BF_DEFAULT_EVICT_TARGET     /* the reference's TARGET_EVICT_SIZE */
 };
-
-/*
-** Unified pool (2026-10-05): see PRAGMA bf_unified_pool.
-*/
-int sqlite3BfCacheUnifiedPool(void){
-  return bfConfig.bUnifiedPool;
-}
 
 /*
 ** M4: bytes one eviction batch reclaims before the allocation is retried
@@ -264,10 +254,6 @@ void sqlite3PragmaBfCacheStats(
 
   sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "evict_target", P4_STATIC);
   sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nEvictTarget, 2);
-  sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
-
-  sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "unified_pool", P4_STATIC);
-  sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.bUnifiedPool, 2);
   sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
 
   {
@@ -687,37 +673,6 @@ void sqlite3PragmaBfScanPromotion(
     if( rate < 0 ) rate = 0;
     if( rate > 100 ) rate = 100;
     bfConfig.nScanPromotion = rate;
-  }
-}
-
-/*
-** Implementation of PRAGMA bf_unified_pool
-**
-** PRAGMA bf_unified_pool;        -- 1 if on
-** PRAGMA bf_unified_pool = 0|1;
-**
-** ON is ../bf-tree's memory model: the ring is the ONLY cache of table leaves
-** (mini-pages and full pages); a leaf page buffer is dropped as soon as no
-** cursor references it, like the reference's per-operation tmp_buffer; page 1
-** and interior pages stay resident outside the budget, like its heap-allocated
-** inner nodes.  Give the ring the whole budget and the page store only a few
-** pages (cache_size) for everything else.  OFF (default) is the split design.
-*/
-void sqlite3PragmaBfUnifiedPool(
-  Parse *pParse,
-  const char *zDb,
-  const char *zValue
-){
-  Vdbe *v = sqlite3GetVdbe(pParse);
-  UNUSED_PARAMETER(zDb);
-  if( zValue == 0 ){
-    pParse->nMem = MAX(pParse->nMem, 1);
-    sqlite3VdbeSetNumCols(v, 1);
-    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.bUnifiedPool, 1);
-    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_unified_pool", SQLITE_STATIC);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-  }else{
-    bfConfig.bUnifiedPool = sqlite3GetBoolean(zValue, 0);
   }
 }
 

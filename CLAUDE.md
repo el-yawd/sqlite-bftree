@@ -38,6 +38,11 @@ larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
   `bf_group_commit=N` is bounded *deferred* durability (`bf_btree.c:705`: the first N-1
   *record-only* commits stage nothing and return; a commit that writes pages never defers).
   See `BF_TREE_V2_PLAN.md` item D2.
+- **One pool** (owner, 2026-10-06): the ring is the whole budget and the ONLY cache of table
+  leaves (mini-pages + full pages); a leaf page buffer lives only while pinned, like the
+  reference's `tmp_buffer`; page 1 + interior pages stay resident OUTSIDE the budget, like its
+  heap inner nodes.  The old split design (page store beside the ring) is gone.  Plan log
+  2026-10-05/06, `results/unified`.
 - **Single-writer** (keep `BtShared` serialization); concurrency is a documented non-transfer.
 - v1 scope: rowid tables, primary B-tree only; secondary indexes etc. stay write-through.
 

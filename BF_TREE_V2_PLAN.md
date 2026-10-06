@@ -379,13 +379,13 @@ Stops at:
 | cold-record discard | partial | copy-on-access matches; size-upgrade discard is default-off |
 | size-class derivation | partial | seven classes, 4096 B ceiling, base 64 vs the reference's default 4 |
 | free list | partial | class direction now matches (`b0026ba`); stale-chain handling is weaker |
-| point lookup | good, within rowid scope | the full-page pcache remains alongside |
+| point lookup | good, within rowid scope | unified pool since 2026-10-06: leaves cached only in the ring, interior pages resident outside the budget, as the reference |
 | negative caching | partial | phantom does not avoid the initial leaf read |
 | forward/reverse scan | semantically good | the reference uses promotion and full-page retention differently |
 | **dirty eviction / merge** | **missing** | the dirty FIFO head refuses eviction |
-| **full-page / gap cache (`BF_LOC_FULL`)** | **absent** | zero producers — the identifier appears only in a comment at `bf_mapping.c:18` |
-| **separate scan promotion** | **absent** | no `scan_promotion` symbol exists |
-| **eviction batching** | **absent** | `sqlite3BfCacheEvict(pCache, 16)` at three call sites — a fixed **16 entries**, against the reference's ~1024 accumulated **bytes** with retry cap 10 (`tree.rs:1012-1018`) |
+| full-page / gap cache (`BF_LOC_FULL`) | **read side done** (M2, `2698253`) | mini-page growth trigger + scan promotion; the WRITE side (mirror a leaf after a merge, `write_load_full_page`) is not built |
+| separate scan promotion | **done** (M3, `89ccce2`) | per leaf, full pages only, as `range_scan.rs` |
+| eviction batching | **done** (M4, `a23720e` + `6e062a0`) | 1 KiB / 10 entries, alloc retried until it fits |
 | **general UPDATE buffering** | **done 2026-09-29** (single-row; SAVEPOSITION declined) | see §3.2, D3 |
 | native mini/base split | deliberately absent | SQLite materialises and balances fixed pages |
 | shared reader buffer pool | missing | one `BfCache` per pager (`pager.c:4259-4269`) |
@@ -2529,3 +2529,17 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
      model; stock's 32 MiB includes its interior pages.
 - Next (owner): make unified the default?  Then the experiments decision 3 deferred (full-page
   triggers), the buffered-I/O arm, and the scan throughput re-measure (`24d7ada`).
+
+### 2026-10-06 — Claude Opus 5.5 — the unified pool is the only design
+
+- Owner: "it should be the only option -- this is the correct design".  `PRAGMA bf_unified_pool`
+  removed; `bfCacheUnpin` always drops known table leaves and retains page 1 + interior pages
+  outside the budget.  The runner's split knobs (`ring_bytes`, `bf_page_cache_floor`,
+  `bf_ring_round`) now REFUSE to run; the budget must be a power of two (ring = budget).
+  Every pre-2026-10-06 config with a 36M budget or a ring_bytes axis is historical.
+- Leaf identification needs the leaf bitmap, which exists only in write-buffering builds:
+  `bf_ro` (no SQLITE_BF_INSERT_BUFFERING) keeps leaves on a 16-page LRU and is no longer a
+  meaningful SUT.
+- Gate `--full` GREEN 51/51 with the pool as default (difftest 1797/1797); quick gate re-run
+  after the bf_ro compile guard GREEN 13/13.  All ablation variants compile.
+- Parity matrix (§3.3) updated: full pages (read side), scan promotion, eviction batching done.

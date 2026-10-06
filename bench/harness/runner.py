@@ -219,78 +219,35 @@ def expand(config, only=None, suts_override=None):
     return runs
 
 
-UNIFIED_PAGE_STORE = 16 * 4096   # 16 pages: page 1, schema, overflow, spill room
+UNIFIED_PAGE_STORE = 16 * 4096   # 16 pages for non-leaf, non-interior pages (overflow, spill)
 
 
 def split_memory(run, page_floor):
-    """Decide the memory split for one experiment cell.
+    """Decide the memory split for one experiment cell: (total, ring, page_cache).
 
-    Returns (total, ring, page_cache).  `total` depends only on the cell, not
-    on the SUT, so every engine in the cell is given exactly the same bytes --
-    that is the whole point of this function existing in one place.
+    ONE design since 2026-10-06 (owner): the unified pool, ../bf-tree's memory
+    model.  The ring IS the budget -- table leaves are cached nowhere else; a
+    leaf page buffer lives only while a cursor pins it.  Page 1 and interior
+    pages stay resident OUTSIDE the budget (the reference's inner nodes are
+    heap-allocated outside its buffer budget; owner decision 2026-10-05), and a
+    token UNIFIED_PAGE_STORE holds any other page.  `total` depends only on the
+    cell, so stock is given exactly the same bytes as its page cache.
 
-    The ring must be a power of two: bf_circular_buffer.c masks addresses with
-    capacity-1, and so does the reference (circular_buffer/mod.rs asserts
-    is_power_of_two).  That constraint is faithful and stays.  What does NOT
-    have to stay is what we did with the remainder.
-
-    Rounding the ring DOWN inside a fixed budget kept the totals equal and
-    quietly halved the thing under test: budget 256M with an 8M floor asks for
-    a 248M ring, rounds down to 128M, and hands the other 128M to the page
-    cache.  The 2026-09-16 steady campaign ran its entire larger-than-memory
-    arm that way -- `bf.buffer_size` reads 134217728 in every row -- so the
-    record cache was measured at half its configured size, with the surplus
-    given to the component Bf-Tree exists to replace.  Rounding UP inside the
-    budget is worse: it gave BF 12.5% more memory than stock.
-
-    "match" (the default) rounds the ring UP and raises the TOTAL to match, so
-    `budget_bytes` is a floor rather than a ceiling: every SUT gets
-    ring + page_floor.  The ring is what the config asked for, and the totals
-    are still exactly equal.  "down" and "up" reproduce the two older
-    behaviours for comparison with results recorded before this.
+    The ring must be a power of two (bf_circular_buffer.c masks addresses; the
+    reference asserts is_power_of_two), so the budget must be one too.  The
+    split design's knobs -- ring_bytes, bf_page_cache_floor, bf_ring_round --
+    are gone with it; configs that still set them are refused rather than
+    silently measuring something else.  page_floor is ignored.
     """
+    for k in ("ring_bytes", "bf_page_cache_floor", "bf_ring_round"):
+        if run.get(k) is not None:
+            raise SystemExit("%s: the split design was removed 2026-10-06 "
+                             "(unified pool only); drop it from the config" % k)
     budget = parse_size(run["budget_bytes"])
-    if run.get("unified_pool"):
-        # Unified pool (2026-10-05, owner decisions): ../bf-tree's memory model.
-        # The ring IS the budget; table leaves are cached nowhere else.  The
-        # page store keeps page 1 and interior pages resident OUTSIDE the
-        # budget (as the reference's heap inner nodes are) plus a token
-        # UNIFIED_PAGE_STORE for any other page.  Stock gets the same total.
-        ring = budget
-        if ring & (ring - 1):
-            raise SystemExit("unified_pool needs a power-of-two budget_bytes")
-        return budget + UNIFIED_PAGE_STORE, ring, UNIFIED_PAGE_STORE
-    if run.get("ring_bytes") is not None:
-        # Explicit split (M2 measurement, 2026-09-30): the ring gets exactly
-        # ring_bytes (a power of two, as the ring requires) and the page cache
-        # gets the rest of the SAME total, so an axis over ring_bytes moves
-        # memory between record-granular and page-granular caching and nothing
-        # else.  Every SUT in the cell still gets `budget` in total.
-        ring = parse_size(run["ring_bytes"])
-        if ring & (ring - 1) or ring >= budget:
-            raise SystemExit("ring_bytes must be a power of two below budget_bytes")
-        return budget, ring, budget - ring
-    floor = parse_size(run.get("bf_page_cache_floor", page_floor))
-    floor = min(floor, budget // 2)
-    ring = budget - floor
-    mode = run.get("bf_ring_round", "match")
-
-    if mode == "match":
-        pow2 = 1
-        while pow2 < ring:
-            pow2 *= 2
-        return pow2 + floor, pow2, floor
-    if mode == "down":
-        pow2 = 1
-        while pow2 * 2 <= ring:
-            pow2 *= 2
-        return budget, pow2, budget - pow2
-    if mode == "up":
-        pow2 = 1
-        while pow2 < ring:
-            pow2 *= 2
-        return pow2 + floor, pow2, floor
-    raise SystemExit("unknown bf_ring_round %r (match|down|up)" % mode)
+    if budget & (budget - 1):
+        raise SystemExit("budget_bytes must be a power of two (the ring is the "
+                         "budget); got %s" % run["budget_bytes"])
+    return budget + UNIFIED_PAGE_STORE, budget, UNIFIED_PAGE_STORE
 
 
 def resolve_memmax(run):
@@ -400,8 +357,6 @@ def build_argv(run, dbpath, jsonpath, page_floor):
             argv += ["--scan-promotion", str(run["scan_promotion"])]
         if run.get("evict_target") is not None:
             argv += ["--evict-target", str(run["evict_target"])]
-        if run.get("unified_pool"):
-            argv += ["--unified-pool"]
         if run.get("min_record") is not None:
             argv += ["--min-record", str(run["min_record"])]
         if run.get("copy_on_access") is not None:

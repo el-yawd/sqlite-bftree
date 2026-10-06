@@ -574,7 +574,7 @@ static void bfStatsRead(sqlite3 *db, BfStats *p){
 static int bfStatIsCumulative(const char *z){
   static const char *az[] = {
     "enabled", "buffer_size", "promotion_rate", "scan_promotion_rate",
-    "evict_target", "unified_pool", "pool_retained_pages",
+    "evict_target", "pool_retained_pages",
     "group_pending",
     /* Live gauges (current state, not a running total): differencing these
     ** across a run would report nonsense such as a negative cache size. */
@@ -626,7 +626,6 @@ typedef struct Config {
   int nPromotion;
   int nScanPromotion;      /* M3: PRAGMA bf_scan_promotion, -1 = build default */
   int nEvictTarget;        /* M4: PRAGMA bf_evict_target, -1 = build default */
-  int bUnifiedPool;        /* PRAGMA bf_unified_pool=1 (leaves only in the ring) */
   int nMinRecord;             /* PRAGMA bf_min_record; -1 leaves the default */
   int nCopyOnAccess;          /* PRAGMA bf_copy_on_access, percent; -1 = default */
   int bInsertReplace;         /* --insert-mode replace: INSERT OR REPLACE (upsert),
@@ -1107,7 +1106,6 @@ static int cmdRun(Config *p){
   if( p->nEvictTarget >= 0 ){
     execFmt(db, "PRAGMA bf_evict_target=%d;", p->nEvictTarget);
   }
-  if( p->bUnifiedPool ) execOrDie(db, "PRAGMA bf_unified_pool=1;");
   /* A global the ring re-reads on every (re)initialisation, so its order
   ** relative to bf_cache_size / bf_min_record does not matter. */
   if( p->nCopyOnAccess >= 0 ) execFmt(db, "PRAGMA bf_copy_on_access=%d;", p->nCopyOnAccess);
@@ -1289,11 +1287,10 @@ static int cmdRun(Config *p){
   fprintf(out, "    \"synchronous\": \"%s\", \"journal_mode\": \"%s\", "
                "\"group_commit\": %d, \"promotion_rate\": %d, "
                "\"scan_promotion\": %d, \"evict_target\": %d, "
-               "\"unified_pool\": %d, "
                "\"copy_on_access\": %d, \"min_record\": %d, "
                "\"insert_mode\": \"%s\",\n",
           p->zSync, p->zJournal, p->nGroupCommit, p->nPromotion,
-          p->nScanPromotion, p->nEvictTarget, p->bUnifiedPool,
+          p->nScanPromotion, p->nEvictTarget,
           p->nCopyOnAccess, p->nMinRecord,
           p->bInsertReplace ? "replace" : "plain");
   fprintf(out, "    \"ops_per_txn\": %d, \"seed\": %llu, "
@@ -1431,7 +1428,6 @@ static const char zUsage[] =
 "  --group-commit N             --promotion N    --bf-cache on|off\n"
 "  --scan-promotion N           per-leaf scan full-page rate (M3)\n"
 "  --evict-target N             bytes per eviction batch, 0 = legacy (M4)\n"
-"  --unified-pool               leaves cached only in the ring (one pool)\n"
 "  --copy-on-access N           PRAGMA bf_copy_on_access, percent of the ring\n"
 "  --insert-mode plain|replace  insert as INSERT (default) or INSERT OR REPLACE\n"
 "                               (reference cb_copy_on_access_ratio; -1 default)\n"
@@ -1487,7 +1483,6 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--evict-target")==0 ){
       NEEDVAL; cfg.nEvictTarget = atoi(zVal);
     }
-    else if( strcmp(z,"--unified-pool")==0 ) cfg.bUnifiedPool = 1;
     else if( strcmp(z,"--min-record")==0 ){ NEEDVAL; cfg.nMinRecord = atoi(zVal); }
     else if( strcmp(z,"--copy-on-access")==0 ){ NEEDVAL; cfg.nCopyOnAccess = atoi(zVal); }
     else if( strcmp(z,"--insert-mode")==0 ){ NEEDVAL;
