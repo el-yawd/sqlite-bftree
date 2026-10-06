@@ -53,7 +53,7 @@ static BfConfig bfConfig = {
   BF_DEFAULT_PROMOTION_RATE,  /* see bf_cache.h for why 30 */
   BF_DEFAULT_COPY_ON_ACCESS,  /* 10% copy-on-access region */
   0,                          /* Group commit off: one flush per commit */
-  BF_DEFAULT_MIN_RECORD,      /* ours, measured; the reference's default is 4 */
+  BF_DEFAULT_MIN_RECORD,      /* the reference's default, 4 (since 2026-10-06) */
   BF_DEFAULT_SCAN_PROMOTION,  /* the reference's scan_promotion_rate default */
   BF_DEFAULT_EVICT_TARGET     /* the reference's TARGET_EVICT_SIZE */
 };
@@ -747,7 +747,7 @@ void sqlite3PragmaBfMinRecord(
     int n = sqlite3Atoi(zValue);
     /* Bounded so the derived ladder stays sane: the first class must hold a
     ** header plus one record, and the largest must still fit a full page. */
-    if( n < 8 ) n = 8;
+    if( n < 2 ) n = 2;      /* the reference's floor (config.rs:430); was 8 */
     if( n > (int)(BF_MAX_MINI_PAGE/4) ) n = (int)(BF_MAX_MINI_PAGE/4);
     if( n != bfConfig.nMinRecord ){
       bfConfig.nMinRecord = n;

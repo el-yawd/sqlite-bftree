@@ -897,7 +897,15 @@ void sqlite3BfCacheCopyOnAccess(BfCache *pCache, BfMapEntry *pEntry){
 
   pMini = (BfMiniPage*)pEntry->pPage;
   if( (void*)pMini == pCache->pEvictProtect ) return;
+  /* Dirty pages get their second chance too (2026-10-06), as in ../bf-tree,
+  ** whose move_cache_page_to_tail copies a mini-page whatever it holds
+  ** (mini_page_op.rs:1047) -- the copy keeps every dirty record, since a
+  ** dirty record is never cold (sqlite3BfKvIsColdCache).  It is also what
+  ** keeps a hot dirty leaf away from the head, where it would stall the
+  ** sweep (item 3).  SQLITE_BF_NO_DIRTY_COA restores clean-only. */
+#if defined(SQLITE_BF_NO_DIRTY_COA)
   if( sqlite3BfMiniPageIsDirty(pMini) ) return;
+#endif
   if( !sqlite3BfCircularBufferIsCopyOnAccess(&pCache->cb, pMini) ) return;
 
   pCache->nCoaAttempt++;
@@ -1181,6 +1189,10 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     if( !wasUnlogged && (pMini->flags & BF_MINI_F_UNLOGGED)!=0 ){
       sqlite3BfUnlogListAdd(pCache, pgno);   /* now has something to log */
     }
+    /* A write is an access: second chance on the WRITE path too, as
+    ** ../bf-tree does after every insert into a cached page (tree.rs:992-995).
+    ** pMini is dead after this point. */
+    sqlite3BfCacheCopyOnAccess(pCache, pEntry);
     return BF_OK;
   }
 
@@ -1251,10 +1263,13 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
       ** not be the reference's.
       **
       ** A nine-point move is over the "stop" line for the tripwire tier, so
-      ** this does not ship on by default on faith.  Build with
-      ** -DSQLITE_BF_UPGRADE_SHED to enable it; the campaign decides. */
+      ** this did not ship on by default on faith.
+      **
+      ** ON BY DEFAULT since 2026-10-06 (owner: "do exactly like the reference
+      ** first, then experiment"); -DSQLITE_BF_NO_UPGRADE_SHED is the ablation.
+      ** The tripwire above predates the unified pool and M2-M4. */
       rc = sqlite3BfMiniPageCopy((BfMiniPage*)pNew, newSize, pMini,
-#if defined(SQLITE_BF_UPGRADE_SHED)
+#if !defined(SQLITE_BF_NO_UPGRADE_SHED)
                                  BF_COPY_REFERENCED);
 #else
                                  BF_COPY_ALL);

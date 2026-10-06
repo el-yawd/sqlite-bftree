@@ -1744,7 +1744,7 @@ int sqlite3BfBtreeBeginMergeScan(BtCursor *pCur){
   pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
   pCur->bfBaseDone = 0;
-  pCur->bfMergeLeaf = 0;
+  pCur->bfMergeLeaf = 0; pCur->bfIxBoundLeaf = 0;
   pCur->bfIx = 0;
   pBf = btreeGetBfCache(pCur->pBt);
   if( pBf ) pBf->nMergeScans++;
@@ -1769,7 +1769,7 @@ int sqlite3BfBtreeBeginMergeScanRev(BtCursor *pCur){
   pCur->bfMergeRev = 1;
   pCur->bfOnMini = 0;
   pCur->bfBaseDone = 0;
-  pCur->bfMergeLeaf = 0;
+  pCur->bfMergeLeaf = 0; pCur->bfIxBoundLeaf = 0;
   pCur->bfIx = 0;
   pBf = btreeGetBfCache(pCur->pBt);
   if( pBf ) pBf->nMergeScans++;
@@ -1964,6 +1964,27 @@ int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur){
 ** omit).  The map is re-looked-up on every call — a mini-page pointer is never
 ** cached across cursor steps because eviction/rebalance can free it.
 */
+/*
+** Re-find a merge cursor's position from its key bound (BtCursor.bfIxBound):
+** forward, the first record with rowid >= bound; reverse, the last with
+** rowid <= bound (-1 if none).  Records are sorted by encoded rowid, whose
+** byte order is rowid order (bfEncodeRowid).  -2 on a malformed record.
+*/
+static int bfMergeIxFromBound(BfMiniPage *pMini, i64 bound, int bFwd){
+  int lo = 0, hi = sqlite3BfMiniPageCount(pMini);   /* first index with key>bound-ish */
+  while( lo<hi ){
+    int mid = (lo+hi)/2;
+    const u8 *pKey, *pVal; int nKey, nVal; u8 op; i64 k;
+    if( !sqlite3BfMiniPageAt(pMini, mid, &pKey, &nKey, &pVal, &nVal, &op)
+     || nKey!=8 ){
+      return -2;
+    }
+    k = bfDecodeRowid(pKey);
+    if( bFwd ? (k<bound) : (k<=bound) ) lo = mid+1; else hi = mid;
+  }
+  return bFwd ? lo : lo-1;
+}
+
 int sqlite3BfBtreeMergeNextInsert(
   BtCursor *pCur, Pgno leaf, int *pIx, i64 *pRowid, void *pBuf, int nCap,
   int *pnVal
@@ -1985,6 +2006,11 @@ int sqlite3BfBtreeMergeNextInsert(
   }
   pMini = (BfMiniPage*)pEntry->pPage;
   n = sqlite3BfMiniPageCount(pMini);
+  if( pCur->bfIxBoundLeaf==leaf ){
+    ix = bfMergeIxFromBound(pMini, pCur->bfIxBound, 1);
+    if( ix<-1 ) return -1;
+    *pIx = ix;
+  }
   for(ix=*pIx; ix<n; ix++){
     const u8 *pKey, *pVal;
     int nKey, nVal;
@@ -2000,10 +2026,13 @@ int sqlite3BfBtreeMergeNextInsert(
     if( nVal>0 ) memcpy(pBuf, pVal, nVal);
     *pnVal = nVal;
     *pIx = ix;                            /* report the found index */
+    pCur->bfIxBound = r;                  /* not consumed yet: bound = it */
+    pCur->bfIxBoundLeaf = leaf;
     pBf->nMergeInserts++;
     return 1;
   }
   *pIx = n;
+  pCur->bfIxBoundLeaf = 0;
   return 0;
 }
 
@@ -2043,6 +2072,10 @@ int sqlite3BfBtreeMergePrevInsert(
   pMini = (BfMiniPage*)pEntry->pPage;
   n = sqlite3BfMiniPageCount(pMini);
   ix = *pIx;
+  if( pCur->bfIxBoundLeaf==leaf ){
+    ix = bfMergeIxFromBound(pMini, pCur->bfIxBound, 0);
+    if( ix<-1 ) return -1;
+  }
   if( ix>n-1 ) ix = n-1;                /* clamp the "start at the end" entry */
   for(; ix>=0; ix--){
     const u8 *pKey, *pVal;
@@ -2059,10 +2092,13 @@ int sqlite3BfBtreeMergePrevInsert(
     if( nVal>0 ) memcpy(pBuf, pVal, nVal);
     *pnVal = nVal;
     *pIx = ix;                            /* report the found index */
+    pCur->bfIxBound = r;                  /* not consumed yet: bound = it */
+    pCur->bfIxBoundLeaf = leaf;
     pBf->nMergeInserts++;
     return 1;
   }
   *pIx = -1;
+  pCur->bfIxBoundLeaf = 0;
   return 0;
 }
 
@@ -2085,7 +2121,7 @@ int sqlite3BfBtreeMergeBail(BtCursor *pCur){
   pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
   pCur->bfBaseDone = 0;
-  pCur->bfMergeLeaf = 0;
+  pCur->bfMergeLeaf = 0; pCur->bfIxBoundLeaf = 0;
   pCur->bfIx = 0;
   if( !pCur->pBt ) return 0;
   pBt = pCur->pBt;

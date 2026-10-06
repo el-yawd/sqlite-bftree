@@ -205,7 +205,9 @@ void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord){
   int i = 0;
   int k;
 
-  if( nMinRecord < 8 ) nMinRecord = BF_DEFAULT_MIN_RECORD;
+  /* The reference rejects < 2 (config.rs:430); this used to be < 8, which
+  ** silently replaced its default of 4 with ours. */
+  if( nMinRecord < 2 ) nMinRecord = BF_DEFAULT_MIN_RECORD;
   c = (u32)(nMinRecord + sizeof(BfKVMeta));
 
   /* Leaves the LAST slot for BF_MAX_MINI_PAGE unconditionally: the derived
@@ -479,6 +481,13 @@ int sqlite3BfMiniPageSearch(BfMiniPage *pMini,
   idx = bfBinarySearch(pMini, (const u8*)pKey, nKey, &found);
 
   if( !found ){
+    /* ../bf-tree marks the lower-bound candidate BEFORE its equality test
+    ** (leaf_node.rs:1655-1659), so a miss marks the record it landed on.
+    ** bfBinarySearch returns that same lower bound on a miss.
+    ** SQLITE_BF_NO_LOWER_BOUND_REF restores exact-hit-only marking. */
+#if !defined(SQLITE_BF_NO_LOWER_BOUND_REF)
+    if( idx < pMini->metaCount ) BF_KV_SET_REF(&aMeta[idx], 1);
+#endif
     return BF_NOT_FOUND;
   }
 

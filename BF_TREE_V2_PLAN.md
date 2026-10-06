@@ -2563,3 +2563,29 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   moved, the untouched insert arm included).
 - Open: read-only transactions cannot merge (needs a write txn); whether reads meet a dirty head
   in practice is unmeasured -- the mixes never filled the ring.  Gate `--full` GREEN 51/51.
+
+### 2026-10-06 (cont.) — Claude Opus 5.5 — item 4: four smaller reference mismatches, and a merge-scan bug they exposed
+
+- Against `../bf-tree`, each with its ablation:
+  a. **Upgrade shed ON by default** (`mini_page_op.rs:744` copies with `discard_cold_cache=true`);
+     `SQLITE_BF_NO_UPGRADE_SHED` (SUT `bf_noshed`, replaces opt-in `bf_shed`).
+  b. **REF on the lower-bound candidate** before the equality test (`leaf_node.rs:1655-1659`), so
+     a mini-page miss marks the record it landed on; `SQLITE_BF_NO_LOWER_BOUND_REF`.
+  c. **Copy-on-access for dirty mini-pages and on the write path** (`move_cache_page_to_tail`
+     copies whatever the page holds; `tree.rs:992-995` after every insert into a cached page);
+     `SQLITE_BF_NO_DIRTY_COA`.  Also keeps hot dirty leaves off the head (item 3).
+  e. **`bf_min_record` default 4** (`config.rs:27`; their benchmark never overrides it).  Our
+     ladder and pragma silently clamped anything < 8, so 4 was impossible; floor now 2 like the
+     reference (`config.rs:430`).
+  d. NOT changed, flagged for the owner: the reference never caches a NEGATIVE lookup on read
+     (`tree.rs:1410-1413` promotes only `Found`); our phantoms are a fork extension, not a gap.
+- **Bug exposed (pre-existing assumption):** the merge scan resumed from a raw index (`bfIx`)
+  into the dirty mini-page and assumed the page "stable across steps" (`btree.c` bfMergePick
+  comment) -- only the scanning cursor's own promotion was suppressed.  (a) and (c) can now
+  SHED records from a dirty page between steps, shifting the array: gate `--full` RED,
+  `buf/ring gen_fullpage_stress s5`, a scan returned a row's pre-UPDATE value (final dump
+  correct).  Fix: the position is a KEY BOUND (`bfIxBound`/`bfIxBoundLeaf`; forward = first insert
+  with rowid >= bound, reverse = last <= bound), re-found by binary search in the merge
+  primitives; consume sites advance it.  Mutant with the bound disabled diverges again.
+- Gate `--full` GREEN 51/51.  UNMEASURED: (a)/(c)/(e) change capacity and retention; they need
+  the next campaign (with the ablations) before any number is quoted.

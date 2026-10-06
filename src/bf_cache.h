@@ -87,7 +87,9 @@ typedef struct BfFreeList BfFreeList;
 ** config.rs:27 has DEFAULT_MIN_RECORD_SIZE = 4, and nothing in its benchmark/
 ** or dev/ trees overrides it, so the reference runs at 4.  Its ladder is
 ** therefore far finer-grained and starts far smaller than ours. */
-#define BF_DEFAULT_MIN_RECORD 64
+/* 2026-10-06: the reference's 4 (owner: "exactly like the reference first");
+** PRAGMA bf_min_record is the knob for the size-class experiments. */
+#define BF_DEFAULT_MIN_RECORD 4
 #define BF_CACHE_LINE         64
 
 /*

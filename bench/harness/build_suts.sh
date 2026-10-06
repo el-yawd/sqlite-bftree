@@ -18,7 +18,7 @@
 #   bf_nowbdel    -DSQLITE_BF_NO_WRITEBACK_DELETE
 #   bf_noshortcut -DSQLITE_BF_NO_DESCENT_SHORTCUT
 #   bf_nocompact  -DSQLITE_BF_NO_MINIPAGE_COMPACT
-#   bf_shed       -DSQLITE_BF_UPGRADE_SHED        opt-in: upgrades shed cold records
+#   bf_noshed     -DSQLITE_BF_NO_UPGRADE_SHED     upgrades keep cold records (pre-2026-10-06)
 #   bf_nofull     -DSQLITE_BF_NO_FULL_PAGE        M2: no full-page (BF_LOC_FULL) copies
 #   bf_noscan     -DSQLITE_BF_NO_SCAN_PROMOTION   M3: scans promote records at the read rate
 #
@@ -89,9 +89,8 @@ if [ "$ALL" = 1 ]; then
   build_one bf_nowbdel    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_WRITEBACK_DELETE"
   build_one bf_noshortcut "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_DESCENT_SHORTCUT"
   build_one bf_nocompact  "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MINIPAGE_COMPACT"
-  # Opt-IN, unlike the ablations above: size upgrades shed cold cache records
-  # (the reference's copy-on-access cold discard, applied on the upgrade copy).
-  build_one bf_shed       "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_UPGRADE_SHED"
+  # Since 2026-10-06 upgrades shed cold records by default, as the reference.
+  build_one bf_noshed     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPGRADE_SHED"
   # D3 ablations (2026-09-30): existing-row UPDATE buffering, blind REPLACE.
   build_one bf_noupd      "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPDATE_BUFFER"
   build_one bf_noblind    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_BLIND_INSERT"

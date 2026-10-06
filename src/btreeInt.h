@@ -596,6 +596,15 @@ struct BtCursor {
   ** it rolled for) may instead become a full page.  SQLITE_BF_NO_SCAN_PROMOTION. */
   u8 bfScan;
   Pgno bfScanLeaf;
+  /* Merge-scan position as a KEY BOUND (2026-10-06).  bfIx indexes the dirty
+  ** mini-page's sorted record array between steps, and that array can be
+  ** re-laid out under the scan by another cursor: a promotion or write adds a
+  ** record, a size upgrade or second-chance copy sheds cold ones.  Forward:
+  ** the next insert to emit is the first with rowid >= bfIxBound; reverse: the
+  ** last with rowid <= bfIxBound.  Valid only while bfIxBoundLeaf is the leaf
+  ** being merged; the merge primitives re-find bfIx from it every step. */
+  i64 bfIxBound;
+  Pgno bfIxBoundLeaf;
 #endif
   i8 iPage;                 /* Index of current page in apPage */
   u8 curIntKey;             /* Value of apPage[0]->intKey */

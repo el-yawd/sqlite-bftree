@@ -4926,7 +4926,7 @@ static int btreeCursor(
   pCur->bfMergeRev = 0;
   pCur->bfOnMini = 0;
   pCur->bfBaseDone = 0;
-  pCur->bfMergeLeaf = 0;
+  pCur->bfMergeLeaf = 0; pCur->bfIxBoundLeaf = 0;
   pCur->bfIx = 0;
   pCur->bfBlindKey = 0;
   pCur->bfBlindArmed = 0;
@@ -4935,6 +4935,8 @@ static int btreeCursor(
   pCur->bfAbsentLeaf = 0;
   pCur->bfAbsentKey = 0;
   pCur->bfAbsentGen = 0;
+  pCur->bfIxBound = 0;
+  pCur->bfIxBoundLeaf = 0;
   pCur->bfScan = 0;
   pCur->bfScanLeaf = 0;
 #endif
@@ -6061,7 +6063,7 @@ static int bfMergePick(BtCursor *pCur){
 
     if( !pPage->leaf ) return SQLITE_CORRUPT_BKPT;
     if( pPage->pgno!=pCur->bfMergeLeaf ){
-      pCur->bfMergeLeaf = pPage->pgno;
+      pCur->bfMergeLeaf = pPage->pgno; pCur->bfIxBoundLeaf = 0;
       pCur->bfIx = 0;
     }
     haveBase = (pCur->ix < pPage->nCell);
@@ -6074,6 +6076,7 @@ static int bfMergePick(BtCursor *pCur){
 
     if( haveIns && (!haveBase || insKey<=baseKey) ){
       pCur->bfIx = foundIx + 1;             /* consume this insert */
+      if( insKey<LARGEST_INT64 ) pCur->bfIxBound = insKey + 1;
       if( haveBase && insKey==baseKey ){
         /* Shadow/update (Stage 2.3): the buffered insert's key still has a
         ** physical base cell — a re-insert of a row deleted earlier in this
@@ -6157,7 +6160,7 @@ static int bfMergePickPrev(BtCursor *pCur){
 
     if( !pPage->leaf ) return SQLITE_CORRUPT_BKPT;
     if( pPage->pgno!=pCur->bfMergeLeaf ){
-      pCur->bfMergeLeaf = pPage->pgno;
+      pCur->bfMergeLeaf = pPage->pgno; pCur->bfIxBoundLeaf = 0;
       pCur->bfIx = BF_MERGE_IX_END;
       pCur->bfBaseDone = (pPage->nCell==0);
     }
@@ -6171,6 +6174,7 @@ static int bfMergePickPrev(BtCursor *pCur){
 
     if( haveIns && (!haveBase || insKey>=baseKey) ){
       pCur->bfIx = foundIx - 1;             /* consume this insert */
+      if( insKey>SMALLEST_INT64 ) pCur->bfIxBound = insKey - 1;
       if( haveBase && insKey==baseKey ){
         /* Shadow/update: the buffered insert supersedes the surviving base
         ** cell for the same key (see bfMergePick for how that arises). */
@@ -6287,7 +6291,7 @@ int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
       rc = bfMergeEnsureScratch(pCur);
       if( rc==SQLITE_OK ){
         pCur->bfMerge = 1;        /* re-arm (moveToRoot cleared it) and pick */
-        pCur->bfMergeLeaf = 0;
+        pCur->bfMergeLeaf = 0; pCur->bfIxBoundLeaf = 0;
         pCur->bfIx = 0;
         pCur->bfOnMini = 0;
         rc = bfMergePick(pCur);
@@ -6395,7 +6399,7 @@ int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
     if( rc!=SQLITE_OK ){ sqlite3BfBtreeMergeBail(pCur); return rc; }
     pCur->bfMerge = 1;            /* re-arm (moveToRoot cleared it) and pick */
     pCur->bfMergeRev = 1;
-    pCur->bfMergeLeaf = 0;
+    pCur->bfMergeLeaf = 0; pCur->bfIxBoundLeaf = 0;
     pCur->bfOnMini = 0;
     pCur->bfBaseDone = 0;
     pCur->curFlags &= ~BTCF_AtLast;
@@ -6986,7 +6990,7 @@ static int bfMergeSeek(BtCursor *pCur, i64 intKey, int biasRight, int *pRes){
   /* Skip the leaf's buffered records below intKey; records are key-sorted, and
   ** every LATER leaf's records are above this leaf's range, so bfMergePick's
   ** per-leaf reset to index 0 stays in-bound for the rest of the scan. */
-  pCur->bfMergeLeaf = pPage->pgno;
+  pCur->bfMergeLeaf = pPage->pgno; pCur->bfIxBoundLeaf = 0;
   pCur->bfIx = 0;
   for(;;){
     int foundIx = pCur->bfIx;
@@ -6997,6 +7001,7 @@ static int bfMergeSeek(BtCursor *pCur, i64 intKey, int biasRight, int *pRes){
     if( r<0 ) return SQLITE_NOTFOUND;       /* mini-page vanished: fall back */
     if( r==0 || insKey>=intKey ){ pCur->bfIx = foundIx; break; }
     pCur->bfIx = foundIx + 1;
+    if( insKey<LARGEST_INT64 ) pCur->bfIxBound = insKey + 1;
   }
 
   pCur->bfMerge = 1;
@@ -7082,7 +7087,7 @@ static int bfMergeSeekRev(BtCursor *pCur, i64 intKey, int *pRes){
     pCur->bfBaseDone = 0;
   }
 
-  pCur->bfMergeLeaf = pPage->pgno;
+  pCur->bfMergeLeaf = pPage->pgno; pCur->bfIxBoundLeaf = 0;
   pCur->bfIx = BF_MERGE_IX_END;
   for(;;){
     int foundIx = pCur->bfIx;
@@ -7093,6 +7098,7 @@ static int bfMergeSeekRev(BtCursor *pCur, i64 intKey, int *pRes){
     if( r<0 ) return SQLITE_NOTFOUND;       /* mini-page vanished: fall back */
     if( r==0 || insKey<=intKey ){ pCur->bfIx = foundIx; break; }
     pCur->bfIx = foundIx - 1;
+    if( insKey>SMALLEST_INT64 ) pCur->bfIxBound = insKey - 1;
   }
 
   pCur->bfMerge = 1;
