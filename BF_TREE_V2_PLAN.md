@@ -1381,9 +1381,9 @@ at three call sites — a fixed **16 entries**.  The reference accumulates towar
      | scans | 0 | 0 / 5941 (was 344 / 4952) | 0.843 (was 0.848) |
      | scans | 1024 | 6 / 6111 (was 6477 / 6477) | **0.843 (was 0.876)** |
      | zipf-raw | 0 | 0 / 1949 (was 758 / 2476) | 0.454 (was 0.453) |
-     | zipf-raw | 1024 | (pending) | (was 0.490) |
+     | zipf-raw | 1024 | 0 / 1899 (was 4335 / 4761) | **0.454 (was 0.490)** |
 
-     M4's read cost on scans is gone; batching itself is neutral once copies can make room.
+     M4's read cost is gone on both arms; batching itself is neutral once copies can make room.
 
 ### S1 — one shared record cache per database file, and threaded readers
 *From: parity plan A3, handoff P7.*  **A project, larger than every M item put together.**
