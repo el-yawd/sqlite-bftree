@@ -2493,3 +2493,39 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
 - Design note raised by the owner: the fork runs a full page store beside the ring (two
   caches, split budget, leaves cached twice), where the reference has ONE pool.  To be
   discussed before further tuning of the split design.
+
+### 2026-10-05 (cont.) — Claude Opus 5.5 — the unified pool: BF matches or beats stock on every arm
+
+- Owner question: why two caches?  The fork registered as SQLite's pcache2 but kept a whole-page
+  store BESIDE the ring (split budget, leaves cached twice); ../bf-tree has ONE pool -- inner
+  nodes heap-allocated, always resident, outside the budget (`inner_node.rs`); a leaf is cached
+  only in the circular buffer, a base leaf is read into a per-op `tmp_buffer` and dropped
+  (`mini_page_op.rs:257`).  Owner decisions: interior pages do NOT count against the budget;
+  leaves kept only while pinned (exactly the reference); full-page triggers unchanged for now.
+- `44c108c` `PRAGMA bf_unified_pool` (default OFF): `bfCacheUnpin` drops a known table leaf
+  (leaf bitmap, now kept in every write-buffering build) when SQLite releases it; page 1 and
+  interior pages are retained off the LRU, outside `nMax`/`xPagecount`.  Gate GREEN 51/51;
+  oracle with the pool on 1296/1296 (scratch variants uni / uni_ring / uni_p100); crash 36/36.
+  Harness: runner `unified_pool` (ring = whole budget, 16-page store), `bfbench --unified-pool`.
+- **`results/unified`** (24/24, 60 min, `--shuffle 7`, direct I/O, 32 MiB budget, every run
+  proven, device wait 72-76 us throughout, repeats within 1%).  Device reads/op (ops/s):
+
+  | arm | stock | split ring 4M | split ring 16M | **unified** |
+  |---|---|---|---|---|
+  | point, scrambled zipf | 0.657 (14.6k) | 0.583 (16.1k) | 0.494 (18.6k) | **0.435 (21.1k) = 1.45x** |
+  | point, contiguous zipf | 0.389 (24.0k) | 0.403 (22.6k) | 0.415 (22.2k) | **0.385 (23.7k) = 0.99x** |
+  | 32-row scans | 0.724 (11.6k) | 0.754 (10.7k) | 0.793 (10.3k) | **0.728 (11.1k) = 0.96x** |
+
+  1. **First configuration in the project's history that is at or below stock's device reads on
+     all three arms**, and the best BF configuration on every arm.  The clustered-read and scan
+     reversal H7 found is gone: full pages now serve 0.575 (zipf-raw) and 1.06 (scans) leaf
+     reads per op.
+  2. Scrambled point reads: 34% fewer device reads than stock, 1.45x throughput -- above the
+     best split (+13%), because the ring now has the whole budget (cached 158k vs 81k).
+  3. Residual: scans 0.96x ops at equal reads = CPU (35.3 vs 32.6 us/op; ring memcpy per leaf
+     + `RecordExists` per row); clustered 0.99x.
+  4. **Caveat that travels with these numbers:** page 1 + 310 interior pages (~1.2 MiB, 3.8% of
+     the budget) are resident outside BF's budget, per the owner's decision and the reference's
+     model; stock's 32 MiB includes its interior pages.
+- Next (owner): make unified the default?  Then the experiments decision 3 deferred (full-page
+  triggers), the buffered-I/O arm, and the scan throughput re-measure (`24d7ada`).
