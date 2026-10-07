@@ -2589,3 +2589,39 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   primitives; consume sites advance it.  Mutant with the bound disabled diverges again.
 - Gate `--full` GREEN 51/51.  UNMEASURED: (a)/(c)/(e) change capacity and retention; they need
   the next campaign (with the ablations) before any number is quoted.
+
+### 2026-10-07 — Claude Opus 5.5 — `results/parity34`: items 3+4 measured with their ablations
+
+- Config `configs/parity34.json` (`0943777`): unified pool, direct I/O, 32 MiB, v100 4M rows,
+  2 repeats, shuffle 7, 60/60 runs clean, manifest not dirty.  SUTs: stock, bf (all on),
+  bf_noshed (4a off), bf_nodirtycoa (4c off), bf_nolbref (4b off), bf min_record=64 (4e off).
+  Quoted metric: device reads/op (repeat pairs agree to <=0.5%); ops/s pairs spread up to 25%
+  -> NOT quotable.
+- Device reads/op, and each switch-off vs bf (negative = turning it off reads LESS):
+
+  | arm | stock | bf | noshed | nodirtycoa | nolbref | min_record 64 |
+  |---|---|---|---|---|---|---|
+  | point zipf (scrambled) | 0.657 | **0.454** (1.45x) | -1.3% | 0.0% | +1.4% | -2.7% |
+  | point zipf-raw (clustered) | 0.389 | **0.368** (1.06x) | -2.1% | -0.2% | +4.9% | +5.0% |
+  | scan zipf-raw | 0.723 | 0.728 | 0 | 0 | 0 | 0 |
+  | update | **0.657** | 1.865 (2.84x MORE) | -0.1% | 0.0% | -0.2% | -0.3% |
+  | insert | **1.182** | 2.228 (1.89x MORE) | +0.3% | 0.0% | 0.0% | 0.0% |
+
+- Item 4 per change: (b) lower-bound REF is the one clear win (+4.9% reads without it on
+  clustered, +1.4% scrambled).  (a) shed costs 1.3-2.1% reads on point arms (keeps 9-10% fewer
+  records); the reference does it, kept for parity, an experiment candidate.  (e) min_record 4 is
+  workload-split (+5% better clustered, 2.7% worse scrambled) -- consistent with
+  [[size-class-base-must-be-tuned]].  (c) no effect on reads; on updates it is what holds the
+  stalls down: with it off, 405 stalls / 309 alloc fails / 110 update fallbacks; with it on 0.
+- Item 3: with item 4c on, update=100 runs with ZERO stalls (`results/dirty_probe` 24,101 before
+  item 3).  The relief itself ran 118 merges in the nodirtycoa arm and every retry succeeded.
+- **NEW FINDING, outside items 3/4 -- the write arms read 2-3x more than stock, every SUT alike.**
+  Decomposition per op (bf, update): 1.00 buffered record, 1.00 record frame, **0.87 merges,
+  0.86 page frames**, 1.86 device reads; insert: 1.00 merges, 1.36 page frames, 2.23 reads.
+  So each buffered record is merged into its base leaf ALONE: the mini-page is evicted holding
+  ~1 record, the merge re-reads the leaf (~0.9-1.0 reads/op) on top of the read the UPDATE /
+  uniqueness probe already paid (~1.0, vs stock 0.66 because the unified pool keeps no leaf
+  after unpin), and writes a page frame anyway -- the record WAL buys nothing.  Same shape as
+  the D3 checkpoint finding (~1 record/leaf).  Next: profile this arm (where the merge is
+  triggered, how many records a merged page held), and compare with the reference's write
+  path before any change.
