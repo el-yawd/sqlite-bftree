@@ -21,6 +21,8 @@
 #   bf_noshed     -DSQLITE_BF_NO_UPGRADE_SHED     upgrades keep cold records (pre-2026-10-06)
 #   bf_nofull     -DSQLITE_BF_NO_FULL_PAGE        M2: no full-page (BF_LOC_FULL) copies
 #   bf_noscan     -DSQLITE_BF_NO_SCAN_PROMOTION   M3: scans promote records at the read rate
+#   bf_nodirtycoa -DSQLITE_BF_NO_DIRTY_COA        item 4c: second chance for clean pages only
+#   bf_nolbref    -DSQLITE_BF_NO_LOWER_BOUND_REF  item 4b: a miss does not mark its lower bound
 #
 # Usage:
 #   sh bench/harness/build_suts.sh            # core variants (stock, bf, bf_ro)
@@ -98,6 +100,9 @@ if [ "$ALL" = 1 ]; then
   build_one bf_nofull     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_FULL_PAGE"
   # M3 ablation (2026-10-05): scan rows promote records (pre-M3), no per-leaf dice.
   build_one bf_noscan     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_SCAN_PROMOTION"
+  # Item 4 ablations (2026-10-06): dirty/write-path copy-on-access, lower-bound REF.
+  build_one bf_nodirtycoa "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_DIRTY_COA"
+  build_one bf_nolbref    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_LOWER_BOUND_REF"
 fi
 
 # bf_off is the same binary as bf; the runner passes --bf-cache off.

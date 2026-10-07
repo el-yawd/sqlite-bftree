@@ -1,0 +1,175 @@
+{
+ "name": "parity34",
+ "_comment": [
+  "Items 3+4 (b881ef8, c538f39) measured with their ablations, one campaign (2026-10-07).",
+  "  bf             everything on (shed on upgrade, lower-bound REF, dirty+write-path CoA, min_record 4)",
+  "  bf_noshed      4a off: upgrades keep cold records",
+  "  bf_nodirtycoa  4c off: second chance for clean pages only, none on the write path",
+  "  bf_nolbref     4b off: a lookup miss marks nothing",
+  "  bf min_record=64   4e off: the old size-class base",
+  "Item 3 (merge-on-eviction) has no switch: read evict_stall_seen / alloc_fails /",
+  "update_fallbacks against results/dirty_probe (same arm, pre-item-3 binary).",
+  "Direct I/O, unified pool, 32 MiB.  QUOTE device reads/op (dio.reads/ops)."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true
+ },
+ "experiments": [
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_noshed",
+    "bf_nodirtycoa",
+    "bf_nolbref"
+   ]
+  },
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "min_record": [
+     64
+    ]
+   }
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_noshed",
+    "bf_nodirtycoa",
+    "bf_nolbref"
+   ]
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "min_record": [
+     64
+    ]
+   }
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "warmup_ops": 300000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_noshed",
+    "bf_nodirtycoa",
+    "bf_nolbref"
+   ]
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "warmup_ops": 300000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "min_record": [
+     64
+    ]
+   }
+  },
+  {
+   "name": "update",
+   "workload": "update=100",
+   "dist": "zipf",
+   "warmup_ops": 300000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_noshed",
+    "bf_nodirtycoa",
+    "bf_nolbref"
+   ]
+  },
+  {
+   "name": "update",
+   "workload": "update=100",
+   "dist": "zipf",
+   "warmup_ops": 300000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "min_record": [
+     64
+    ]
+   }
+  },
+  {
+   "name": "insert",
+   "workload": "insert=100",
+   "dist": "zipf",
+   "warmup_ops": 300000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_noshed",
+    "bf_nodirtycoa",
+    "bf_nolbref"
+   ]
+  },
+  {
+   "name": "insert",
+   "workload": "insert=100",
+   "dist": "zipf",
+   "warmup_ops": 300000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "min_record": [
+     64
+    ]
+   }
+  }
+ ]
+}
