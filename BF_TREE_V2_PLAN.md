@@ -2748,3 +2748,21 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   with the reference in both modes.**  Anything beyond -- e.g. adaptive admission (record vs
   leaf per leaf, by observed spatial reuse), going full sooner than the cap -- is
   experiment-phase and needs the owner.
+
+### 2026-10-08 (cont.) — Claude Opus 5.5 — experiment phase, X1: adaptive record-vs-leaf admission
+
+- Owner "go ahead" after the read audit -> experiment phase on reads (the write-path options
+  stay with the owner: they change the durability design).
+- **X1 (`fefab82`, `085e5b6`; default OFF -- not in the reference)**: per-leaf tallies of
+  descent-shortcut lookups that find the leaf's mini-page and hit / miss the key, kept in
+  `BfMapEntry`'s three padding bytes (hit, miss, epoch; entry size unchanged; reset on
+  ForgetPage), aged into rates (global epoch every 65,536 tallies; counts halve per elapsed
+  epoch).  `PRAGMA bf_adaptive_full=N`: a read promotion on a clean leaf whose mini-page
+  has >= N recent misses and misses >= 4x hits caches the whole leaf instead of the record --
+  spatial reuse is what a page serves and a record cache cannot.  Counter `adaptive_full`;
+  opt-in difftest variant `adaptive` (168/168); gate GREEN.
+- Replay probes (single runs, NOT quotable), v16 32 MiB, device reads/op:
+  unaged N=8: raw 0.430 -> 0.328, scrambled 0.473 -> **0.615** (every leaf eventually crossed);
+  aged N=8: raw **0.317** (stock 0.391, record 0.428), scrambled **0.473** (unchanged);
+  aged N=4: raw 0.323, scrambled 0.489.
+- Campaign `configs/x1.json` running: stock / bf / bf N=8 / bf N=16, v100 + v16, raw + scrambled.
