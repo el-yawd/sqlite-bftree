@@ -2660,3 +2660,30 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   leaf-less (BTCF_BfLeaf) cursor.  Same question for insert's uniqueness probe (a cached
   phantom answers it).
 - Owner priority 2026-10-07: READ performance first; both write items parked behind it.
+
+### 2026-10-07 (cont.) — Claude Opus 5.5 — read audit at parity; M5 mini-page cap (`505347d`)
+
+- Read-path re-audit against `../bf-tree` (owner: reads are the priority).  Point reads:
+  promote a record on a base-page read at `read_promotion_rate` (`tree.rs:1408-1440`,
+  `read_record_cache` default true -- full pages are NOT a read-miss mode by default); a hit
+  in a mini-page/full page gets copy-on-access (`tree.rs:1384-1392`).  Ours matches.  Every
+  miss in `results/parity34` costs exactly one device read (455,270 misses = 455,270 reads,
+  scrambled arm), and the scrambled hit rate (54.6%) is near the Zipf(0.9) ideal for the
+  132k records the ring holds (~63%).  Bytes/record (242 B for ~110 B rows, mini-pages
+  averaging 445 B = the 2-record class) is the reference's own ladder, not a fork defect.
+- **Gap found: the mini-page cap.**  The reference derives `max_mini_page_size` (`tree.rs:
+  204-210`) = 2048 B for a 4 KiB leaf with its defaults, adds it as a class, and never grows a
+  mini-page past it (`leaf_node.rs:1713` searches all classes except the leaf size); beyond
+  it the page merges and becomes a FULL page (`mini_page_op.rs:771, 938-956`), for read
+  promotions too.  The 2026-09-21 audit was right that the 2048 constant is deprecated, but
+  the derived value is the same 2048.  Ours grew 1600 -> 4096: a mini-page as large as the
+  page it caches part of, and a hot leaf went full only past 4096.  Expected to matter most
+  on clustered reads, where `results/parity34` shows 19.6 MB of mini-pages serving 2% of
+  lookups while ~550 full pages serve 61%.
+- **M5 (`505347d`)**: ladder 64 128 256 448 832 1600 **2048** 4096 (identical to the
+  reference's), growth capped at `BF_MAX_MINI_GROW`; clean -> full page at the cap, dirty ->
+  compaction/merge path; `bfDirtyRecordFits` refuses records that cannot fit a capped page.
+  Counter `mini_cap_hits`; ablation `SQLITE_BF_NO_MINI_CAP` (SUT `bf_nocap`, old ladder
+  byte-for-byte).  Smoke: 20k rows x 60 B, cold cache, promotion 100 -> 34 cap hits -> 34 full
+  pages.  Gate `--full` GREEN 51/51 (twice).  Campaign `configs/m5.json` queued behind
+  `configs/paper_small.json` (reads at the paper's ~32 B record shape, pre-M5 binaries).
