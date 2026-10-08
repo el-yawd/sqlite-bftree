@@ -2728,3 +2728,6 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   clean; one case created 241 full pages over a cycling ring).  Gate `--full` GREEN 51/51.
   Campaign `configs/b3b.json` queued (v100 + v16, scrambled + raw, 32 MiB, stock / bf / bf
   mode 0).
+- `results/paper_small_m5` (12/12, 32 MiB, v16): scrambled stock 0.724 / bf 0.473 / nocap 0.473
+  (cap inert, 1.53x); **raw stock 0.391 / bf 0.428 / nocap 0.405** -- the cap costs 5.9% (261 vs
+  381 leaves went full) and leaves bf 9.6% behind stock.  Same direction as `results/m5`.
