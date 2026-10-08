@@ -1,0 +1,66 @@
+{
+ "name": "paper_small_m5",
+ "_comment": [
+  "paper_small at 32 MiB (the saturated budget: 128 MiB never evicted in results/paper_small)",
+  "with M5 (bf, 2048 B mini-page cap) vs bf_nocap (pre-M5 ladder) vs stock.  results/paper_small: raw",
+  "zipf had mini-pages serving 2.9% of lookups -- the cap should turn warm leaves into full pages sooner.",
+  "QUOTE device reads/op."
+ ],
+ "datasets": {
+  "v16": {
+   "records": 20000000,
+   "value_len": 16,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v16",
+  "repeats": 2,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true,
+  "workload": "read=100",
+  "suts": [
+   "stock",
+   "bf",
+   "bf_nocap"
+  ]
+ },
+ "experiments": [
+  {
+   "name": "small_scrambled",
+   "dist": "zipf",
+   "axes": {
+    "budget": [
+     {
+      "label": "32M",
+      "budget_bytes": "32M",
+      "warmup_ops": 4000000
+     }
+    ]
+   }
+  },
+  {
+   "name": "small_raw",
+   "dist": "zipf-raw",
+   "axes": {
+    "budget": [
+     {
+      "label": "32M",
+      "budget_bytes": "32M",
+      "warmup_ops": 4000000
+     }
+    ]
+   }
+  }
+ ]
+}
