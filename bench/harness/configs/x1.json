@@ -1,0 +1,141 @@
+{
+ "name": "x1",
+ "_comment": [
+  "X1 (experiment, default off): adaptive record-vs-leaf admission, aged per-leaf tallies.",
+  "stock vs bf (record mode = reference default) vs bf adaptive_full 8 / 16.  v100 + v16, scrambled + raw,",
+  "32 MiB, direct I/O, unified pool.  Replay probes: v16 raw 0.428 -> 0.317 at N=8, scrambled unchanged.",
+  "QUOTE device reads/op."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  },
+  "v16": {
+   "records": 20000000,
+   "value_len": 16,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true,
+  "workload": "read=100"
+ },
+ "experiments": [
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8,
+     16
+    ]
+   }
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8,
+     16
+    ]
+   }
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "warmup_ops": 4000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8,
+     16
+    ]
+   }
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "warmup_ops": 4000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8,
+     16
+    ]
+   }
+  }
+ ]
+}
