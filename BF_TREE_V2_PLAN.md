@@ -2709,3 +2709,22 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   (warm leaves turn full once their mini-page outgrows it) -- which we lacked until M5, and
   at 16 B records a 4096 B mini-page meant ~120 records before going full vs ~60 at 2048.
   Queued: `configs/paper_small_m5.json` (32 MiB, stock / bf / bf_nocap), behind `m5.json`.
+
+### 2026-10-08 (cont.) — Claude Opus 5.5 — `results/m5` measured; B3b read mode built (`9332035`)
+
+- `results/m5` (30/30 clean, bins `0a67b84`): device reads/op, bf (cap) vs bf_nocap:
+  scrambled 0.4537 vs 0.4536 (0.0%); **clustered 0.3831 vs 0.3687 (+3.9% worse)**; scans,
+  update, insert 0.0%.  mini_cap_hits 588 = full_page_creates 588 on clustered.
+- **Correction to the M5 entry above.**  Pre-M5, a CLEAN mini-page did not grow to 4096: the
+  1600 -> 4096 step returned BF_WANT_FULL (`newSize >= szPage`), so clean leaves already went
+  full past 1600 B (nocap: 621 full creates with 0 cap hits).  Only DIRTY pages could reach
+  4096.  M5 therefore lets clean pages grow to 2048 before going full -- later, not sooner --
+  which is what costs the 3.9%.  Kept: it is the reference's ladder byte for byte (owner rule:
+  parity first, then experiment).  "Go full earlier" is an experiment-phase lever.
+- **B3b (`9332035`)**: `PRAGMA bf_read_record_cache` = the reference's `read_record_cache`
+  (default 1).  0 = a promoted read miss caches the whole leaf instead of the record
+  (`tree.rs:1457`), clean leaves only.  bfbench `--read-record-cache`, runner key
+  `read_record_cache`, opt-in difftest variant `readfull` (NOT in the default gate; 168/168
+  clean; one case created 241 full pages over a cycling ring).  Gate `--full` GREEN 51/51.
+  Campaign `configs/b3b.json` queued (v100 + v16, scrambled + raw, 32 MiB, stock / bf / bf
+  mode 0).
