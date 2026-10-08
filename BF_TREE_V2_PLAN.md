@@ -2687,3 +2687,25 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   byte-for-byte).  Smoke: 20k rows x 60 B, cold cache, promotion 100 -> 34 cap hits -> 34 full
   pages.  Gate `--full` GREEN 51/51 (twice).  Campaign `configs/m5.json` queued behind
   `configs/paper_small.json` (reads at the paper's ~32 B record shape, pre-M5 binaries).
+
+### 2026-10-08 — Claude Opus 5.5 — `results/paper_small`: reads at the paper's record shape (pre-M5)
+
+- `configs/paper_small.json`: 20M rows x 16 B values (526 MB db), direct I/O, unified pool,
+  budgets 32/128 MiB, 2 repeats, 16/16 clean.  Binaries from `0943777` (pre-M5).
+  Device reads/op (stock / bf):
+
+  | arm | 32 MiB | 128 MiB (ring NOT full: evictions 0) |
+  |---|---|---|
+  | scrambled zipf | 0.724 / **0.473** (1.53x fewer) | 0.518 / **0.360** (1.44x) |
+  | raw zipf (the paper's) | **0.391** / 0.404 (+3%) | **0.220** / 0.306 (+39%) |
+
+- Small records do NOT widen the scrambled win (1.53x vs 1.45x at 100 B): 57-69 B/cached
+  record at ~4 records per mini-page.  The 128 MiB cells never filled the ring (12M warmup
+  ops; ~62 MB used) -- mid-fill, not steady state; do not quote them as such.
+- **Raw zipf loses.**  bf 128 MiB: 122k mini-pages (~57 MB) serve 2.9% of lookups; 1,126 full
+  pages (~4.6 MB) serve 67%.  With contiguous hot keys the reuse is SPATIAL (other keys of a
+  warm leaf), so a promoted single record is rarely re-read; a page cache exploits it, a
+  record cache does not.  The reference mitigates this only through the mini-page cap
+  (warm leaves turn full once their mini-page outgrows it) -- which we lacked until M5, and
+  at 16 B records a 4096 B mini-page meant ~120 records before going full vs ~60 at 2048.
+  Queued: `configs/paper_small_m5.json` (32 MiB, stock / bf / bf_nocap), behind `m5.json`.
