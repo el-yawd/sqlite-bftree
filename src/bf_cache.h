@@ -999,6 +999,7 @@ SQLITE_PRIVATE int sqlite3BfBtreeApplyDelete(Pager *pPager, Pgno pgno,
 SQLITE_PRIVATE int sqlite3BfCacheEnabled(void);
 SQLITE_PRIVATE u64 sqlite3BfCacheBufferSize(void);
 SQLITE_PRIVATE int sqlite3BfCachePromotionRate(void);
+SQLITE_PRIVATE int sqlite3BfCacheReadRecordCache(void);
 #if !defined(SQLITE_BF_NO_SCAN_PROMOTION)
 SQLITE_PRIVATE int sqlite3BfCacheScanPromotion(void);
 #endif

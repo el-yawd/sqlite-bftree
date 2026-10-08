@@ -45,6 +45,7 @@ typedef struct BfConfig {
   int nMinRecord;             /* Size-class ladder base; see bf_min_record */
   int nScanPromotion;         /* M3: per-leaf scan promotion rate (0-100) */
   int nEvictTarget;           /* M4: bytes per eviction batch; 0 = legacy 16 */
+  int bReadRecordCache;       /* B3b: read miss caches a record (1) or the leaf */
 } BfConfig;
 
 static BfConfig bfConfig = {
@@ -55,7 +56,8 @@ static BfConfig bfConfig = {
   0,                          /* Group commit off: one flush per commit */
   BF_DEFAULT_MIN_RECORD,      /* the reference's default, 4 (since 2026-10-06) */
   BF_DEFAULT_SCAN_PROMOTION,  /* the reference's scan_promotion_rate default */
-  BF_DEFAULT_EVICT_TARGET     /* the reference's TARGET_EVICT_SIZE */
+  BF_DEFAULT_EVICT_TARGET,    /* the reference's TARGET_EVICT_SIZE */
+  1                           /* the reference's read_record_cache default */
 };
 
 /*
@@ -125,6 +127,18 @@ int sqlite3BfCacheScanPromotion(void){
   return bfConfig.nScanPromotion;
 }
 #endif
+
+/*
+** B3b: the reference's read_record_cache (config.rs:48, default true).  After
+** the read-promotion dice a base-page read either inserts the record into the
+** leaf's mini-page (1) or caches the whole leaf as a full page (0,
+** tree.rs:1419-1460: "if read_record_cache ... else upgrade_to_full_page").
+** A MODE, not an addition: 0 turns record promotion off.  PRAGMA
+** bf_read_record_cache.
+*/
+int sqlite3BfCacheReadRecordCache(void){
+  return bfConfig.bReadRecordCache;
+}
 
 /*
 ** Implementation of PRAGMA bf_cache
@@ -250,6 +264,10 @@ void sqlite3PragmaBfCacheStats(
 
   sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "scan_promotion_rate", P4_STATIC);
   sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nScanPromotion, 2);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+  sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "read_record_cache", P4_STATIC);
+  sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.bReadRecordCache, 2);
   sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
 
   sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "evict_target", P4_STATIC);
@@ -674,6 +692,34 @@ void sqlite3PragmaBfScanPromotion(
     if( rate < 0 ) rate = 0;
     if( rate > 100 ) rate = 100;
     bfConfig.nScanPromotion = rate;
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_read_record_cache  (B3b)
+**
+** PRAGMA bf_read_record_cache;      -- 1: a read miss promotes the record
+** PRAGMA bf_read_record_cache = 0;  -- 0: it caches the whole leaf instead
+**
+** Both subject to bf_promotion_rate, as in the reference.  Full pages need
+** M2; under SQLITE_BF_NO_FULL_PAGE mode 0 promotes nothing.
+*/
+void sqlite3PragmaBfReadRecordCache(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  UNUSED_PARAMETER(zDb);
+  if( zValue == 0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.bReadRecordCache, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_read_record_cache",
+                          SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    bfConfig.bReadRecordCache = sqlite3GetBoolean(zValue, 1) ? 1 : 0;
   }
 }
 

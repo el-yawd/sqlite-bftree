@@ -2505,6 +2505,23 @@ int sqlite3BfBtreePromoteRecord(
     }
   }
 
+#if !defined(SQLITE_BF_NO_FULL_PAGE)
+  /* B3b: the reference's read_record_cache=false mode -- after the dice,
+  ** cache the whole leaf instead of the record (tree.rs:1457).  Same rule as
+  ** the M2 trigger below: only a clean page equal to what the pager would read
+  ** back; a leaf with buffered records is left alone (FullPageCreate refuses). */
+  if( !sqlite3BfCacheReadRecordCache() ){
+    MemPage *pLeaf = pCur->pPage;
+    if( pLeaf && pLeaf->leaf && pLeaf->intKey
+     && (pCur->curFlags & BTCF_BfLeaf)==0
+     && (pLeaf->pDbPage->flags & (PGHDR_WRITEABLE|PGHDR_DIRTY))==0 ){
+      (void)sqlite3BfFullPageCreate(pBf, pLeaf->pgno, pCur->pgnoRoot,
+                                    pLeaf->aData);
+    }
+    return SQLITE_OK;
+  }
+#endif
+
   /* Promote into the mini-page of the leaf the row lives on. */
   {
     u32 leaf = bfCursorLeafPgno(pCur);

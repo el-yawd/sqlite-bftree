@@ -427,6 +427,10 @@ set pragma_def {
   TYPE: BF_SCAN_PROMOTION
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
 
+  NAME: bf_read_record_cache
+  TYPE: BF_READ_RECORD_CACHE
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
   NAME: bf_evict_target
   TYPE: BF_EVICT_TARGET
   IF:   !defined(SQLITE_OMIT_BF_CACHE)

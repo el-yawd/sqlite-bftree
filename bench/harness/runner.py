@@ -355,6 +355,8 @@ def build_argv(run, dbpath, jsonpath, page_floor):
             argv += ["--promotion", str(run["promotion"])]
         if run.get("scan_promotion") is not None:
             argv += ["--scan-promotion", str(run["scan_promotion"])]
+        if run.get("read_record_cache") is not None:
+            argv += ["--read-record-cache", str(run["read_record_cache"])]
         if run.get("evict_target") is not None:
             argv += ["--evict-target", str(run["evict_target"])]
         if run.get("min_record") is not None:

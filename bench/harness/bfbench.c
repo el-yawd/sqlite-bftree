@@ -574,6 +574,7 @@ static void bfStatsRead(sqlite3 *db, BfStats *p){
 static int bfStatIsCumulative(const char *z){
   static const char *az[] = {
     "enabled", "buffer_size", "promotion_rate", "scan_promotion_rate",
+    "read_record_cache",
     "evict_target", "pool_retained_pages", "dirty_list_pages",
     "group_pending",
     /* Live gauges (current state, not a running total): differencing these
@@ -625,6 +626,7 @@ typedef struct Config {
   int nGroupCommit;
   int nPromotion;
   int nScanPromotion;      /* M3: PRAGMA bf_scan_promotion, -1 = build default */
+  int nReadRecordCache;    /* B3b: PRAGMA bf_read_record_cache, -1 = default */
   int nEvictTarget;        /* M4: PRAGMA bf_evict_target, -1 = build default */
   int nMinRecord;             /* PRAGMA bf_min_record; -1 leaves the default */
   int nCopyOnAccess;          /* PRAGMA bf_copy_on_access, percent; -1 = default */
@@ -667,6 +669,7 @@ static void configDefaults(Config *p){
   p->nGroupCommit = -1;
   p->nPromotion = -1;
   p->nScanPromotion = -1;
+  p->nReadRecordCache = -1;
   p->nEvictTarget = -1;
   p->bfEnable = -1;
   p->nOpsPerTxn = 1;
@@ -1103,6 +1106,9 @@ static int cmdRun(Config *p){
   if( p->nScanPromotion >= 0 ){
     execFmt(db, "PRAGMA bf_scan_promotion=%d;", p->nScanPromotion);
   }
+  if( p->nReadRecordCache >= 0 ){
+    execFmt(db, "PRAGMA bf_read_record_cache=%d;", p->nReadRecordCache);
+  }
   if( p->nEvictTarget >= 0 ){
     execFmt(db, "PRAGMA bf_evict_target=%d;", p->nEvictTarget);
   }
@@ -1286,11 +1292,12 @@ static int cmdRun(Config *p){
           p->bfCacheBytes, p->pageCacheBytes);
   fprintf(out, "    \"synchronous\": \"%s\", \"journal_mode\": \"%s\", "
                "\"group_commit\": %d, \"promotion_rate\": %d, "
-               "\"scan_promotion\": %d, \"evict_target\": %d, "
+               "\"scan_promotion\": %d, \"read_record_cache\": %d, "
+               "\"evict_target\": %d, "
                "\"copy_on_access\": %d, \"min_record\": %d, "
                "\"insert_mode\": \"%s\",\n",
           p->zSync, p->zJournal, p->nGroupCommit, p->nPromotion,
-          p->nScanPromotion, p->nEvictTarget,
+          p->nScanPromotion, p->nReadRecordCache, p->nEvictTarget,
           p->nCopyOnAccess, p->nMinRecord,
           p->bInsertReplace ? "replace" : "plain");
   fprintf(out, "    \"ops_per_txn\": %d, \"seed\": %llu, "
@@ -1427,6 +1434,7 @@ static const char zUsage[] =
 "  --synchronous off|normal|full  --journal wal|delete\n"
 "  --group-commit N             --promotion N    --bf-cache on|off\n"
 "  --scan-promotion N           per-leaf scan full-page rate (M3)\n"
+"  --read-record-cache 0|1      B3b: read miss caches the record (1) or leaf (0)\n"
 "  --evict-target N             bytes per eviction batch, 0 = legacy (M4)\n"
 "  --copy-on-access N           PRAGMA bf_copy_on_access, percent of the ring\n"
 "  --insert-mode plain|replace  insert as INSERT (default) or INSERT OR REPLACE\n"
@@ -1477,6 +1485,9 @@ int main(int argc, char **argv){
     else if( strcmp(z,"--journal")==0 ){ NEEDVAL; cfg.zJournal = zVal; }
     else if( strcmp(z,"--group-commit")==0 ){ NEEDVAL; cfg.nGroupCommit = atoi(zVal); }
     else if( strcmp(z,"--promotion")==0 ){ NEEDVAL; cfg.nPromotion = atoi(zVal); }
+    else if( strcmp(z,"--read-record-cache")==0 ){
+      NEEDVAL; cfg.nReadRecordCache = atoi(zVal);
+    }
     else if( strcmp(z,"--scan-promotion")==0 ){
       NEEDVAL; cfg.nScanPromotion = atoi(zVal);
     }

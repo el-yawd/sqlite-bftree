@@ -47,6 +47,13 @@ VARIANTS = {
     "group8": ["PRAGMA bf_group_commit=8;"],
     "promo100": ["PRAGMA bf_promotion_rate=100;", "PRAGMA bf_scan_promotion=100;"],
 }
+# Opt-in variants: run only when named with --variant, never by default (the gate's
+# runtime is a budget the owner protects).
+EXTRA_VARIANTS = {
+    # B3b: read misses cache whole leaves, on a ring small enough to cycle.
+    "readfull": ["PRAGMA bf_cache_size=262144;", "PRAGMA bf_promotion_rate=100;",
+                 "PRAGMA bf_read_record_cache=0;"],
+}
 NOPS = int(os.environ.get("NOPS", "4000"))
 
 
@@ -125,7 +132,7 @@ def run_case(case, bins, work, keep, base_sql, st_res):
     suite, variant, gen, seed, jm = case
     tag = f"{suite}_{variant}_{gen}_s{seed}_{jm}"
     base = os.path.join(work, tag)
-    sql = inject(base_sql, VARIANTS.get(variant, []))
+    sql = inject(base_sql, VARIANTS.get(variant, EXTRA_VARIANTS.get(variant, [])))
     bf = bins["bf_shell"] if suite == "stress" else bins["buf"]
     res = {"bf": run_engine(bf, f"{base}.bf.db", sql), "st": st_res}
     ok = res["bf"] == res["st"]
