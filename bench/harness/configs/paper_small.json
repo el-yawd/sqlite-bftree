@@ -1,0 +1,79 @@
+{
+ "name": "paper_small",
+ "_comment": [
+  "Reads at the PAPER's record shape (2026-10-07, plan H5 scaled down).  bench_bftree.rs inserts",
+  "key=value with 16 B keys, so a record is ~32 B; our usual arms use 100 B values, where a",
+  "mini-page is only ~2x denser per cached record than a 4 KiB leaf.  Here the question is whether",
+  "the paper's ~2x point-read win appears once records are small.",
+  "Scaled: 20M rows x 16 B values (not 100M), budgets 32 MiB and 128 MiB, direct I/O, unified pool,",
+  "both zipf arms (raw = the paper's, scrambled = YCSB's).  Warmup sized to fill the ring:",
+  "a 128 MiB ring holds ~1.5M small records at 30% promotion -> >= 5M misses.",
+  "QUOTE device reads/op."
+ ],
+ "datasets": {
+  "v16": {
+   "records": 20000000,
+   "value_len": 16,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v16",
+  "repeats": 2,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true,
+  "workload": "read=100",
+  "suts": [
+   "stock",
+   "bf"
+  ]
+ },
+ "experiments": [
+  {
+   "name": "small_scrambled",
+   "dist": "zipf",
+   "axes": {
+    "budget": [
+     {
+      "label": "32M",
+      "budget_bytes": "32M",
+      "warmup_ops": 4000000
+     },
+     {
+      "label": "128M",
+      "budget_bytes": "128M",
+      "warmup_ops": 12000000
+     }
+    ]
+   }
+  },
+  {
+   "name": "small_raw",
+   "dist": "zipf-raw",
+   "axes": {
+    "budget": [
+     {
+      "label": "32M",
+      "budget_bytes": "32M",
+      "warmup_ops": 4000000
+     },
+     {
+      "label": "128M",
+      "budget_bytes": "128M",
+      "warmup_ops": 12000000
+     }
+    ]
+   }
+  }
+ ]
+}
