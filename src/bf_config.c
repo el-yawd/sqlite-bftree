@@ -46,6 +46,7 @@ typedef struct BfConfig {
   int nScanPromotion;         /* M3: per-leaf scan promotion rate (0-100) */
   int nEvictTarget;           /* M4: bytes per eviction batch; 0 = legacy 16 */
   int bReadRecordCache;       /* B3b: read miss caches a record (1) or the leaf */
+  int nAdaptiveFull;          /* X1: miss threshold for record->leaf; 0 = off */
 } BfConfig;
 
 static BfConfig bfConfig = {
@@ -57,7 +58,8 @@ static BfConfig bfConfig = {
   BF_DEFAULT_MIN_RECORD,      /* the reference's default, 4 (since 2026-10-06) */
   BF_DEFAULT_SCAN_PROMOTION,  /* the reference's scan_promotion_rate default */
   BF_DEFAULT_EVICT_TARGET,    /* the reference's TARGET_EVICT_SIZE */
-  1                           /* the reference's read_record_cache default */
+  1,                          /* the reference's read_record_cache default */
+  0                           /* X1 off: the reference has no such rule */
 };
 
 /*
@@ -138,6 +140,17 @@ int sqlite3BfCacheScanPromotion(void){
 */
 int sqlite3BfCacheReadRecordCache(void){
   return bfConfig.bReadRecordCache;
+}
+
+/*
+** X1 (EXPERIMENT, not in the reference; default 0 = off): adaptive admission.
+** A read promotion on a leaf whose mini-page has seen at least N misses and at
+** least 4x as many misses as hits caches the whole leaf instead of the record:
+** that leaf's reuse is spatial (other keys of the same leaf), which a page
+** serves and a record cache does not.  See PRAGMA bf_adaptive_full.
+*/
+int sqlite3BfCacheAdaptiveFull(void){
+  return bfConfig.nAdaptiveFull;
 }
 
 /*
@@ -268,6 +281,10 @@ void sqlite3PragmaBfCacheStats(
 
   sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "read_record_cache", P4_STATIC);
   sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.bReadRecordCache, 2);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+
+  sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "adaptive_full_misses", P4_STATIC);
+  sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nAdaptiveFull, 2);
   sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
 
   sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "evict_target", P4_STATIC);
@@ -404,16 +421,16 @@ void sqlite3PragmaBfCacheStats(
         "evict_batches", "evicted_bytes",
         "coa_attempts", "coa_alloc_fails", "coa_full_attempts",
         "coa_full_alloc_fails", "pool_leaf_discards", "pool_retained_pages",
-        "alloc_fails", "dirty_list_pages", "mini_cap_hits"
+        "alloc_fails", "dirty_list_pages", "mini_cap_hits", "adaptive_full"
       };
-      u64 aUpd[24];
+      u64 aUpd[25];
       int iU;
       memset(aUpd, 0, sizeof(aUpd));
       if( pBt ){
         extern void sqlite3BfBtreeUpdateStat(Btree*, u64*);
         sqlite3BfBtreeUpdateStat(pBt, aUpd);
       }
-      for(iU=0; iU<24; iU++){
+      for(iU=0; iU<25; iU++){
         sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, azUpd[iU], P4_STATIC);
         sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&aUpd[iU], P4_INT64);
         sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
@@ -720,6 +737,33 @@ void sqlite3PragmaBfReadRecordCache(
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
   }else{
     bfConfig.bReadRecordCache = sqlite3GetBoolean(zValue, 1) ? 1 : 0;
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_adaptive_full  (X1, experiment)
+**
+** PRAGMA bf_adaptive_full;      -- current miss threshold (0 = off)
+** PRAGMA bf_adaptive_full = N;  -- 1..255
+*/
+void sqlite3PragmaBfAdaptiveFull(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  UNUSED_PARAMETER(zDb);
+  if( zValue == 0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.nAdaptiveFull, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_adaptive_full", SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    int n = sqlite3Atoi(zValue);
+    if( n < 0 ) n = 0;
+    if( n > 255 ) n = 255;
+    bfConfig.nAdaptiveFull = n;
   }
 }
 

@@ -1054,6 +1054,7 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[21] = pBf ? pBf->nAllocFail : 0;
   aOut[22] = pBf ? (u64)pBf->nDirtyPg : 0;
   aOut[23] = pBf ? pBf->nMiniCap : 0;
+  aOut[24] = pBf ? pBf->nAdaptiveFull : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){
@@ -2199,6 +2200,17 @@ int sqlite3BfBtreeRecordExists(
 ** Interior pgnos are never in the map, so this only ever fires at the true
 ** leaf edge.
 */
+/* X1: saturating per-leaf hit/miss tallies (BfMapEntry.nAdHit/nAdMiss).
+** Halving both on saturation keeps the ratio and ages old history. */
+static void bfAdaptiveTally(BfMapEntry *pEntry, int bHit){
+  if( sqlite3BfCacheAdaptiveFull()<=0 ) return;
+  if( pEntry->nAdHit==255 || pEntry->nAdMiss==255 ){
+    pEntry->nAdHit >>= 1;
+    pEntry->nAdMiss >>= 1;
+  }
+  if( bHit ) pEntry->nAdHit++; else pEntry->nAdMiss++;
+}
+
 int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
                                void *pBuf, int *pnBuf, int *pAbsent){
   BtShared   *pBt;
@@ -2237,10 +2249,14 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
   if( rc!=BF_OK ){
     /* BF_DELETED (tombstone/phantom) or miss: let the real descent decide. */
     if( rc==BF_DELETED ) pBf->nMiniPageHit++;
-    else{ pBf->nMiniPageMiss++; *pAbsent = 1; }
+    else{
+      pBf->nMiniPageMiss++; *pAbsent = 1;
+      bfAdaptiveTally(pEntry, 0);
+    }
     return 0;
   }
   pBf->nMiniPageHit++;
+  bfAdaptiveTally(pEntry, 1);
   /* Served from the mini-page: second chance if the head is closing on it.
   ** pMini is dead from here -- the value is already in the caller's buffer. */
   sqlite3BfCacheCopyOnAccess(pBf, pEntry);
@@ -2522,6 +2538,31 @@ int sqlite3BfBtreePromoteRecord(
   }
 #endif
 
+#if !defined(SQLITE_BF_NO_FULL_PAGE)
+  /* X1 (experiment, off by default): a leaf whose mini-page keeps MISSING --
+  ** lookups for other keys of the same leaf, i.e. spatial reuse -- is cached
+  ** whole instead of growing its record cache.  Same clean-leaf rule as B3b. */
+  {
+    int nThresh = sqlite3BfCacheAdaptiveFull();
+    MemPage *pLeaf = pCur->pPage;
+    if( nThresh>0 && pLeaf && pLeaf->leaf && pLeaf->intKey
+     && (pCur->curFlags & BTCF_BfLeaf)==0
+     && (pLeaf->pDbPage->flags & (PGHDR_WRITEABLE|PGHDR_DIRTY))==0 ){
+      BfMapEntry *pE = sqlite3BfMapLookup(pBf, pLeaf->pgno);
+      if( pE && pE->locType==BF_LOC_MINI
+       && pE->nAdMiss>=(u8)nThresh && pE->nAdMiss>=4*(int)pE->nAdHit ){
+        u64 nBefore = pBf->nFullCreate;
+        (void)sqlite3BfFullPageCreate(pBf, pLeaf->pgno, pCur->pgnoRoot,
+                                      pLeaf->aData);
+        if( pBf->nFullCreate!=nBefore ){
+          pBf->nAdaptiveFull++;
+          return SQLITE_OK;
+        }
+      }
+    }
+  }
+#endif
+
   /* Promote into the mini-page of the leaf the row lives on. */
   {
     u32 leaf = bfCursorLeafPgno(pCur);
@@ -2666,6 +2707,7 @@ void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno){
   sqlite3BfLeafBitClear(pBf, pgno);   /* D3b: freed, so no longer a known leaf */
   sqlite3BfFullPageDrop(pBf, pgno);   /* M2: the copy describes the old page */
   pEntry = sqlite3BfMapLookup(pBf, pgno);
+  if( pEntry ){ pEntry->nAdHit = 0; pEntry->nAdMiss = 0; }  /* X1: new page */
   if( pEntry && pEntry->locType==BF_LOC_MINI ){
     /* Drop only CLEAN mini-pages.  A dirty mini-page (buffered BFOP_INSERT /
     ** BFOP_DELETE) must never be silently dropped — that would lose data the

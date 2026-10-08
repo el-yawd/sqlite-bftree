@@ -362,7 +362,14 @@ struct BfMiniPage {
 */
 struct BfMapEntry {
   u8 locType;               /* BfPageLocation enum */
-  u8 reserved[3];           /* Alignment */
+  /* X1 adaptive admission (experiment, PRAGMA bf_adaptive_full): saturating
+  ** per-leaf tallies of descent-shortcut lookups that found this leaf's
+  ** mini-page and hit (nAdHit) or missed (nAdMiss) the key.  Live in the map
+  ** entry, not the mini-page, so they survive size upgrades, copy-on-access
+  ** and eviction.  Were alignment padding; the entry size is unchanged. */
+  u8 nAdHit;
+  u8 nAdMiss;
+  u8 reserved;              /* Alignment */
   void *pPage;              /* Pointer if BF_LOC_MINI or BF_LOC_FULL */
   i64 diskOffset;           /* Base page disk offset */
 };
@@ -573,6 +580,7 @@ struct BfCache {
                             ** the rest were excluded by the buffering gate in
                             ** sqlite3BtreeInsert before BF was even asked */
   u64 nUpgradeShed;         /* Cold cache records dropped by size upgrades */
+  u64 nAdaptiveFull;        /* X1: read promotions turned into full pages */
   u64 nMiniCap;             /* M5: growth refused at BF_MAX_MINI_GROW (the
                             ** next class would have fitted, under 4096) */
   /* Per-seek read outcome (H1b, 2026-09-24): the only honest record hit rate.
@@ -1000,6 +1008,7 @@ SQLITE_PRIVATE int sqlite3BfCacheEnabled(void);
 SQLITE_PRIVATE u64 sqlite3BfCacheBufferSize(void);
 SQLITE_PRIVATE int sqlite3BfCachePromotionRate(void);
 SQLITE_PRIVATE int sqlite3BfCacheReadRecordCache(void);
+SQLITE_PRIVATE int sqlite3BfCacheAdaptiveFull(void);
 #if !defined(SQLITE_BF_NO_SCAN_PROMOTION)
 SQLITE_PRIVATE int sqlite3BfCacheScanPromotion(void);
 #endif

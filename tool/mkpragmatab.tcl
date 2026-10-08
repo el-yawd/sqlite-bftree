@@ -431,6 +431,10 @@ set pragma_def {
   TYPE: BF_READ_RECORD_CACHE
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
 
+  NAME: bf_adaptive_full
+  TYPE: BF_ADAPTIVE_FULL
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
   NAME: bf_evict_target
   TYPE: BF_EVICT_TARGET
   IF:   !defined(SQLITE_OMIT_BF_CACHE)

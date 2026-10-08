@@ -922,6 +922,11 @@ void sqlite3Pragma(
     sqlite3PragmaBfEvictTarget(pParse, zDb, zRight);
     break;
   }
+  case PragTyp_BF_ADAPTIVE_FULL: {
+    extern void sqlite3PragmaBfAdaptiveFull(Parse*, const char*, const char*);
+    sqlite3PragmaBfAdaptiveFull(pParse, zDb, zRight);
+    break;
+  }
   case PragTyp_BF_READ_RECORD_CACHE: {
     extern void sqlite3PragmaBfReadRecordCache(Parse*, const char*, const char*);
     sqlite3PragmaBfReadRecordCache(pParse, zDb, zRight);

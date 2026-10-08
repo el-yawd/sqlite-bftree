@@ -355,6 +355,8 @@ def build_argv(run, dbpath, jsonpath, page_floor):
             argv += ["--promotion", str(run["promotion"])]
         if run.get("scan_promotion") is not None:
             argv += ["--scan-promotion", str(run["scan_promotion"])]
+        if run.get("adaptive_full") is not None:
+            argv += ["--adaptive-full", str(run["adaptive_full"])]
         if run.get("read_record_cache") is not None:
             argv += ["--read-record-cache", str(run["read_record_cache"])]
         if run.get("evict_target") is not None:

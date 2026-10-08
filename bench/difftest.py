@@ -53,6 +53,9 @@ EXTRA_VARIANTS = {
     # B3b: read misses cache whole leaves, on a ring small enough to cycle.
     "readfull": ["PRAGMA bf_cache_size=262144;", "PRAGMA bf_promotion_rate=100;",
                  "PRAGMA bf_read_record_cache=0;"],
+    # X1 (experiment): adaptive record->leaf admission at a low threshold.
+    "adaptive": ["PRAGMA bf_cache_size=262144;", "PRAGMA bf_promotion_rate=100;",
+                 "PRAGMA bf_adaptive_full=2;"],
 }
 NOPS = int(os.environ.get("NOPS", "4000"))
 
