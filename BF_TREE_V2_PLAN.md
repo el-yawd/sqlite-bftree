@@ -2731,3 +2731,20 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - `results/paper_small_m5` (12/12, 32 MiB, v16): scrambled stock 0.724 / bf 0.473 / nocap 0.473
   (cap inert, 1.53x); **raw stock 0.391 / bf 0.428 / nocap 0.405** -- the cap costs 5.9% (261 vs
   381 leaves went full) and leaves bf 9.6% behind stock.  Same direction as `results/m5`.
+- `results/b3b` (24/24, bins `6a46013`, 32 MiB, direct I/O): device reads/op, x = stock/bf.
+
+  | arm | stock | bf record mode (default) | bf page mode (`read_record_cache=0`) |
+  |---|---|---|---|
+  | v100 scrambled | 0.657 | **0.454 (1.45x)** | 0.658 (1.00x) |
+  | v100 raw | 0.389 | 0.383 (1.01x) | 0.392 (0.99x) |
+  | v16 scrambled | 0.724 | **0.473 (1.53x)** | 0.723 (1.00x) |
+  | v16 raw | 0.391 | 0.429 (0.91x) | 0.393 (1.00x) |
+
+  Page mode is a FIFO page cache and lands on stock's LRU everywhere (each promoted leaf is
+  evicted again: ~145k creates / ~145k full evictions).  Record mode is the whole win, and only
+  where hot records are SCATTERED; with contiguous hot keys the best either reference mode does
+  is parity, and record mode at small records loses 9% (mini-pages hold 365k records serving
+  3.5% of lookups, memory a page cache would have used).  **Reads are at parity of mechanism
+  with the reference in both modes.**  Anything beyond -- e.g. adaptive admission (record vs
+  leaf per leaf, by observed spatial reuse), going full sooner than the cap -- is
+  experiment-phase and needs the owner.
