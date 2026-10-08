@@ -2200,10 +2200,28 @@ int sqlite3BfBtreeRecordExists(
 ** Interior pgnos are never in the map, so this only ever fires at the true
 ** leaf edge.
 */
-/* X1: saturating per-leaf hit/miss tallies (BfMapEntry.nAdHit/nAdMiss).
-** Halving both on saturation keeps the ratio and ages old history. */
-static void bfAdaptiveTally(BfMapEntry *pEntry, int bHit){
+/* X1: saturating per-leaf hit/miss tallies (BfMapEntry.nAdHit/nAdMiss),
+** aged into RATES: a global epoch advances every BF_ADAPTIVE_EPOCH tallies and
+** an entry's counts halve once per epoch elapsed since it was last touched.
+** Without aging (first probe) any leaf eventually crossed the threshold, and
+** scrambled zipf went 0.473 -> 0.615 device reads/op.  Halving both on
+** saturation keeps the ratio. */
+#ifndef BF_ADAPTIVE_EPOCH
+# define BF_ADAPTIVE_EPOCH 65536
+#endif
+static void bfAdaptiveTally(BfCache *pBf, BfMapEntry *pEntry, int bHit){
+  u8 nAge;
   if( sqlite3BfCacheAdaptiveFull()<=0 ) return;
+  if( ++pBf->nAdTick>=BF_ADAPTIVE_EPOCH ){
+    pBf->nAdTick = 0;
+    pBf->iAdEpoch++;
+  }
+  nAge = (u8)(pBf->iAdEpoch - pEntry->nAdEpoch);
+  if( nAge ){
+    if( nAge>=8 ){ pEntry->nAdHit = 0; pEntry->nAdMiss = 0; }
+    else{ pEntry->nAdHit >>= nAge; pEntry->nAdMiss >>= nAge; }
+    pEntry->nAdEpoch = pBf->iAdEpoch;
+  }
   if( pEntry->nAdHit==255 || pEntry->nAdMiss==255 ){
     pEntry->nAdHit >>= 1;
     pEntry->nAdMiss >>= 1;
@@ -2251,12 +2269,12 @@ int sqlite3BfBtreeDescentServe(BtCursor *pCur, Pgno chldPg, i64 intKey,
     if( rc==BF_DELETED ) pBf->nMiniPageHit++;
     else{
       pBf->nMiniPageMiss++; *pAbsent = 1;
-      bfAdaptiveTally(pEntry, 0);
+      bfAdaptiveTally(pBf, pEntry, 0);
     }
     return 0;
   }
   pBf->nMiniPageHit++;
-  bfAdaptiveTally(pEntry, 1);
+  bfAdaptiveTally(pBf, pEntry, 1);
   /* Served from the mini-page: second chance if the head is closing on it.
   ** pMini is dead from here -- the value is already in the caller's buffer. */
   sqlite3BfCacheCopyOnAccess(pBf, pEntry);

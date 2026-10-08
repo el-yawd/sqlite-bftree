@@ -369,7 +369,7 @@ struct BfMapEntry {
   ** and eviction.  Were alignment padding; the entry size is unchanged. */
   u8 nAdHit;
   u8 nAdMiss;
-  u8 reserved;              /* Alignment */
+  u8 nAdEpoch;              /* X1: epoch of the last tally (ages the two above) */
   void *pPage;              /* Pointer if BF_LOC_MINI or BF_LOC_FULL */
   i64 diskOffset;           /* Base page disk offset */
 };
@@ -581,6 +581,8 @@ struct BfCache {
                             ** sqlite3BtreeInsert before BF was even asked */
   u64 nUpgradeShed;         /* Cold cache records dropped by size upgrades */
   u64 nAdaptiveFull;        /* X1: read promotions turned into full pages */
+  u32 nAdTick;              /* X1: tallies since the epoch last advanced */
+  u8 iAdEpoch;              /* X1: current epoch (wraps) */
   u64 nMiniCap;             /* M5: growth refused at BF_MAX_MINI_GROW (the
                             ** next class would have fitted, under 4096) */
   /* Per-seek read outcome (H1b, 2026-09-24): the only honest record hit rate.
