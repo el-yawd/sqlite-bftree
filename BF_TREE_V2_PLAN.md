@@ -2766,3 +2766,15 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   aged N=8: raw **0.317** (stock 0.391, record 0.428), scrambled **0.473** (unchanged);
   aged N=4: raw 0.323, scrambled 0.489.
 - Campaign `configs/x1.json` running: stock / bf / bf N=8 / bf N=16, v100 + v16, raw + scrambled.
+- `results/x1` STOPPED by the owner at 18/32 runs (v100 arms complete, v16 partial).  Device
+  reads/op (2 repeats unless noted; x = stock/that):
+
+  | arm | stock | bf record mode | X1 N=8 | X1 N=16 |
+  |---|---|---|---|---|
+  | v100 scrambled | 0.657 | 0.454 (1.45x) | 0.454 (1.45x) | 0.454 (1.45x) |
+  | v100 raw | 0.389 | 0.383 (1.02x) | **0.333 (1.17x)** | 0.372 (1.05x) |
+  | v16 raw (1 run each) | 0.392 | -- | **0.317 (1.23x)** | -- |
+
+  X1 at N=8 keeps the scrambled win intact and turns raw from parity into a win; N=16 admits
+  too few leaves.  Missing: v16 scrambled (replay probe: 0.473 at N=8 = record mode) and the
+  rest of v16 raw.  X1 stays DEFAULT OFF pending the owner.
