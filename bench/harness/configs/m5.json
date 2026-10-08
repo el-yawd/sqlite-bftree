@@ -1,0 +1,90 @@
+{
+ "name": "m5",
+ "_comment": [
+  "M5 (505347d): mini-page cap at the reference's derived 2048 B vs bf_nocap (growth to 4096, pre-M5).",
+  "Same arms/settings as parity34 (unified pool, direct I/O, 32 MiB, v100 4M rows).  Expect: clustered point",
+  "reads go full-page sooner (full_page_creates up, mini_cap_hits > 0); scrambled barely moves (mini-pages",
+  "average ~445 B); writes merge sooner when a dirty page hits the cap.  QUOTE device reads/op."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true
+ },
+ "experiments": [
+  {
+   "name": "read_zipf",
+   "workload": "read=100",
+   "dist": "zipf",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nocap"
+   ]
+  },
+  {
+   "name": "read_zipfraw",
+   "workload": "read=100",
+   "dist": "zipf-raw",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nocap"
+   ]
+  },
+  {
+   "name": "scan_zipfraw",
+   "workload": "scan=100",
+   "dist": "zipf-raw",
+   "warmup_ops": 300000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nocap"
+   ]
+  },
+  {
+   "name": "update",
+   "workload": "update=100",
+   "dist": "zipf",
+   "warmup_ops": 300000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nocap"
+   ]
+  },
+  {
+   "name": "insert",
+   "workload": "insert=100",
+   "dist": "zipf",
+   "warmup_ops": 300000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nocap"
+   ]
+  }
+ ]
+}
