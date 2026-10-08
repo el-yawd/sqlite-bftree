@@ -1202,6 +1202,9 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   ** one step from the 64-byte initial allocation reaches only 128. */
   newSize = sqlite3BfMiniPageSizeClassFor(pMini, nKey, nVal,
                                           pCache->aSizeClass);
+#if !defined(SQLITE_BF_NO_MINI_CAP)
+  if( newSize==0 && pMini->nodeSize>=BF_MAX_MINI_GROW ) pCache->nMiniCap++;
+#endif
 #if !defined(SQLITE_BF_NO_FULL_PAGE)
   /* M2: the reference's trigger.  A clean mini-page that would need a slab as
   ** large as the page itself (or cannot grow at all) caches the whole leaf

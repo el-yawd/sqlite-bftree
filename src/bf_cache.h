@@ -40,7 +40,29 @@ typedef struct BfFreeList BfFreeList;
 */
 #define BF_MIN_MINI_PAGE      64
 #define BF_MAX_MINI_PAGE      4096
-#define BF_SIZE_CLASS_COUNT   7
+#define BF_SIZE_CLASS_COUNT   8
+
+/* M5 (2026-10-07): the largest a MINI-page may grow, as the reference derives
+** it (tree.rs:204-210, non-cache-only mode):
+**
+**     leaf_page_size - (cb_max_record_size + sizeof(LeafKVMeta))
+**                    - max_fence_len - 2*sizeof(LeafKVMeta),  aligned DOWN to 64
+**
+** with its defaults 4096, 1952, 8, 32 (2 x cb_max_key_len 16): 2088 -> 2048.
+** new_size_if_upgrade (leaf_node.rs:1713) searches every class EXCEPT the last
+** (the leaf size), so a mini-page never exceeds this; growing past it merges
+** the mini-page and, with write_load_full_page (default true), caches the whole
+** leaf instead (mini_page_op.rs:771/938-956) -- for a read promotion too.
+** Before this our ladder ended 1600 -> 4096 and a mini-page could be as large as
+** the page it partially caches.  4096 stays the ladder's last class (the
+** free list and the full-page slab size rely on it); it is just never a
+** mini-page.  -DSQLITE_BF_NO_MINI_CAP restores growth to BF_MAX_MINI_PAGE. */
+#if !defined(SQLITE_BF_NO_MINI_CAP)
+# define BF_MAX_MINI_GROW \
+    (((BF_MAX_MINI_PAGE - (1952 + 8) - 32 - 2*8) / 64) * 64)
+#else
+# define BF_MAX_MINI_GROW     BF_MAX_MINI_PAGE
+#endif
 
 /* Size-class derivation (B1), matching the reference.
 **
@@ -551,6 +573,8 @@ struct BfCache {
                             ** the rest were excluded by the buffering gate in
                             ** sqlite3BtreeInsert before BF was even asked */
   u64 nUpgradeShed;         /* Cold cache records dropped by size upgrades */
+  u64 nMiniCap;             /* M5: growth refused at BF_MAX_MINI_GROW (the
+                            ** next class would have fitted, under 4096) */
   /* Per-seek read outcome (H1b, 2026-09-24): the only honest record hit rate.
   ** nMiniPageHit/Miss count LOOKUPS, and one point read makes several (descent
   ** shortcut, the RecordExists at the leaf, fetchPayload's RecordExists, each

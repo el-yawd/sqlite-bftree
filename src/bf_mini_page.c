@@ -214,17 +214,25 @@ void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord){
   ** ladder happens to yield exactly 6 classes below 4096 for today's geometry,
   ** but a different BF_MIN_RECORD would yield more, and the final class has to
   ** be the full page or a max-size mini-page could not be allocated at all. */
-  for(k = 0; i < BF_SIZE_CLASS_COUNT - 1; k++){
+  /* Two slots are reserved: the mini-page cap (M5, BF_MAX_MINI_GROW) and the
+  ** leaf size.  Under SQLITE_BF_NO_MINI_CAP the cap IS the leaf size and only
+  ** one is used; the spare slot is padding. */
+  for(k = 0; i < BF_SIZE_CLASS_COUNT - 2; k++){
     u64 sz = ((u64)1 << k) * (u64)c + (u64)hdr;
     if( sz % BF_CACHE_LINE ){
       sz = (sz / BF_CACHE_LINE + 1) * BF_CACHE_LINE;
     }
-    if( sz >= BF_MAX_MINI_PAGE ) break;
+    if( sz >= BF_MAX_MINI_GROW ) break;
     /* Strictly increasing only: cache-line rounding can repeat a class when
     ** the record size is tiny. */
     if( i==0 || (u32)sz > aSizeClass[i-1] ){
       aSizeClass[i++] = (u32)sz;
     }
+  }
+  /* The reference pushes max_mini_page_size as a class of its own
+  ** (tree.rs:258-262), then the leaf size. */
+  if( BF_MAX_MINI_GROW < BF_MAX_MINI_PAGE ){
+    aSizeClass[i++] = (u32)BF_MAX_MINI_GROW;
   }
   while( i < BF_SIZE_CLASS_COUNT ){
     aSizeClass[i++] = BF_MAX_MINI_PAGE;
@@ -271,6 +279,10 @@ u32 sqlite3BfMiniPageSizeClassFor(
 
   assert( aSizeClass[0] < aSizeClass[BF_SIZE_CLASS_COUNT-1] );  /* ascending */
   for(i = 0; i < BF_SIZE_CLASS_COUNT; i++){
+    /* M5: never past the mini-page cap -- 0 sends a clean page to the
+    ** full-page trigger and a dirty one to compaction / merge, as the
+    ** reference's new_size_if_upgrade returning None does. */
+    if( aSizeClass[i] > BF_MAX_MINI_GROW ) break;
     if( aSizeClass[i] > pMini->nodeSize && aSizeClass[i] >= needed ){
       return aSizeClass[i];
     }

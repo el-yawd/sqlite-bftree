@@ -1053,6 +1053,7 @@ void sqlite3BfBtreeUpdateStat(Btree *p, u64 *aOut){
   aOut[20] = pBf ? (u64)sqlite3BfCacheRetainedPages(pBf) : 0;
   aOut[21] = pBf ? pBf->nAllocFail : 0;
   aOut[22] = pBf ? (u64)pBf->nDirtyPg : 0;
+  aOut[23] = pBf ? pBf->nMiniCap : 0;
 }
 
 void sqlite3BfBtreeClearCache(Btree *p){
@@ -1347,6 +1348,13 @@ static int bfDirtyRecordFits(BfCache *pBf, int nVal){
   BfWalRec r;
   memset(&r, 0, sizeof(r));
   r.pgno = 2; r.rootPgno = 2; r.op = BFWAL_OP_INSERT; r.nKey = 8; r.nVal = nVal;
+  /* M5: and it must fit a mini-page at its cap (BF_MAX_MINI_GROW) -- the
+  ** reference's cb_max_record_size plays this role -- or the buffered write
+  ** would have nowhere to live and would fall back after building a page. */
+  if( (u64)sizeof(BfMiniPage) + sizeof(BfKVMeta) + 8 + (u64)nVal
+        > (u64)BF_MAX_MINI_GROW ){
+    return 0;
+  }
   return sqlite3BfWalRecSize(&r) <= pBf->szPage - BFWAL_HDRSIZE;
 }
 
