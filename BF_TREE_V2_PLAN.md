@@ -2625,3 +2625,38 @@ object and cannot be recovered**.  Its content survives only in §1, §2, §3, �
   the D3 checkpoint finding (~1 record/leaf).  Next: profile this arm (where the merge is
   triggered, how many records a merged page held), and compare with the reference's write
   path before any change.
+
+### 2026-10-07 (cont.) — Claude Opus 5.5 — write-arm diagnosis: two causes, both measured
+
+Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the same cell:
+- **Cause 1 -- checkpoint materialisation (~0.9 of the 1.86 reads/op).**  33% of all samples sit
+  under `sqlite3WalDefaultHook -> sqlite3Checkpoint -> bfCheckpointMaterialize ->
+  sqlite3BfBtreeFlushAllDirty -> bfFlushOneMiniPage`: the default `wal_autocheckpoint` (1000
+  frames) merges EVERY dirty mini-page into its leaf; under scrambled zipf over ~110k leaves that
+  is ~1 record per leaf, each costing a leaf read + a page frame.  Eviction merges do NOT cause it
+  (evict_stall_seen = 0 with item 4c).  NB `merges` counts RECORDS applied
+  (`nMergeToBase += nApplied`), not flushes.  Replays: autocheckpoint 0 -> 0.93 reads/op;
+  10000 -> 1.71 (records/leaf grows only slowly with the interval).
+  **Reference:** its CPR snapshot (`snapshot.rs:913`, `snapshot_mini_page`) writes dirty
+  mini-pages AS mini-pages to the snapshot file; it never merges them to base to truncate a
+  log.  Ours must, because SQLite resets the WAL from frame 1: a record not in base has no
+  other durable home.  Carrying records into the next generation is not crash-safe as is --
+  the first new frame (new salt) invalidates every old frame, so a crash before the carry
+  commit is durable loses committed records; no write ordering inside one WAL file avoids it.
+  Options for the owner (none started): (a) decouple record materialisation from page
+  backfill (materialise every K checkpoints / at a WAL-size bound; costs WAL growth);
+  (b) a carry protocol that needs a second durable location = the sidecar the locked design
+  forbids; (c) accept and report it as the SQL/WAL structural cost.
+  Measurement caveat: the bfdio shim covers the MAIN DB only; the WAL is buffered I/O, so with
+  autocheckpoint 0 stock re-reads its pages from the WAL through the OS cache (0.011 reads/op)
+  and the arm is not comparable.  Compare write arms at the default autocheckpoint only.
+- **Cause 2 -- the UPDATE's own row read (~0.9-1.0 reads/op vs stock 0.66).**  SQL UPDATE
+  seeks with a WRITE cursor and `sqlite3BfBtreeDescentServe` refuses write cursors
+  (`BTCF_WriteFlag`), and serves only CLEAN `BFOP_CACHE` records, so every update reads its
+  leaf even when the row is cached; the unified pool keeps no leaf after unpin, while stock's
+  page cache does.  The reference's update is a blind upsert that reads nothing.  Candidate
+  (unbuilt): let a write cursor be served from the mini-page (clean or dirty INSERT record)
+  when the following op is a buffered update -- needs D3's buffered-update path to accept a
+  leaf-less (BTCF_BfLeaf) cursor.  Same question for insert's uniqueness probe (a cached
+  phantom answers it).
+- Owner priority 2026-10-07: READ performance first; both write items parked behind it.
