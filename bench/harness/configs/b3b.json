@@ -1,0 +1,137 @@
+{
+ "name": "b3b",
+ "_comment": [
+  "B3b (9332035): the reference's read mode -- read_record_cache=1 (record promotion, default) vs 0",
+  "(a read miss caches the whole leaf) vs stock.  Point reads, 32 MiB, direct I/O, unified pool,",
+  "two record shapes (v100: 100 B values, 4M rows; v16: 16 B values, 20M rows), scrambled and raw zipf.",
+  "results/paper_small: under raw zipf mini-pages served 2.9% of lookups.  QUOTE device reads/op."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  },
+  "v16": {
+   "records": 20000000,
+   "value_len": 16,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true,
+  "workload": "read=100"
+ },
+ "experiments": [
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "warmup_ops": 4000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "warmup_ops": 4000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  }
+ ]
+}
