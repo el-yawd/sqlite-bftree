@@ -2839,3 +2839,20 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - The checkpoint-architecture decision (§4.3) is still the owner's; this stopgap keeps it
   correct at a memory cost in the pathological case (rebuilding connection's ring smaller
   than the dirty set).
+
+### 2026-10-12 (cont.) — Claude Opus 5.5 — WAL under direct I/O (`28d0d2b`)
+
+- Owner: direct I/O for the WAL is required for consistent write measurements.  `--direct-io`
+  now covers the WAL: aligned covering reads; read-modify-write of whole blocks with a
+  process-wide tail-block cache (appends cost no reads; bytes past the log generation's
+  high-water mark are dead and zero-filled); write-combining so each block reaches the device
+  about once (device/logical 1.00-1.08 at NORMAL; 1.44-1.78 at FULL, where the per-commit sync
+  forces the partial block, as a real fsync does).  New `dio.wal_*` fields + WAL mincore proof.
+- Verified on 4 write configs x stock/bf x buffered/direct: identical `.dump`, integrity ok,
+  0 RMW reads, WAL never resident.  **Every write-arm number before `28d0d2b` used a buffered
+  WAL** (checkpoint backfill read WAL frames from the OS cache): re-measure, do not mix.
+- Discussed, not built: Option A' checkpoint (materialise from the WAL index, not the cache);
+  write amplification needs sub-page record frames (#1) + records surviving restart (#2) --
+  both collide with locked decisions; plugging the reference in as SQLite's B-tree is months
+  (no txns/rollback/reverse scans/FFI) -- a standalone reference calibration run is the cheap
+  alternative (owner: yes, next).
