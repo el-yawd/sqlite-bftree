@@ -628,6 +628,8 @@ struct BfCache {
   u64 nRollbackRehydrate;
   u64 nClearLogged;
   u64 nSnapshotRehydrate;   /* rebuilds because another connection wrote */
+  u64 nRingGrow;            /* rebuilds that grew the ring to fit the replay */
+  u64 nRingPeak;            /* largest ring capacity in force, bytes */
   u32 iDataVersionSeen;     /* non-WAL: data_version the cache was built for */
   u32 aSnapSeen[3];         /* WAL: snapshot (mxFrame, salts) it reflects */
   u8 bSnapSeen;             /* aSnapSeen is valid */
@@ -994,6 +996,7 @@ SQLITE_PRIVATE void sqlite3BfBtreeClearCache(Btree *p);
 /* Full ROLLBACK in WAL mode: empty the cache, then rebuild its committed dirty
 ** state from the log (consumes apStage).  See bf_btree.c. */
 SQLITE_PRIVATE int sqlite3BfBtreeSnapshotRehydrate(Btree *p);
+SQLITE_PRIVATE u64 sqlite3BfCacheReplayBound(BfCache*, BfWalIndex*, u32, int);
 SQLITE_PRIVATE int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage,
                                                    int nStage);
 /* Checkpoint's forced-flush commit: log the CLEARs its flush produced. */

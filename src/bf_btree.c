@@ -1015,6 +1015,8 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[3] = pBf ? pBf->nReplayDropped : 0;
   aOut[4] = pBf ? pBf->nRollbackRehydrate : 0;
   aOut[6] = pBf ? pBf->nSnapshotRehydrate : 0;
+  aOut[7] = pBf ? pBf->nRingGrow : 0;
+  aOut[8] = pBf ? pBf->nRingPeak : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -1175,9 +1177,33 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
   if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
   if( pBf ){
     int bAllDurable = 0;
+    u64 nDropBefore;
     sqlite3BfBtreeClearCache(p);
     pBf->nFlushed = 0;       /* every flush of this txn was rolled back too */
     pBf->bFlushedOom = 0;
+    /* Size the ring for the replay (2026-10-12).  The cache is empty now, so it
+    ** can be rebuilt at any capacity: grow it when the committed dirty set will
+    ** not fit (replay cannot evict dirty records and used to DROP them), and
+    ** come back to the configured size once a later rebuild fits in it. */
+    {
+      u64 need = sqlite3PagerBfReplayBound(p->pBt->pPager, pBf);
+      u64 want = sqlite3BfCacheBufferSize();
+      u64 cap = want;
+      while( cap < need + need/4 + 65536 ) cap <<= 1;   /* power of two */
+      /* Rebuilding frees the ring's memory, where the plain clear above only
+      ** unlinked mappings and left the slabs in place.  An open cursor may
+      ** still hold a raw mini-page pointer (merge scans), so resize only when
+      ** none is open: always true for a snapshot rebuild (no transaction). */
+      if( cap!=pBf->cb.capacity && p->pBt->pCursor==0 ){
+        sqlite3BfCircularBufferDestroy(&pBf->cb);
+        rc = sqlite3BfCircularBufferInit(&pBf->cb, cap);
+        pBf->nDirty = 0;
+        if( rc!=SQLITE_OK ) return rc;
+        if( cap>want ) pBf->nRingGrow++;
+      }
+      if( cap>pBf->nRingPeak ) pBf->nRingPeak = cap;
+    }
+    nDropBefore = pBf->nReplayDropped;
     rc = sqlite3PagerBfReplayLog(p->pBt->pPager, pBf, &bAllDurable);
     g = (BfGroup*)pBf->pGroupCommit;
     if( rc==SQLITE_OK && g==0 && nStage>0 ){
@@ -1230,6 +1256,13 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
     if( rc==SQLITE_OK && bAllDurable ){
       sqlite3BfMapIterate(pBf, bfMarkLoggedCallback, NULL);
       sqlite3BfUnlogListReset(pBf);
+    }
+    /* A dropped replay is a lost committed record: fail rather than answer
+    ** from a cache that is missing rows. */
+    if( rc==SQLITE_OK && pBf->nReplayDropped!=nDropBefore ){
+      sqlite3_log(SQLITE_FULL, "BF replay could not hold %llu committed records",
+                  (unsigned long long)(pBf->nReplayDropped - nDropBefore));
+      rc = SQLITE_FULL;
     }
   }
   sqlite3BfWalIndexFree(pTmp);

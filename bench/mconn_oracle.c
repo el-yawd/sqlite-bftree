@@ -24,8 +24,9 @@
 **   cc -O1 -g -DSQLITE_OMIT_BF_CACHE -Ibuild -Isrc \
 **      -o build/mconn_stock bench/mconn_oracle.c build/sqlite3.c -lm -lpthread
 ** Usage:
-**   mconn_buf DB SEED NOPS NREADERS ["PRAGMA ...; PRAGMA ...;"]
-** The pragma string is applied to EVERY connection after journal_mode=wal.
+**   mconn_buf DB SEED NOPS NREADERS ["PRAGMAS"] ["READER PRAGMAS"]
+** PRAGMAS go to EVERY connection after journal_mode=wal; READER PRAGMAS, when
+** given, go to the readers only, after PRAGMAS (e.g. a smaller ring).
 */
 #include "sqlite3.h"
 #include <stdio.h>
@@ -298,6 +299,7 @@ int main(int argc, char **argv){
   long nOps;
   int i, k;
   const char *zPragmas;
+  const char *zReaderPragmas;
   if( argc<5 ){
     fprintf(stderr, "usage: %s DB SEED NOPS NREADERS [PRAGMAS]\n", argv[0]);
     return 2;
@@ -308,6 +310,7 @@ int main(int argc, char **argv){
   nReader = atoi(argv[4]);
   if( nReader<1 || nReader>MAXREAD ) nReader = 2;
   zPragmas = argc>5 ? argv[5] : "";
+  zReaderPragmas = argc>6 ? argv[6] : "";
   { char b[600];
     snprintf(b, sizeof(b), "%s", zDbPath); remove(b);
     snprintf(b, sizeof(b), "%s-wal", zDbPath); remove(b);
@@ -331,7 +334,10 @@ int main(int argc, char **argv){
   execOk(W.db, "COMMIT");
   memcpy(aModel, aWork, sizeof(aModel));
   W.inTxn = 0;
-  for(i=0; i<nReader; i++) openConn(&R[i], zPragmas);
+  for(i=0; i<nReader; i++){
+    openConn(&R[i], zPragmas);
+    if( zReaderPragmas[0] ) execOk(R[i].db, zReaderPragmas);
+  }
 
   for(iOp=0; iOp<nOps; iOp++){
     int r = rndn(100);

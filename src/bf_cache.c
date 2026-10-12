@@ -1500,6 +1500,67 @@ static int bfReplayOnePage(void *pCtx, u32 pgno){
   return BFWAL_OK;
 }
 
+/*
+** Upper bound on the ring bytes sqlite3BfCacheReplayWal(mxFrame, bKeepBeyond)
+** needs to hold everything it would apply (2026-10-12).
+**
+** A replay cannot make room by evicting what it writes -- every replayed record
+** is DIRTY -- so a dirty set larger than the ring used to be dropped, silently:
+** a writer killed after 12,000 buffered single-row UPDATEs, recovered with
+** bf_cache_size=262144, came back with 9,661 of them (replay_dropped 2339).
+** Per leaf: the ops after its last honoured CLEAR (the same rule as
+** bfReplayOnePage), sized as live records, rounded up to the size class a
+** mini-page holding them needs, plus the ring's per-allocation header.  Several
+** ops on one key overwrite each other in replay, so this over-counts; never
+** under.
+*/
+typedef struct BfBoundCtx BfBoundCtx;
+struct BfBoundCtx {
+  BfCache    *pCache;
+  BfWalIndex *pWalIdx;
+  u32         mxFrame;
+  int         bKeepBeyond;
+  u64         nBytes;
+};
+static int bfReplayBoundOnePage(void *pCtx, u32 pgno){
+  BfBoundCtx *ctx = (BfBoundCtx*)pCtx;
+  int n = sqlite3BfWalIndexPageCount(ctx->pWalIdx, pgno);
+  int i, iStart = 0, k;
+  u64 sum = sizeof(BfMiniPage);
+  for(i=n-1; i>=0; i--){
+    BfWalRec rec;
+    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
+    if( rec.op!=BFWAL_OP_CLEAR || rec.iFrame>ctx->mxFrame ) continue;
+    iStart = i+1;
+    break;
+  }
+  if( iStart>=n ) return BFWAL_OK;
+  for(i=iStart; i<n; i++){
+    BfWalRec rec;
+    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
+    if( rec.iFrame>ctx->mxFrame && !ctx->bKeepBeyond ) continue;
+    if( rec.op==BFWAL_OP_CLEAR ) continue;
+    sum += sizeof(BfKVMeta) + rec.nKey + rec.nVal;
+  }
+  for(k=0; k<BF_SIZE_CLASS_COUNT; k++){
+    if( ctx->pCache->aSizeClass[k]>=sum ){ sum = ctx->pCache->aSizeClass[k]; break; }
+  }
+  ctx->nBytes += sum + 16;    /* + the ring's per-allocation header */
+  return BFWAL_OK;
+}
+u64 sqlite3BfCacheReplayBound(BfCache *pCache, BfWalIndex *pWalIdx,
+    u32 mxFrame, int bKeepBeyond){
+  BfBoundCtx ctx;
+  if( pCache==0 || pWalIdx==0 ) return 0;
+  ctx.pCache = pCache;
+  ctx.pWalIdx = pWalIdx;
+  ctx.mxFrame = mxFrame;
+  ctx.bKeepBeyond = bKeepBeyond;
+  ctx.nBytes = 0;
+  sqlite3BfWalIndexForEachPage(pWalIdx, bfReplayBoundOnePage, &ctx);
+  return ctx.nBytes;
+}
+
 int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx,
     u32 mxFrame, int bKeepBeyond){
   BfReplayCtx ctx;

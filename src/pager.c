@@ -4444,6 +4444,20 @@ int sqlite3PagerBfSnapshot(Pager *pPager, u32 *aOut){
   return 0;
 }
 
+/* Bytes the ring needs to hold what sqlite3PagerBfReplayLog would replay. */
+u64 sqlite3PagerBfReplayBound(Pager *pPager, BfCache *pBf){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pBf && pagerUseWal(pPager) ){
+    BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
+    if( pWalIdx ){
+      return sqlite3BfCacheReplayBound(pBf, pWalIdx,
+                                       sqlite3WalBfMxFrame(pPager->pWal), 1);
+    }
+  }
+#endif
+  return 0;
+}
+
 int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable){
   *pbAllDurable = 0;
 #ifndef SQLITE_OMIT_WAL
