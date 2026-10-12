@@ -46,6 +46,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include "sqlite3.h"
 
 /*----------------------------------------------------------------------------
@@ -328,11 +329,42 @@ static void dropFileCache(const char *zDb){
 ** serves xRead -- and page-aligned xWrite -- through it, via an aligned bounce
 ** buffer (pcache buffers are not block-aligned, and the 100-byte header read is
 ** neither aligned nor block-sized).  Locking, sync, size, truncate and shm stay
-** on the unix file; fsync on either descriptor syncs the same inode.  WAL, shm
-** and journals stay buffered: WAL frame offsets are not block-aligned, and the
-** read campaigns write nothing.  The kernel keeps O_DIRECT coherent with the
+** on the unix file; fsync on either descriptor syncs the same inode.  Shm and
+** journals stay buffered.  The kernel keeps O_DIRECT coherent with the
 ** page cache (it writes back and invalidates the range first), so a buffered
 ** write elsewhere cannot make a direct read stale.
+**
+** THE WAL TOO (2026-10-12).  Until then the WAL stayed buffered, so a write
+** campaign compared two engines whose WAL reads were OS page-cache hits (with
+** autocheckpoint 0, stock re-read its pages from the WAL at 0.011 device reads
+** per op) and whose WAL writes were deferred page-cache writeback.  Now the WAL
+** gets its own O_DIRECT descriptor.  Its offsets are not block-aligned (32-byte
+** header, frames of 24 + page size), so:
+**   - reads are aligned covering reads through the bounce buffer, like the db's;
+**   - writes are read-modify-write of whole blocks.  The bytes of a partial edge
+**     block outside the write MUST be preserved (SQLite rewrites a frame of the
+**     open transaction in place, and the next frame shares its block), so they
+**     come from a TAIL-BLOCK CACHE -- the last block written, shared by every
+**     connection on the same WAL in this process, under a mutex -- or, on a
+**     miss, from a device read counted separately as wal_rmw_reads.  Appends
+**     always hit (each write's head block is the previous write's tail), so a
+**     commit costs device WRITES only, as on the real thing.
+**   - WRITE-COMBINING.  SQLite writes a frame as two calls (24-byte header,
+**     then the page), so writing whole blocks per call put each block on the
+**     device ~3 times (device/logical bytes 3.0 measured), where buffered I/O
+**     writes each page once at writeback.  Complete blocks go to the device at
+**     once; the trailing PARTIAL block stays in the tail cache (dirty) until it
+**     completes or until a sync, an overlapping read, xFileSize, truncate or
+**     close.  So each block reaches the device about once, as with the page
+**     cache.  Like unsynced buffered data, an unsynced partial block is lost if
+**     the PROCESS dies (synchronous=NORMAL semantics); benchmarks do not die.
+**   - writing whole blocks can leave the file up to one block longer than
+**     SQLite wrote; the extra bytes are zeros, which no frame checksum accepts,
+**     so recovery stops exactly where it would have.
+** Separate counters: wal_reads / wal_read_bytes (real reads), wal_rmw_reads,
+** wal_writes / wal_write_bytes (device bytes) and wal_logical_bytes (what
+** SQLite asked to write).  Multi-PROCESS writers are not supported (the tail
+** cache is per process); the harness is one process.
 **
 ** A filesystem that rejects O_DIRECT fails the run: falling back silently would
 ** measure buffered I/O under a direct-I/O label.  One that ACCEPTS it but serves
@@ -342,10 +374,28 @@ static void dropFileCache(const char *zDb){
 */
 #define DIO_ALIGN 4096
 
+/* The WAL's tail-block cache: one per WAL path, shared by all connections. */
+typedef struct DioTail {
+  char zPath[512];
+  pthread_mutex_t mu;
+  int bValid;
+  sqlite3_int64 iBlock;       /* file offset of the cached block */
+  unsigned char *aBlk;        /* DIO_ALIGN bytes, aligned */
+  sqlite3_int64 iHigh;        /* end of what THIS log generation has written;
+                              ** -1 = unknown (file opened, not yet written) */
+  int bDirty;                 /* aBlk holds bytes not yet on the device */
+} DioTail;
+#define DIO_MAX_TAIL 8
+static DioTail gDioTail[DIO_MAX_TAIL];
+static int gnDioTail = 0;
+static pthread_mutex_t gDioTailMu = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct DioFile {
   sqlite3_file base;          /* .pMethods = &dioMethods (or the real ones) */
   sqlite3_file *pReal;        /* the unix file, allocated right after this */
-  int fd;                     /* O_DIRECT descriptor; -1 when not the main db */
+  int fd;                     /* O_DIRECT descriptor; -1 when not db or WAL */
+  int bWal;                   /* this is a WAL file */
+  DioTail *pTail;             /* WAL only */
   unsigned char *aBuf;        /* DIO_ALIGN-aligned bounce buffer */
   size_t nBuf;
 } DioFile;
@@ -354,7 +404,51 @@ static sqlite3_vfs *gDioReal = 0;
 static struct {
   unsigned long long nRead, nReadBytes, nReadUnaligned, nShort;
   unsigned long long nWrite, nWriteBytes, nWriteFallback;
+  unsigned long long nWalRead, nWalReadBytes, nWalRmw, nWalShort;
+  unsigned long long nWalWrite, nWalWriteBytes, nWalLogicalBytes;
+  unsigned long long nWalTailFlush;
 } gDio;
+
+/* Write the pending partial tail block (write-combining, see the header). */
+static int dioTailFlush(DioTail *t, int fd){
+  ssize_t put;
+  if( !t->bDirty ) return SQLITE_OK;
+  do{ put = pwrite(fd, t->aBlk, DIO_ALIGN, t->iBlock); }while( put<0 && errno==EINTR );
+  if( put!=DIO_ALIGN ) return (put<0 && errno==ENOSPC) ? SQLITE_FULL : SQLITE_IOERR_WRITE;
+  t->bDirty = 0;
+  gDio.nWalTailFlush++;
+  gDio.nWalWrite++;
+  gDio.nWalWriteBytes += DIO_ALIGN;
+  return SQLITE_OK;
+}
+static int dioTailFlushLocked(DioFile *f){
+  int rc;
+  if( !f->pTail ) return SQLITE_OK;
+  pthread_mutex_lock(&f->pTail->mu);
+  rc = dioTailFlush(f->pTail, f->fd);
+  pthread_mutex_unlock(&f->pTail->mu);
+  return rc;
+}
+
+static DioTail *dioTailFor(const char *zPath){
+  DioTail *t = 0;
+  int i;
+  pthread_mutex_lock(&gDioTailMu);
+  for(i=0; i<gnDioTail; i++){
+    if( strcmp(gDioTail[i].zPath, zPath)==0 ){ t = &gDioTail[i]; break; }
+  }
+  if( t==0 ){
+    if( gnDioTail>=DIO_MAX_TAIL ) die("--direct-io: too many WAL files");
+    t = &gDioTail[gnDioTail++];
+    snprintf(t->zPath, sizeof(t->zPath), "%s", zPath);
+    pthread_mutex_init(&t->mu, 0);
+    if( posix_memalign((void**)&t->aBlk, DIO_ALIGN, DIO_ALIGN)!=0 ) die("out of memory");
+    t->bValid = 0;
+    t->iHigh = -1;
+  }
+  pthread_mutex_unlock(&gDioTailMu);
+  return t;
+}
 
 static int dioBuf(DioFile *f, size_t n){
   if( n<=f->nBuf ) return 1;
@@ -365,9 +459,12 @@ static int dioBuf(DioFile *f, size_t n){
   return 1;
 }
 
+static int dioTailFlushLocked(DioFile *f);
 static int dioClose(sqlite3_file *pFile){
   DioFile *f = (DioFile*)pFile;
-  int rc = f->pReal->pMethods ? f->pReal->pMethods->xClose(f->pReal) : SQLITE_OK;
+  int rc;
+  if( f->fd>=0 ) dioTailFlushLocked(f);    /* before the descriptor goes */
+  rc = f->pReal->pMethods ? f->pReal->pMethods->xClose(f->pReal) : SQLITE_OK;
   if( f->fd>=0 ) close(f->fd);
   free(f->aBuf);
   f->fd = -1; f->aBuf = 0; f->nBuf = 0;
@@ -382,16 +479,30 @@ static int dioRead(sqlite3_file *pFile, void *zBuf, int iAmt, sqlite3_int64 iOfs
   ssize_t got;
   sqlite3_int64 avail;
   if( f->fd<0 ) return f->pReal->pMethods->xRead(f->pReal, zBuf, iAmt, iOfst);
+  if( f->pTail ){                       /* WAL: pending tail must be readable */
+    int rcF = SQLITE_OK;
+    pthread_mutex_lock(&f->pTail->mu);
+    if( f->pTail->bDirty && f->pTail->iBlock>=lo && f->pTail->iBlock<hi ){
+      rcF = dioTailFlush(f->pTail, f->fd);
+    }
+    pthread_mutex_unlock(&f->pTail->mu);
+    if( rcF!=SQLITE_OK ) return rcF;
+  }
   if( !dioBuf(f, n) ) return SQLITE_IOERR_NOMEM;
-  if( lo!=iOfst || (iAmt & (DIO_ALIGN-1))!=0 ) gDio.nReadUnaligned++;
+  if( !f->bWal && (lo!=iOfst || (iAmt & (DIO_ALIGN-1))!=0) ) gDio.nReadUnaligned++;
   do{ got = pread(f->fd, f->aBuf, n, lo); }while( got<0 && errno==EINTR );
   if( got<0 ){
     if( errno==EINVAL ) die("--direct-io: O_DIRECT read rejected (EINVAL) -- "
                             "filesystem or alignment does not support it");
     return SQLITE_IOERR_READ;
   }
-  gDio.nRead++;
-  gDio.nReadBytes += (unsigned long long)got;
+  if( f->bWal ){
+    gDio.nWalRead++;
+    gDio.nWalReadBytes += (unsigned long long)got;
+  }else{
+    gDio.nRead++;
+    gDio.nReadBytes += (unsigned long long)got;
+  }
   avail = (sqlite3_int64)got - (iOfst - lo);
   if( avail >= iAmt ){
     memcpy(zBuf, f->aBuf + (iOfst - lo), iAmt);
@@ -402,8 +513,99 @@ static int dioRead(sqlite3_file *pFile, void *zBuf, int iAmt, sqlite3_int64 iOfs
   if( avail < 0 ) avail = 0;
   if( avail ) memcpy(zBuf, f->aBuf + (iOfst - lo), (size_t)avail);
   memset((char*)zBuf + avail, 0, (size_t)(iAmt - avail));
-  gDio.nShort++;
+  if( f->bWal ) gDio.nWalShort++; else gDio.nShort++;
   return SQLITE_IOERR_SHORT_READ;
+}
+
+/* Fill dst (DIO_ALIGN bytes) with the current content of the block at iBlk:
+** the tail cache if it holds it, zeros where nothing live can be (past end of
+** file, or wholly past what this log generation has written), else a device
+** read.  After a checkpoint restarts the log, new frames overwrite the old
+** generation's bytes; those are dead (wrong salt, never accepted), so reading
+** them back to "preserve" them was a device read per frame for nothing. */
+static int dioWalFill(DioFile *f, sqlite3_int64 iBlk, unsigned char *dst){
+  DioTail *t = f->pTail;
+  struct stat st;
+  ssize_t got;
+  if( t->bValid && t->iBlock==iBlk ){
+    memcpy(dst, t->aBlk, DIO_ALIGN);
+    return SQLITE_OK;
+  }
+  if( t->iHigh>=0 && iBlk>=t->iHigh ){
+    memset(dst, 0, DIO_ALIGN);
+    return SQLITE_OK;
+  }
+  if( fstat(f->fd, &st)==0 && iBlk>=(sqlite3_int64)st.st_size ){
+    memset(dst, 0, DIO_ALIGN);
+    return SQLITE_OK;
+  }
+  do{ got = pread(f->fd, dst, DIO_ALIGN, iBlk); }while( got<0 && errno==EINTR );
+  if( got<0 ) return SQLITE_IOERR_READ;
+  if( got<DIO_ALIGN ) memset(dst + got, 0, (size_t)(DIO_ALIGN - got));
+  gDio.nWalRmw++;
+  return SQLITE_OK;
+}
+
+/* WAL write: read-modify-write of whole blocks (see the header comment). */
+static int dioWalWrite(DioFile *f, const void *zBuf, int iAmt, sqlite3_int64 iOfst){
+  DioTail *t = f->pTail;
+  sqlite3_int64 lo = iOfst & ~(sqlite3_int64)(DIO_ALIGN-1);
+  sqlite3_int64 end = iOfst + iAmt;
+  sqlite3_int64 hi = (end + DIO_ALIGN - 1) & ~(sqlite3_int64)(DIO_ALIGN-1);
+  size_t n = (size_t)(hi - lo);
+  ssize_t put;
+  int rc = SQLITE_OK;
+  if( !dioBuf(f, n) ) return SQLITE_IOERR_NOMEM;
+  pthread_mutex_lock(&t->mu);
+  /* A pending tail block that this write neither starts nor ends in must reach
+  ** the device first: the cache holds only one block. */
+  if( t->bDirty && t->iBlock!=lo && t->iBlock!=hi - DIO_ALIGN ){
+    rc = dioTailFlush(t, f->fd);
+    if( rc!=SQLITE_OK ){ pthread_mutex_unlock(&t->mu); return rc; }
+  }
+  /* Offset 0 is the WAL header: it is written exactly when a log generation
+  ** starts (first frame after a restart, or a new log), so nothing beyond it
+  ** is live any more. */
+  if( iOfst==0 ) t->iHigh = 0;
+  if( iOfst!=lo ) rc = dioWalFill(f, lo, f->aBuf);
+  if( rc==SQLITE_OK && end!=hi && (hi - DIO_ALIGN!=lo || iOfst==lo) ){
+    if( t->iHigh>=0 && end>=t->iHigh
+     && !(t->bValid && t->iBlock==hi - DIO_ALIGN) ){
+      /* Everything after this write in its last block is past the
+      ** generation's high-water mark: dead bytes, zero them. */
+      memset(f->aBuf + (n - DIO_ALIGN), 0, DIO_ALIGN);
+    }else{
+      rc = dioWalFill(f, hi - DIO_ALIGN, f->aBuf + (n - DIO_ALIGN));
+    }
+  }
+  if( rc==SQLITE_OK ){
+    /* Complete blocks go now; a partial last block stays pending. */
+    size_t nNow = (end==hi) ? n : n - DIO_ALIGN;
+    memcpy(f->aBuf + (iOfst - lo), zBuf, (size_t)iAmt);
+    put = (ssize_t)nNow;
+    if( nNow>0 ){
+      do{ put = pwrite(f->fd, f->aBuf, nNow, lo); }while( put<0 && errno==EINTR );
+      if( put<0 && errno==EINVAL ) die("--direct-io: O_DIRECT WAL write rejected (EINVAL)");
+    }
+    if( put!=(ssize_t)nNow ){
+      rc = (put<0 && errno==ENOSPC) ? SQLITE_FULL : SQLITE_IOERR_WRITE;
+      t->bValid = 0;
+      t->bDirty = 0;
+    }else{
+      memcpy(t->aBlk, f->aBuf + (n - DIO_ALIGN), DIO_ALIGN);
+      t->iBlock = hi - DIO_ALIGN;
+      t->bValid = 1;
+      t->bDirty = (end!=hi);
+      if( t->iHigh>=0 && end>t->iHigh ) t->iHigh = end;
+      if( nNow>0 ){
+        gDio.nWalWrite++;
+        gDio.nWalWriteBytes += (unsigned long long)nNow;
+      }
+      gDio.nWalLogicalBytes += (unsigned long long)iAmt;
+    }
+  }
+  pthread_mutex_unlock(&t->mu);
+  return rc;
 }
 
 static int dioWrite(sqlite3_file *pFile, const void *zBuf, int iAmt,
@@ -411,6 +613,7 @@ static int dioWrite(sqlite3_file *pFile, const void *zBuf, int iAmt,
   DioFile *f = (DioFile*)pFile;
   ssize_t put;
   if( f->fd<0 ) return f->pReal->pMethods->xWrite(f->pReal, zBuf, iAmt, iOfst);
+  if( f->bWal ) return dioWalWrite(f, zBuf, iAmt, iOfst);
   if( (iOfst & (DIO_ALIGN-1))!=0 || (iAmt & (DIO_ALIGN-1))!=0 ){
     gDio.nWriteFallback++;      /* buffered; the kernel keeps them coherent */
     return f->pReal->pMethods->xWrite(f->pReal, zBuf, iAmt, iOfst);
@@ -427,9 +630,27 @@ static int dioWrite(sqlite3_file *pFile, const void *zBuf, int iAmt,
 
 /* Everything else is the unix file's own behaviour. */
 #define DIO_REAL(f) (((DioFile*)(f))->pReal)
-static int dioTruncate(sqlite3_file *p, sqlite3_int64 n){ return DIO_REAL(p)->pMethods->xTruncate(DIO_REAL(p), n); }
-static int dioSync(sqlite3_file *p, int fl){ return DIO_REAL(p)->pMethods->xSync(DIO_REAL(p), fl); }
-static int dioFileSize(sqlite3_file *p, sqlite3_int64 *pn){ return DIO_REAL(p)->pMethods->xFileSize(DIO_REAL(p), pn); }
+static int dioTruncate(sqlite3_file *p, sqlite3_int64 n){
+  DioFile *f = (DioFile*)p;
+  if( f->pTail ){                       /* the cached block may be cut off */
+    pthread_mutex_lock(&f->pTail->mu);
+    if( f->pTail->bDirty && f->pTail->iBlock<n ) dioTailFlush(f->pTail, f->fd);
+    f->pTail->bDirty = 0;
+    f->pTail->bValid = 0;
+    pthread_mutex_unlock(&f->pTail->mu);
+  }
+  return DIO_REAL(p)->pMethods->xTruncate(DIO_REAL(p), n);
+}
+static int dioSync(sqlite3_file *p, int fl){
+  int rc = dioTailFlushLocked((DioFile*)p);
+  if( rc!=SQLITE_OK ) return rc;
+  return DIO_REAL(p)->pMethods->xSync(DIO_REAL(p), fl);
+}
+static int dioFileSize(sqlite3_file *p, sqlite3_int64 *pn){
+  int rc = dioTailFlushLocked((DioFile*)p);
+  if( rc!=SQLITE_OK ) return rc;
+  return DIO_REAL(p)->pMethods->xFileSize(DIO_REAL(p), pn);
+}
 static int dioLock(sqlite3_file *p, int e){ return DIO_REAL(p)->pMethods->xLock(DIO_REAL(p), e); }
 static int dioUnlock(sqlite3_file *p, int e){ return DIO_REAL(p)->pMethods->xUnlock(DIO_REAL(p), e); }
 static int dioCheckReserved(sqlite3_file *p, int *pr){ return DIO_REAL(p)->pMethods->xCheckReservedLock(DIO_REAL(p), pr); }
@@ -467,8 +688,16 @@ static int dioOpen(sqlite3_vfs *pVfs, sqlite3_filename zName, sqlite3_file *pFil
     return rc;
   }
   f->base.pMethods = &dioMethods;
-  if( (flags & SQLITE_OPEN_MAIN_DB)==0 || zName==0 ){
-    return SQLITE_OK;           /* not the main db: fd<0, every call forwards */
+  if( (flags & (SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_WAL))==0 || zName==0 ){
+    return SQLITE_OK;           /* not db or WAL: fd<0, every call forwards */
+  }
+  if( flags & SQLITE_OPEN_WAL ){
+    f->bWal = 1;
+    f->pTail = dioTailFor(zName);
+    /* Another connection may have written since this one last looked. */
+    pthread_mutex_lock(&f->pTail->mu);
+    f->pTail->bValid = 0;
+    pthread_mutex_unlock(&f->pTail->mu);
   }
   f->fd = open(zName, ((flags & SQLITE_OPEN_READONLY) ? O_RDONLY : O_RDWR)
                       | O_DIRECT | O_CLOEXEC);
@@ -1058,7 +1287,7 @@ static int cmdRun(Config *p){
   int memUsed, memHigh;
   double tStart, tEnd, elapsed;
   long long nDone = 0, nTxn = 0;
-  long long nRes0, nRes1;
+  long long nRes0, nRes1, nWalRes0, nWalRes1;
   int inTxn = 0, i;
   FILE *out;
 
@@ -1191,6 +1420,7 @@ static int cmdRun(Config *p){
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, &dbCacheWrite0,&dummy, 1);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_SPILL, &dbCacheSpill0,&dummy, 1);
   nRes0 = residentPages(p->zDb);
+  { char b[512]; snprintf(b, sizeof(b), "%s-wal", p->zDb); nWalRes0 = residentPages(b); }
   memset(&gDio, 0, sizeof(gDio));     /* direct-I/O counters: measured phase only */
   procIoRead(&io0);
   getrusage(RUSAGE_SELF, &ru0);
@@ -1254,6 +1484,7 @@ static int cmdRun(Config *p){
   getrusage(RUSAGE_SELF, &ru1);
   procIoRead(&io1);
   nRes1 = residentPages(p->zDb);
+  { char b[512]; snprintf(b, sizeof(b), "%s-wal", p->zDb); nWalRes1 = residentPages(b); }
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_HIT,   &dbCacheHit1,  &dummy, 0);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS,  &dbCacheMiss1, &dummy, 0);
   sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, &dbCacheWrite1,&dummy, 0);
@@ -1370,10 +1601,17 @@ static int cmdRun(Config *p){
                "\"db_resident_pages_after\": %lld, \"reads\": %llu, "
                "\"read_bytes\": %llu, \"reads_unaligned\": %llu, "
                "\"short_reads\": %llu, \"writes\": %llu, \"write_bytes\": %llu, "
-               "\"write_fallbacks\": %llu},\n",
+               "\"write_fallbacks\": %llu, \"wal_direct\": %d, "
+               "\"wal_resident_pages_before\": %lld, \"wal_resident_pages_after\": %lld, "
+               "\"wal_reads\": %llu, \"wal_read_bytes\": %llu, \"wal_rmw_reads\": %llu, "
+               "\"wal_short_reads\": %llu, \"wal_writes\": %llu, \"wal_write_bytes\": %llu, "
+               "\"wal_logical_bytes\": %llu, \"wal_tail_flushes\": %llu},\n",
           p->bDirectIo, nRes0, nRes1, gDio.nRead, gDio.nReadBytes,
           gDio.nReadUnaligned, gDio.nShort, gDio.nWrite, gDio.nWriteBytes,
-          gDio.nWriteFallback);
+          gDio.nWriteFallback, p->bDirectIo, nWalRes0, nWalRes1,
+          gDio.nWalRead, gDio.nWalReadBytes, gDio.nWalRmw, gDio.nWalShort,
+          gDio.nWalWrite, gDio.nWalWriteBytes, gDio.nWalLogicalBytes,
+          gDio.nWalTailFlush);
 
   fprintf(out, "    \"pcache\": {\"hit\": %d, \"miss\": %d, \"write\": %d, "
                "\"spill\": %d},\n",
