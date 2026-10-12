@@ -1,0 +1,10 @@
+# compiled libFuzzer binaries (rebuild per README.md)
+fuzz_bfwal_decoder
+fuzz_bfwal_recovery
+fuzz_sql
+fuzz_sql_fixed
+fuzz_sql_mconn
+crash-*
+leak-*
+timeout-*
+oom-*
