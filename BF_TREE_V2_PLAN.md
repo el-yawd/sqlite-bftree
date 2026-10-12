@@ -624,7 +624,7 @@ diff touches actually executed.  A green suite at the default ring size would ha
 nothing about them.
 
 - [ ] owed: full `BF_GROUP=8` and `BF_PROMOTION=100` runs
-- [ ] owed: `bench/ring_repro.sh` under a `SQLITE_DEBUG` build — it ran release-only
+- [x] owed: `bench/ring_repro.sh` under a `SQLITE_DEBUG` build — DONE 2026-10-12, clean
 
 > Process note, recorded because the rule was in this file at the time: the V0 item said
 > *"do not commit unless the user explicitly asks"*.  The sweep and the plan consolidation
@@ -700,7 +700,9 @@ overwrite flush of the first design had been *masking* bug #8.
       `recover_repro.sh` scenarios B and C; no rows lost
 - [x] persist and restore `rootPgno` across recovery — WAL payload v2; the leaf→root gap was
       the structural defect even though the old row-count-only control showed no loss
-- [ ] reproduce recovery into a mini-page that reaches `BF_FULL` — the "re-applied from the base
+- [x] reproduce recovery into a mini-page that reaches `BF_FULL` — DONE 2026-10-12
+      (`bench/replay_fit_repro.sh`: 12,000 committed UPDATEs -> 9,661 after recovery into a
+      256 KiB ring; fixed `0840996` by sizing the ring for the replay).  Original note: the "re-applied from the base
       path" claim is **false** (2026-09-24); such a refusal loses the record.  Now counted
       (`replay_dropped`); a reproducer that makes it non-zero is still owed
 - [x] multiple table roots — `crash_oracle.py` runs four tables, one created mid-stream, one
@@ -708,7 +710,9 @@ overwrite flush of the first design had been *masking* bug #8.
 - [x] crash during checkpoint; compare against the allowed committed states —
       `crash_oracle.py` mode `killckpt` (2026-09-24)
 - [x] full ROLLBACK, torn commits, group commit under crash — bugs 1, 3, 4, 5 above
-- [ ] crash oracle under `SQLITE_DEBUG` at scale (6 seeds run, §9) and with `BF_PROMOTION=100`
+- [x] crash oracle under `SQLITE_DEBUG` at scale (6 seeds run, §9) and with `BF_PROMOTION=100`
+      — DONE 2026-10-12: debug seeds 9-60, debug+ring 30, debug+promo100 30, readfull 30,
+      adaptive 30: all clean
 - [ ] **decide the checkpoint architecture** (§4.3): direct replay of durable record frames to
       their target pages, or materialisation via `bfCheckpointMaterialize()` as today.  If this
       work finds a state rehydration cannot reconstruct, the question answers itself; otherwise
@@ -2813,3 +2817,25 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - Open: deferred commit (`bf_group_commit>1`) with several WRITING connections is unsupported;
   rollback-journal multi-connection is not exercised by the oracle (WAL only); a
   single-connection crash repro for bug 3 would make it visible to the crash oracle too.
+
+### 2026-10-12 (cont.) — Claude Opus 5.5 — correctness debts: replay never drops (`0840996`)
+
+- Owed crash-oracle runs done, all clean: SQLITE_DEBUG seeds 9-60; debug + 256 KiB ring 30;
+  debug + promotion 100 30; `bf_read_record_cache=0` 30; `bf_adaptive_full=2` 30.
+  `ring_repro.sh` under a SQLITE_DEBUG bfbench: clean.
+- **Owed reproducer found the loss it was meant to find.**  `bench/replay_fit_repro.sh`: a writer
+  killed after 12,000 buffered single-row UPDATEs (autocheckpoint 0), recovered with
+  `bf_cache_size=262144` set before the first read -> 9,661 survive, `replay_dropped` 2339.
+  Replay cannot evict what it writes, so ANY rebuild (recovery, rollback, a reader's
+  snapshot rebuild) into a ring smaller than the committed-but-unmerged set lost records.
+  Fix: `sqlite3BfCacheReplayBound` sizes the replay; the rehydrate (cache already empty)
+  rebuilds the ring at the configured size or the next power of two that holds it, shrinking
+  back later; only with no open cursor (it frees ring memory).  Counters `ring_grow`,
+  `ring_peak`.  Any remaining drop -> SQLITE_FULL (never a silent answer).  Mutant with growth
+  disabled now fails loudly.  NOTE for the benchmarks: a grown ring exceeds the memory budget;
+  campaigns must report `ring_peak` (it should equal the budget in every quotable run).
+- Side finding, not fixed: `BfCache.nDirty` is never decremented, so the public resize refuses
+  after a connection's first write (PRAGMA bf_cache_size cannot take effect then).
+- The checkpoint-architecture decision (§4.3) is still the owner's; this stopgap keeps it
+  correct at a memory cost in the pathological case (rebuilding connection's ring smaller
+  than the dirty set).
