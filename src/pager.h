@@ -281,6 +281,7 @@ int sqlite3PagerIsWal(Pager *pPager);
 void sqlite3PagerBfFrameStats(Pager*, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
 /* Phase 2 (WAL) rollback: rebuild the record cache from the committed log. */
 int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable);
+int sqlite3PagerBfSnapshot(Pager *pPager, u32 *aOut);
 void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage);
 int sqlite3PagerBfHasDirty(Pager *pPager);
 

@@ -1443,6 +1443,17 @@ static int bfReplayOnePage(void *pCtx, u32 pgno){
     break;
   }
   ctx->pCache->nReplaySuperseded += (u64)iStart;
+#ifdef SQLITE_BF_MCONN_TRACE
+  fprintf(stderr, "  REPLAY cache=%p leaf=%u nops=%d start=%d mx=%u\n",
+          (void*)ctx->pCache, pgno, n, iStart, ctx->mxFrame);
+  for(i=0; i<n; i++){
+    BfWalRec r2;
+    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &r2)!=BFWAL_OK ) break;
+    fprintf(stderr, "    op%d f=%u op=%d key=", i, r2.iFrame, r2.op);
+    { int j; for(j=0;j<(int)r2.nKey;j++) fprintf(stderr,"%02x",r2.pKey[j]); }
+    fprintf(stderr, "\n");
+  }
+#endif
   for(i=iStart; i<n; i++){
     BfWalRec rec;
     u8 op;

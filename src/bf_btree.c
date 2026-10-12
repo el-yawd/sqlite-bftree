@@ -662,6 +662,9 @@ static int bfLogClears(BfCache *pBf, BfLogAllCtx *ctx){
     rec.pgno = pBf->aFlushed[i];
     rec.rootPgno = pBf->aFlushed[i+1];
     rec.op = BFWAL_OP_CLEAR;
+#ifdef SQLITE_BF_MCONN_TRACE
+    fprintf(stderr, "  LOGCLEAR cache=%p leaf=%u\n", (void*)pBf, rec.pgno);
+#endif
     bfLogAppendRec(ctx, &rec);
     n++;
   }
@@ -1011,6 +1014,7 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[2] = pBf ? pBf->nReplayTorn : 0;
   aOut[3] = pBf ? pBf->nReplayDropped : 0;
   aOut[4] = pBf ? pBf->nRollbackRehydrate : 0;
+  aOut[6] = pBf ? pBf->nSnapshotRehydrate : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -1127,7 +1131,41 @@ static int bfMarkLoggedCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
 ** carry -- unless the rollback discarded WAL frames that carried some of them.
 ** apStage is consumed in every case.
 */
+static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage);
 int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage, int nStage){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf ) pBf->nRollbackRehydrate++;
+  return bfRehydrateFromLog(p, apStage, nStage);
+}
+
+/*
+** A new read snapshot that another connection produced (2026-10-12).  Every
+** connection has its OWN record cache (owner decision 2026-10-12), so when the
+** pager reset its page cache because the WAL moved, this cache is just as
+** stale: clean records may describe rows since updated or deleted, and the
+** records an earlier snapshot replayed are now in base pages wherever a later
+** commit's CLEAR says so.  pager_reset never touched mini-pages, so a reader
+** kept serving both (bench/mconn_oracle.c: count(*) 1515 vs 1512, keys emitted
+** twice by the merge scan).  Rebuild from the log exactly as a full rollback
+** does: empty, replay the WAL's committed record ops (sqlite3WalBfCatchUp has
+** made the index cover this snapshot), re-add this connection's own deferred
+** batches, mark logged.  Stock SQLite discards its whole page cache at the same
+** moment, so the cost is the same shape.
+**
+** Deferred commit (bf_deferred_commit>1) with more than one WRITING connection
+** is not supported: a connection's deferred records are replayed after newer
+** ops of another writer.  Single writer + N readers is the supported model.
+*/
+int sqlite3BfBtreeSnapshotRehydrate(Btree *p){
+  BfCache *pBf = 0;
+  if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf==0 ) return SQLITE_OK;
+  pBf->nSnapshotRehydrate++;
+  return bfRehydrateFromLog(p, 0, 0);
+}
+
+static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
   BfCache *pBf = 0;
   BfGroup *g;
   BfWalIndex *pTmp = 0;
@@ -1193,7 +1231,6 @@ int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage, int nStage){
       sqlite3BfMapIterate(pBf, bfMarkLoggedCallback, NULL);
       sqlite3BfUnlogListReset(pBf);
     }
-    pBf->nRollbackRehydrate++;
   }
   sqlite3BfWalIndexFree(pTmp);
   for(i=0; i<nStage; i++) sqlite3_free(apStage[i]);

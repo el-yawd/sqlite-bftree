@@ -3292,14 +3292,11 @@ static int pagerBeginReadTransaction(Pager *pPager){
     ** connection advanced the WAL), so the BF record cache was just reset.
     ** Rehydrate it from any record ops the WAL holds (NULL in steady state, so
     ** this is a no-op on the common path). */
-    if( rc==SQLITE_OK ){
-      BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
-      if( pWalIdx ){
-        BfCache *pBf = sqlite3PagerGetBfCache(pPager);
-        if( pBf ) rc = sqlite3BfCacheReplayWal(pBf, pWalIdx,
-                           sqlite3WalBfMxFrame(pPager->pWal), 0);
-      }
-    }
+    /* The record cache itself is rebuilt one layer up, where the Btree is:
+    ** btreeBeginTrans sees the data version this reset bumped and calls
+    ** sqlite3BfBtreeSnapshotRehydrate.  Here only the WAL's record index is
+    ** brought up to the new snapshot, which that rebuild replays. */
+    if( rc==SQLITE_OK ) rc = sqlite3WalBfCatchUp(pPager->pWal);
 #endif
   }
 
@@ -4436,6 +4433,17 @@ int sqlite3PagerIsWal(Pager *pPager){
 ** sqlite3PagerBfHasDirty reports whether the commit in progress will write any
 ** page.
 */
+/* 1 and the WAL snapshot id in aOut[3] when the pager is in WAL mode, else 0. */
+int sqlite3PagerBfSnapshot(Pager *pPager, u32 *aOut){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    sqlite3WalBfSnapshot(pPager->pWal, aOut);
+    return 1;
+  }
+#endif
+  return 0;
+}
+
 int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable){
   *pbAllDurable = 0;
 #ifndef SQLITE_OMIT_WAL

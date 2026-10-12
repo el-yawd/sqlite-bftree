@@ -3763,6 +3763,39 @@ static SQLITE_NOINLINE int btreeBeginTrans(
     ** pBt->pageSize to the page-size of the file on disk.
     */
     while( pBt->pPage1==0 && SQLITE_OK==(rc = lockBtree(pBt)) );
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+    /* The pager reset its cache for a new snapshot (another connection wrote,
+    ** or recovery ran): rebuild the record cache to match it. */
+    if( rc==SQLITE_OK && pBt->inTransaction==TRANS_NONE ){
+      BfCache *pBfSnap = sqlite3PagerGetBfCache(pPager);
+      u32 aSnap[3];
+      if( pBfSnap==0 ){
+        /* no record cache */
+      }else if( sqlite3PagerBfSnapshot(pPager, aSnap) ){
+        /* WAL: rebuild only when the committed log differs from the one this
+        ** cache reflects.  The pager's data version is no guide: it also moves
+        ** on this connection's own commits and checkpoints, and a rebuild is
+        ** both wasted work and, in a ring smaller than the dirty set, lossy. */
+        if( !pBfSnap->bSnapSeen
+         || memcmp(aSnap, pBfSnap->aSnapSeen, sizeof(aSnap))!=0 ){
+          rc = sqlite3BfBtreeSnapshotRehydrate(p);
+        }
+        if( rc==SQLITE_OK ){
+          memcpy(pBfSnap->aSnapSeen, aSnap, sizeof(aSnap));
+          pBfSnap->bSnapSeen = 1;
+        }
+      }else{
+        /* Rollback journal: nothing stays buffered across transactions, so a
+        ** change by ANOTHER connection (data_version semantics: own commits
+        ** excluded) only makes cached records stale -- drop them. */
+        u32 iVer = p->iBDataVersion + sqlite3PagerDataVersion(pPager);
+        if( pBfSnap->iDataVersionSeen!=iVer ){
+          sqlite3BfBtreeClearCache(p);
+          pBfSnap->iDataVersionSeen = iVer;
+        }
+      }
+    }
+#endif
 
     if( rc==SQLITE_OK && wrflag ){
       if( (pBt->btsFlags & BTS_READ_ONLY)!=0 ){
@@ -4520,6 +4553,17 @@ int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
     p->iBDataVersion--;  /* Compensate for pPager->iDataVersion++; */
     pBt->inTransaction = TRANS_READ;
     btreeClearHasContent(pBt);
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+    /* This commit is the log state the record cache now reflects. */
+    {
+      BfCache *pBfC = sqlite3PagerGetBfCache(pBt->pPager);
+      u32 aSnap[3];
+      if( pBfC && sqlite3PagerBfSnapshot(pBt->pPager, aSnap) ){
+        memcpy(pBfC->aSnapSeen, aSnap, sizeof(aSnap));
+        pBfC->bSnapSeen = 1;
+      }
+    }
+#endif
   }
 
   btreeEndTransaction(p);
@@ -10970,6 +11014,22 @@ int sqlite3BtreeInsert(
         if( rc ) return rc;
       }
       if( pCur->bfOnMini ) return SQLITE_CORRUPT_BKPT;  /* nothing to write */
+    }else if( pCur->curIntKey && pCur->pgnoRoot>1 ){
+      /* The same rule for a row WITH a base cell (2026-10-12).  A write that
+      ** declined buffering -- an UpdateCell refusal (mini-page at its cap, ring
+      ** stalled), SAVEPOSITION, PREFORMAT -- reaches the same-size overwrite
+      ** fast path below, which patches the base cell BEFORE the pre-mutation
+      ** flush further down.  If the key also has a newer DIRTY record (already
+      ** logged), the page then gets the new value while the WAL keeps the older
+      ** record op with no CLEAR after it: replay -- crash recovery, a rollback
+      ** rehydrate, another connection's snapshot -- resurrects the old value
+      ** over the newer page image.  Found by bench/mconn_oracle.c (8 readers,
+      ** seed 30: a reader read key 63's pre-update value).  Replay's ordering
+      ** rule needs every page-path write to find its row in base: flush first. */
+      if( sqlite3BfBtreeFlushTableForMutation(pCur)>0 ){
+        rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
+        if( rc ) return rc;
+      }
     }
 #endif
 

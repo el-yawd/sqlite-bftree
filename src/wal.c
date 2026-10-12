@@ -559,6 +559,13 @@ struct Wal {
   u64 nBfPageFrame;         /* Page-image frames written to the WAL */
   u64 nBfCommit;            /* Commit frames (transactions) written to the WAL */
   u8 bBfPrune;              /* pBfWal may hold ops past mxFrame (after undo) */
+  /* Cross-connection catch-up (2026-10-12).  pBfWal covers every frame <=
+  ** iBfIngested of the WAL generation whose salt is aBfSalt.  A connection
+  ** that did not run recovery, or that another connection's commits have
+  ** overtaken, ingests (iBfIngested, mxFrame] when its read snapshot changes;
+  ** see walBfCatchUp. */
+  u32 iBfIngested;
+  u32 aBfSalt[2];
 #endif
 #ifdef SQLITE_USE_SEH
   u32 lockMask;              /* Mask of locks held */
@@ -1088,6 +1095,7 @@ static int walDecodeFrame(
 */
 static int walBfIngestRecordFrame(Wal *pWal, const u8 *aData, u32 iFrame){
   int rc;
+  if( iFrame>pWal->iBfIngested ) pWal->iBfIngested = iFrame;
   if( pWal->pBfWal==0 ){
     pWal->pBfWal = sqlite3BfWalIndexNew();
     if( pWal->pBfWal==0 ) return SQLITE_NOMEM_BKPT;
@@ -1640,6 +1648,8 @@ finished:
     ** record frames of a commit whose final frame never reached the disk.  That
     ** transaction did not commit, so its ops must not be replayed. */
     sqlite3BfWalIndexPrune(pWal->pBfWal, pWal->hdr.mxFrame);
+    pWal->iBfIngested = pWal->hdr.mxFrame;
+    memcpy(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt));
 #endif
     pWal->hdr.aFrameCksum[0] = aFrameCksum[0];
     pWal->hdr.aFrameCksum[1] = aFrameCksum[1];
@@ -2241,6 +2251,10 @@ static void walRestartHdr(Wal *pWal, u32 salt1){
 #endif
   sqlite3Put4byte((u8*)&aSalt[0], 1 + sqlite3Get4byte((u8*)&aSalt[0]));
   memcpy(&pWal->hdr.aSalt[1], &salt1, 4);
+#ifndef SQLITE_OMIT_BF_CACHE
+  pWal->iBfIngested = 0;                       /* new generation, empty index */
+  memcpy(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt));
+#endif
   walIndexWriteHdr(pWal);
   AtomicStore(&pInfo->nBackfill, 0);
   pInfo->nBackfillAttempted = 0;
@@ -3899,6 +3913,9 @@ int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
       ** does, the next write transaction prunes them before a frame number
       ** can be reused. */
       if( iMax!=pWal->hdr.mxFrame && pWal->pBfWal ) pWal->bBfPrune = 1;
+      if( pWal->iBfIngested>pWal->hdr.mxFrame ){
+        pWal->iBfIngested = pWal->hdr.mxFrame;  /* discarded frames re-ingest */
+      }
 #endif
     }
     SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
@@ -3958,6 +3975,9 @@ int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
     ** savepoint's opening flush put every dirty record into base pages the
     ** savepoint does not undo, so ops staged after it are already there. */
     sqlite3BfWalIndexPrune(pWal->pBfWal, pWal->hdr.mxFrame);
+    if( pWal->iBfIngested>pWal->hdr.mxFrame ){
+      pWal->iBfIngested = pWal->hdr.mxFrame;
+    }
 #endif
   }
 
@@ -4653,6 +4673,75 @@ void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit){
 */
 BfWalIndex *sqlite3WalBfIndex(Wal *pWal){
   return pWal ? pWal->pBfWal : 0;
+}
+
+/*
+** Bring pBfWal up to this connection's read snapshot (hdr.mxFrame).
+**
+** pBfWal used to be filled only by a connection's OWN recovery scan and its
+** OWN frame writes.  Every other connection on the file -- one that joined an
+** existing WAL through the shm index, or one another connection's commits had
+** overtaken -- never saw those record frames, so committed buffered rows were
+** simply invisible to it (bench/mconn_oracle.c: a reader opened after the
+** writer's commit counted 1492 of 1500 rows).  Record frames are not in the
+** wal-index hash, so the only way to find them is to read the frames.
+**
+** Reads (iBfIngested, mxFrame] -- only frames this connection has not
+** considered -- and ingests the record frames among them.  A new WAL
+** generation (salt changed: another connection restarted the log) or a
+** watermark past the snapshot discards the index and starts from frame 1.
+** Frames <= mxFrame are committed and cannot be overwritten while this
+** connection holds its read lock.  Must be called with the read lock held.
+*/
+int sqlite3WalBfCatchUp(Wal *pWal){
+  u32 iFrame;
+  u8 *aFrame;
+  int szPage, szFrame;
+  int rc = SQLITE_OK;
+  if( pWal==0 ) return SQLITE_OK;
+  if( memcmp(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt))!=0
+   || pWal->iBfIngested>pWal->hdr.mxFrame ){
+    sqlite3BfWalIndexFree(pWal->pBfWal);
+    pWal->pBfWal = 0;
+    pWal->bBfPrune = 0;
+    pWal->iBfIngested = 0;
+    memcpy(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt));
+  }else if( pWal->bBfPrune ){
+    sqlite3BfWalIndexPrune(pWal->pBfWal, pWal->iBfIngested);
+    pWal->bBfPrune = 0;
+  }
+  if( pWal->iBfIngested>=pWal->hdr.mxFrame ) return SQLITE_OK;
+  szPage = walPagesize(pWal);
+  szFrame = szPage + WAL_FRAME_HDRSIZE;
+  aFrame = (u8*)sqlite3_malloc64(szFrame);
+  if( aFrame==0 ) return SQLITE_NOMEM_BKPT;
+  for(iFrame=pWal->iBfIngested+1; iFrame<=pWal->hdr.mxFrame; iFrame++){
+    i64 iOffset = walFrameOffset(iFrame, szPage);
+    rc = sqlite3OsRead(pWal->pWalFd, aFrame, WAL_FRAME_HDRSIZE, iOffset);
+    if( rc!=SQLITE_OK ) break;
+    if( memcmp(&aFrame[8], pWal->hdr.aSalt, 8)!=0 ){
+      rc = SQLITE_CORRUPT_BKPT;           /* a committed frame of another log */
+      break;
+    }
+    if( sqlite3Get4byte(aFrame)==WAL_BF_RECORD_PGNO ){
+      rc = sqlite3OsRead(pWal->pWalFd, &aFrame[WAL_FRAME_HDRSIZE], szPage,
+                         iOffset + WAL_FRAME_HDRSIZE);
+      if( rc!=SQLITE_OK ) break;
+      rc = walBfIngestRecordFrame(pWal, &aFrame[WAL_FRAME_HDRSIZE], iFrame);
+      if( rc!=SQLITE_OK ) break;
+    }
+  }
+  if( rc==SQLITE_OK ) pWal->iBfIngested = pWal->hdr.mxFrame;
+  sqlite3_free(aFrame);
+  return rc;
+}
+
+/* This connection's snapshot as (mxFrame, salt1, salt2): equal values mean the
+** same committed log state, so the record cache built for one fits the other. */
+void sqlite3WalBfSnapshot(Wal *pWal, u32 *aOut){
+  aOut[0] = pWal ? pWal->hdr.mxFrame : 0;
+  aOut[1] = pWal ? pWal->hdr.aSalt[0] : 0;
+  aOut[2] = pWal ? pWal->hdr.aSalt[1] : 0;
 }
 
 /* The last frame of this connection's snapshot (committed log end). */
