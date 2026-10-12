@@ -1578,6 +1578,27 @@ int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx,
   return ctx.rc;
 }
 
+/* Replay only the leaves aPg[0..nPg) (incremental invalidation).  Each must be
+** absent from the cache, as after sqlite3BfCacheReplayWal's ClearCache. */
+int sqlite3BfCacheReplayPages(BfCache *pCache, BfWalIndex *pWalIdx,
+    u32 mxFrame, const u32 *aPg, int nPg){
+  BfReplayCtx ctx;
+  int i, bAny = 0;
+  if( pCache==0 || pWalIdx==0 ) return SQLITE_OK;
+  ctx.pCache  = pCache;
+  ctx.pWalIdx = pWalIdx;
+  ctx.mxFrame = mxFrame;
+  ctx.bKeepBeyond = 0;
+  ctx.rc      = SQLITE_OK;
+  for(i=0; i<nPg && ctx.rc==SQLITE_OK; i++){
+    if( sqlite3BfWalIndexPageCount(pWalIdx, aPg[i])==0 ) continue;
+    bAny = 1;
+    bfReplayOnePage(&ctx, aPg[i]);
+  }
+  if( ctx.rc==SQLITE_OK && bAny ) pCache->bDirtyInserts = 1;
+  return ctx.rc;
+}
+
 /*
 ** Callback function to apply dirty records to the base page during merge.
 ** This function is called for each record in the mini-page during merge.

@@ -4444,6 +4444,43 @@ int sqlite3PagerBfSnapshot(Pager *pPager, u32 *aOut){
   return 0;
 }
 
+/*
+** Incremental invalidation (2026-10-12): the pages another connection's commits
+** changed since snapshot aOld, as sqlite3WalBfTouched.  0 = rebuild in full.
+** Also 0 when a rollback left record ops past the log end (a replay would
+** have to mark them unlogged; the full rebuild handles that).
+*/
+int sqlite3PagerBfTouched(Pager *pPager, const u32 *aOld, u32 **paPg, int *pnPg){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) && !sqlite3WalBfPrunePending(pPager->pWal) ){
+    return sqlite3WalBfTouched(pPager->pWal, aOld, paPg, pnPg);
+  }
+#endif
+  *paPg = 0;
+  *pnPg = 0;
+  return 0;
+}
+void sqlite3PagerBfTouchReset(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) sqlite3WalBfTouchReset(pPager->pWal);
+#endif
+}
+/* Replay the committed record ops of the nPg leaves aPg (each after its last
+** CLEAR), as sqlite3PagerBfReplayLog does for every leaf. */
+int sqlite3PagerBfReplayPages(Pager *pPager, BfCache *pBf,
+                              const u32 *aPg, int nPg){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pBf && pagerUseWal(pPager) ){
+    BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
+    if( pWalIdx ){
+      return sqlite3BfCacheReplayPages(pBf, pWalIdx,
+                 sqlite3WalBfMxFrame(pPager->pWal), aPg, nPg);
+    }
+  }
+#endif
+  return SQLITE_OK;
+}
+
 /* Bytes the ring needs to hold what sqlite3PagerBfReplayLog would replay. */
 u64 sqlite3PagerBfReplayBound(Pager *pPager, BfCache *pBf){
 #ifndef SQLITE_OMIT_WAL

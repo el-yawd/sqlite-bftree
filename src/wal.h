@@ -122,6 +122,8 @@ typedef struct BfWalIndex BfWalIndex;
 BfWalIndex *sqlite3WalBfIndex(Wal *pWal);
 int sqlite3WalBfCatchUp(Wal *pWal);
 void sqlite3WalBfSnapshot(Wal *pWal, u32 *aOut);
+int sqlite3WalBfTouched(Wal *pWal, const u32 *aOld, u32 **paPg, int *pnPg);
+void sqlite3WalBfTouchReset(Wal *pWal);
 /* Write-amplification counters: record frames / page-image frames / commits. */
 void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
 /* True iff record payloads are staged for the pending commit. */

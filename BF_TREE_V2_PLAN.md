@@ -2856,3 +2856,37 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   both collide with locked decisions; plugging the reference in as SQLite's B-tree is months
   (no txns/rollback/reverse scans/FFI) -- a standalone reference calibration run is the cheap
   alternative (owner: yes, next).
+
+### 2026-10-12 (cont.) — Claude Opus 5.5 — incremental invalidation of a reader's record cache
+
+- Problem (read priority): every foreign commit made each reader rebuild its WHOLE record
+  cache (ClearCache + replay of every logged op), so readers beside a busy writer ran cold.
+- Built: `sqlite3WalBfCatchUp` now also lists the pgnos the new frames change -- page frames'
+  pgnos and the leaves of record ops (incl. CLEAR) -- for the range (old snapshot, new].
+  `sqlite3BfBtreeSnapshotAdvance` drops only those leaves (mini-page, full page, leaf bit, X1
+  tallies) and replays each one's committed ops after its last CLEAR (`sqlite3BfCacheReplayPages`)
+  -- exactly what the full rebuild does for that leaf; every other leaf is already what the
+  rebuild would produce.  Falls back to the full rebuild when the list does not cover exactly
+  the range (log restart/new salt, gap, >16384 entries, file shrank), when this connection holds
+  records the log does not (deferred-commit carry/open batch, unlogged records, prune pending),
+  a cursor is open, or the replay does not fit (the full rebuild resizes the ring).  Ablation
+  `SQLITE_BF_NO_INCR_INVALIDATE` (SUT `bf_fullinval`); counters `snapshot_incremental`,
+  `snapshot_incr_pages` (bf_cache_stats).
+- Correctness: gate --full GREEN 51/51; mconn oracle 96 release + 32 debug runs over 7 configs
+  (ring 256 KiB, autockpt 20/50, promo 100, read_record_cache=0, adaptive, 8 readers with a
+  128 KiB reader ring) + 6 readers in full-page mode with 15% big values: all clean, ~98% of
+  snapshot changes take the incremental path; replay_fit_repro OK.
+- Oracle hole found by mutation: dropping the record-op leaves is caught at once; dropping the
+  page-frame pgnos passed every seed, because the oracle's values (<=300 B) always buffered.
+  `mconn_oracle` now writes 3% values of 2.5-6 KB (page path; `MCONN_BIGPCT`).  Even so -- and in
+  two directed tests (page-path writes on clean leaves; a flush that rebalances into siblings
+  the reader holds as full pages) -- the page-frame half was never NEEDED: every leaf whose base
+  changed also got a CLEAR.  It stays: "every base change is a page frame" is a WAL guarantee,
+  "every leaf change logs a CLEAR" only an observation.  Costs ~2x leaves listed, mostly
+  interior/overflow pgnos with no cache entry.
+- Micro (not quotable: 1 thread, buffered, in RAM, 100k rows x 100 B, zipf 0.99 scrambled,
+  16 MiB ring; READER statements timed only; writer = 1-row UPDATE commit every E reads):
+  E=10: stock 273k/s, full-drop 40k/s (miss 10%), incremental 255k/s (miss 0.07%);
+  E=100: 350k / 205k / 359k; E=1000: 382k / 353k / 377k.  The remaining mixed-loop gap at E=10
+  (stock 195k vs 161k) is the writer's commit path, not the reader.
+- Next: the threaded multi-reader driver (`bfbench --threads`) to measure this under direct I/O.

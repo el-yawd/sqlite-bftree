@@ -1017,6 +1017,8 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[6] = pBf ? pBf->nSnapshotRehydrate : 0;
   aOut[7] = pBf ? pBf->nRingGrow : 0;
   aOut[8] = pBf ? pBf->nRingPeak : 0;
+  aOut[9] = pBf ? pBf->nSnapshotIncr : 0;
+  aOut[10] = pBf ? pBf->nSnapshotIncrPages : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -1165,6 +1167,111 @@ int sqlite3BfBtreeSnapshotRehydrate(Btree *p){
   if( pBf==0 ) return SQLITE_OK;
   pBf->nSnapshotRehydrate++;
   return bfRehydrateFromLog(p, 0, 0);
+}
+
+/*
+** Incremental invalidation (2026-10-12): the cheap path to the same result as
+** sqlite3BfBtreeSnapshotRehydrate.
+**
+** Dropping the whole record cache because another connection committed made
+** every reader start cold after every foreign commit -- one writer committing
+** a row at a time left N readers each re-reading their working set from disk.
+** Stock SQLite does the same with its page cache, but stock has the OS page
+** cache behind it; our benchmarks run direct I/O, and the record cache is the
+** whole point.  So drop only what changed.  A leaf's cached state is two
+** things, and the log names every change to either:
+**
+**   - clean records and full pages copy its BASE image, which changes only by
+**     a page frame for it (the WAL is the only way to change a page);
+**   - buffered records are its ops after the last CLEAR, which change only by
+**     a record op (or CLEAR) logged for it.
+**
+** sqlite3WalBfCatchUp lists both kinds of pgno while it reads the new frames.
+** Each listed leaf is dropped and its committed ops replayed -- exactly what
+** the full rebuild does for it -- and every other leaf is left as it is, which
+** is exactly what the full rebuild would rebuild it to.
+**
+** Falls back to the full rebuild when that equivalence is not established:
+** the list does not cover exactly (old snapshot, new snapshot] (a log restart
+** overwrote frames this connection never read, the list overflowed, the file
+** shrank), this connection holds committed records the log does not (a
+** deferred-commit carry or open batch, unlogged records), or the replay could
+** not fit.  Ablation: SQLITE_BF_NO_INCR_INVALIDATE.
+*/
+static int bfSortPgno(const void *a, const void *b){
+  u32 x = *(const u32*)a, y = *(const u32*)b;
+  return x<y ? -1 : x>y;
+}
+int sqlite3BfBtreeSnapshotAdvance(Btree *p){
+#ifndef SQLITE_BF_NO_INCR_INVALIDATE
+  BfCache *pBf = 0;
+  Pager *pPager;
+  BfGroup *g;
+  u32 *aTouch = 0, *aPg;
+  int nTouch = 0, nPg, i;
+  u64 nDropBefore;
+  int rc;
+  if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf==0 ) return SQLITE_OK;
+  pPager = p->pBt->pPager;
+  g = (BfGroup*)pBf->pGroupCommit;
+  if( !pBf->bSnapSeen
+   || (g && (g->nCarry>0 || g->nOpen>0))
+   || pBf->nUnlogPg>0 || pBf->bUnlogOverflow
+   || p->pBt->pCursor!=0
+   || !sqlite3PagerBfTouched(pPager, pBf->aSnapSeen, &aTouch, &nTouch) ){
+    return sqlite3BfBtreeSnapshotRehydrate(p);
+  }
+  aPg = 0;
+  nPg = 0;
+  if( nTouch>0 ){
+    aPg = (u32*)sqlite3_malloc64(sizeof(u32)*(u64)nTouch);
+    if( aPg==0 ) return sqlite3BfBtreeSnapshotRehydrate(p);
+    memcpy(aPg, aTouch, sizeof(u32)*(size_t)nTouch);
+    qsort(aPg, (size_t)nTouch, sizeof(u32), bfSortPgno);
+    for(i=0; i<nTouch; i++){
+      if( nPg==0 || aPg[nPg-1]!=aPg[i] ) aPg[nPg++] = aPg[i];
+    }
+  }
+  for(i=0; i<nPg; i++){
+    BfMapEntry *pEntry;
+    sqlite3BfLeafBitClear(pBf, aPg[i]);    /* a page frame may make it interior */
+    sqlite3BfFullPageDrop(pBf, aPg[i]);
+    pEntry = sqlite3BfMapLookup(pBf, aPg[i]);
+    if( pEntry ){
+      pEntry->nAdHit = 0;
+      pEntry->nAdMiss = 0;
+      if( pEntry->locType==BF_LOC_MINI ){
+        pEntry->locType = BF_LOC_NULL;     /* slab becomes an orphan */
+        pEntry->pPage = 0;
+      }
+    }
+  }
+  nDropBefore = pBf->nReplayDropped;
+  rc = sqlite3PagerBfReplayPages(pPager, pBf, aPg, nPg);
+  if( rc==SQLITE_OK && pBf->nReplayDropped!=nDropBefore ){
+    /* Did not fit beside what the cache already holds: the full rebuild can
+    ** resize the ring, and fails loudly if even that is not enough. */
+    pBf->nReplayDropped = nDropBefore;
+    sqlite3_free(aPg);
+    return sqlite3BfBtreeSnapshotRehydrate(p);
+  }
+  if( rc==SQLITE_OK ){
+    /* Every replayed op is in the committed log (no prune pending: checked by
+    ** sqlite3PagerBfTouched), so none of it is this connection's to log. */
+    for(i=0; i<nPg; i++){
+      BfMapEntry *pEntry = sqlite3BfMapLookup(pBf, aPg[i]);
+      if( pEntry ) bfMarkLoggedCallback(0, aPg[i], pEntry);
+    }
+    sqlite3BfUnlogListReset(pBf);
+    pBf->nSnapshotIncr++;
+    pBf->nSnapshotIncrPages += (u64)nPg;
+  }
+  sqlite3_free(aPg);
+  return rc;
+#else
+  return sqlite3BfBtreeSnapshotRehydrate(p);
+#endif
 }
 
 static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){

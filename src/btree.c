@@ -3778,11 +3778,14 @@ static SQLITE_NOINLINE int btreeBeginTrans(
         ** both wasted work and, in a ring smaller than the dirty set, lossy. */
         if( !pBfSnap->bSnapSeen
          || memcmp(aSnap, pBfSnap->aSnapSeen, sizeof(aSnap))!=0 ){
-          rc = sqlite3BfBtreeSnapshotRehydrate(p);
+          /* Drops only the leaves the new frames changed when it can, else
+          ** rebuilds the whole cache. */
+          rc = sqlite3BfBtreeSnapshotAdvance(p);
         }
         if( rc==SQLITE_OK ){
           memcpy(pBfSnap->aSnapSeen, aSnap, sizeof(aSnap));
           pBfSnap->bSnapSeen = 1;
+          sqlite3PagerBfTouchReset(pPager);
         }
       }else{
         /* Rollback journal: nothing stays buffered across transactions, so a
@@ -4561,6 +4564,7 @@ int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
       if( pBfC && sqlite3PagerBfSnapshot(pBt->pPager, aSnap) ){
         memcpy(pBfC->aSnapSeen, aSnap, sizeof(aSnap));
         pBfC->bSnapSeen = 1;
+        sqlite3PagerBfTouchReset(pBt->pPager);
       }
     }
 #endif

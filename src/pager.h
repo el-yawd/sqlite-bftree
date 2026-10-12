@@ -283,6 +283,9 @@ void sqlite3PagerBfFrameStats(Pager*, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
 int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable);
 int sqlite3PagerBfSnapshot(Pager *pPager, u32 *aOut);
 u64 sqlite3PagerBfReplayBound(Pager *pPager, BfCache *pBf);
+int sqlite3PagerBfTouched(Pager*, const u32 *aOld, u32 **paPg, int *pnPg);
+void sqlite3PagerBfTouchReset(Pager*);
+int sqlite3PagerBfReplayPages(Pager*, BfCache*, const u32 *aPg, int nPg);
 void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage);
 int sqlite3PagerBfHasDirty(Pager *pPager);
 

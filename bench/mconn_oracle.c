@@ -88,8 +88,16 @@ static void execOk(sqlite3 *db, const char *zSql){
 
 /* Values are refcount-free: every version is a fresh malloc and nothing is
 ** freed (bounded by NOPS), so snapshots can share pointers safely. */
+/* Percent of values that are too big to buffer (MCONN_BIGPCT, default 3).
+** Those go through the PAGE path: a write-through cell, with no record op and
+** often no CLEAR either, so a reader learns of it only from the page frame.
+** Without them every change also logged a record op for the same leaf, and
+** the oracle could not see a reader that ignored page frames (2026-10-12: a
+** build that skipped them passed every seed). */
+static int nBigPct = 3;
+#define BIGVAL 6000
 static char *mkVal(void){
-  int n = 1 + rndn(MAXVAL), i;
+  int n = rndn(100)<nBigPct ? 2500 + rndn(BIGVAL-2500) : 1 + rndn(MAXVAL), i;
   char *z = malloc(n+1);
   for(i=0; i<n; i++) z[i] = 'a' + rndn(26);
   z[n] = 0;
@@ -311,6 +319,7 @@ int main(int argc, char **argv){
   if( nReader<1 || nReader>MAXREAD ) nReader = 2;
   zPragmas = argc>5 ? argv[5] : "";
   zReaderPragmas = argc>6 ? argv[6] : "";
+  if( getenv("MCONN_BIGPCT") ) nBigPct = atoi(getenv("MCONN_BIGPCT"));
   { char b[600];
     snprintf(b, sizeof(b), "%s", zDbPath); remove(b);
     snprintf(b, sizeof(b), "%s-wal", zDbPath); remove(b);
@@ -384,7 +393,7 @@ int main(int argc, char **argv){
   checkRange(&W, 1, NKEYS, 0);
   /* A replay that drops a record has lost a committed row even if no read
   ** happened to touch it: fail on it explicitly (BF builds only). */
-  { u64 nDrop = 0, nRehyd = 0;
+  { u64 nDrop = 0, nRehyd = 0, nIncr = 0, nIncrPg = 0;
     for(i=0; i<=nReader; i++){
       sqlite3 *db = i<nReader ? R[i].db : W.db;
       sqlite3_stmt *p;
@@ -393,6 +402,8 @@ int main(int argc, char **argv){
         const char *zName = (const char*)sqlite3_column_text(p, 0);
         if( zName && strcmp(zName, "replay_dropped")==0 ) nDrop += sqlite3_column_int64(p, 1);
         if( zName && strcmp(zName, "snapshot_rehydrate")==0 ) nRehyd += sqlite3_column_int64(p, 1);
+        if( zName && strcmp(zName, "snapshot_incremental")==0 ) nIncr += sqlite3_column_int64(p, 1);
+        if( zName && strcmp(zName, "snapshot_incr_pages")==0 ) nIncrPg += sqlite3_column_int64(p, 1);
       }
       sqlite3_finalize(p);
     }
@@ -402,8 +413,9 @@ int main(int argc, char **argv){
                (unsigned long long)nDrop);
       die(buf);
     }
-    printf("OK %ld ops, %d readers, %llu snapshot rebuilds\n", nOps, nReader,
-           (unsigned long long)nRehyd);
+    printf("OK %ld ops, %d readers, %llu snapshot rebuilds, %llu incremental"
+           " (%llu leaves dropped)\n", nOps, nReader, (unsigned long long)nRehyd,
+           (unsigned long long)nIncr, (unsigned long long)nIncrPg);
   }
   for(i=0; i<nReader; i++) sqlite3_close(R[i].db);
   sqlite3_close(W.db);

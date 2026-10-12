@@ -491,6 +491,8 @@ struct WalCkptInfo {
 ** WAL checksum chain, salt matching, and the nTruncate commit marker are all
 ** unaffected.  See bf_wal.h and BF_TREE_V2_KNOWLEDGE.md §1.5. */
 #define WAL_BF_RECORD_PGNO 0xffffffffu
+/* Incremental invalidation stops listing pages past this many (sqlite3WalBfTouched). */
+#define WAL_BF_TOUCH_MAX 16384
 #endif
 
 /* Size of write ahead log header, including checksum. */
@@ -566,6 +568,21 @@ struct Wal {
   ** see walBfCatchUp. */
   u32 iBfIngested;
   u32 aBfSalt[2];
+  /* Incremental invalidation (2026-10-12).  The pages the frames catch-up read
+  ** change -- page frames' pgnos and the leaves of record ops -- for the range
+  ** (iBfTouchFrom, iBfTouchTo] of the generation aBfTouchSalt.  The btree layer
+  ** uses it to drop only those leaves from the record cache when another
+  ** connection committed, instead of rebuilding the whole cache.  bBfTouchOk is
+  ** cleared by anything that breaks continuity (a new generation, a gap, an
+  ** overflowing list), and then the full rebuild runs. */
+  u32 *aBfTouch;
+  int nBfTouch;
+  int nBfTouchAlloc;
+  u32 iBfTouchFrom;
+  u32 iBfTouchTo;
+  u32 nBfTouchPage;         /* database size (pages) at iBfTouchFrom */
+  u32 aBfTouchSalt[2];
+  u8 bBfTouchOk;
 #endif
 #ifdef SQLITE_USE_SEH
   u32 lockMask;              /* Mask of locks held */
@@ -2667,6 +2684,7 @@ int sqlite3WalClose(
     sqlite3BfWalIndexFree(pWal->pBfWal);
     sqlite3WalBfStageClear(pWal);
     sqlite3_free(pWal->apBfStage);
+    sqlite3_free(pWal->aBfTouch);
 #endif
     sqlite3_free(pWal);
   }
@@ -4693,6 +4711,23 @@ BfWalIndex *sqlite3WalBfIndex(Wal *pWal){
 ** Frames <= mxFrame are committed and cannot be overwritten while this
 ** connection holds its read lock.  Must be called with the read lock held.
 */
+/* Note that frames of the catch-up in progress change page pgno. */
+static void walBfTouch(Wal *pWal, u32 pgno){
+  if( !pWal->bBfTouchOk || pgno<=1 ) return;
+  if( pWal->nBfTouch>0 && pWal->aBfTouch[pWal->nBfTouch-1]==pgno ) return;
+  if( pWal->nBfTouch>=pWal->nBfTouchAlloc ){
+    int nNew = pWal->nBfTouchAlloc ? pWal->nBfTouchAlloc*2 : 64;
+    u32 *aNew;
+    /* Past this many leaves a full rebuild is as cheap: stop listing. */
+    if( nNew>WAL_BF_TOUCH_MAX ){ pWal->bBfTouchOk = 0; return; }
+    aNew = (u32*)sqlite3_realloc(pWal->aBfTouch, nNew*(int)sizeof(u32));
+    if( aNew==0 ){ pWal->bBfTouchOk = 0; return; }
+    pWal->aBfTouch = aNew;
+    pWal->nBfTouchAlloc = nNew;
+  }
+  pWal->aBfTouch[pWal->nBfTouch++] = pgno;
+}
+
 int sqlite3WalBfCatchUp(Wal *pWal){
   u32 iFrame;
   u8 *aFrame;
@@ -4701,6 +4736,7 @@ int sqlite3WalBfCatchUp(Wal *pWal){
   if( pWal==0 ) return SQLITE_OK;
   if( memcmp(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt))!=0
    || pWal->iBfIngested>pWal->hdr.mxFrame ){
+    pWal->bBfTouchOk = 0;    /* the frames between are gone: full rebuild */
     sqlite3BfWalIndexFree(pWal->pBfWal);
     pWal->pBfWal = 0;
     pWal->bBfPrune = 0;
@@ -4709,6 +4745,11 @@ int sqlite3WalBfCatchUp(Wal *pWal){
   }else if( pWal->bBfPrune ){
     sqlite3BfWalIndexPrune(pWal->pBfWal, pWal->iBfIngested);
     pWal->bBfPrune = 0;
+  }
+  if( pWal->bBfTouchOk
+   && (pWal->iBfTouchTo!=pWal->iBfIngested
+    || memcmp(pWal->aBfTouchSalt, pWal->hdr.aSalt, 8)!=0) ){
+    pWal->bBfTouchOk = 0;    /* a gap: the list would not cover every change */
   }
   if( pWal->iBfIngested>=pWal->hdr.mxFrame ) return SQLITE_OK;
   szPage = walPagesize(pWal);
@@ -4729,11 +4770,63 @@ int sqlite3WalBfCatchUp(Wal *pWal){
       if( rc!=SQLITE_OK ) break;
       rc = walBfIngestRecordFrame(pWal, &aFrame[WAL_FRAME_HDRSIZE], iFrame);
       if( rc!=SQLITE_OK ) break;
+      if( pWal->bBfTouchOk ){
+        BfWalIter it;
+        BfWalRec r;
+        if( sqlite3BfWalIterInit(&it, &aFrame[WAL_FRAME_HDRSIZE], szPage)
+              ==BFWAL_OK ){
+          while( sqlite3BfWalIterNext(&it, &r)==BFWAL_OK ) walBfTouch(pWal, r.pgno);
+        }else{
+          pWal->bBfTouchOk = 0;
+        }
+      }
+    }else{
+      walBfTouch(pWal, sqlite3Get4byte(aFrame));
     }
   }
-  if( rc==SQLITE_OK ) pWal->iBfIngested = pWal->hdr.mxFrame;
+  if( rc==SQLITE_OK ){
+    pWal->iBfIngested = pWal->hdr.mxFrame;
+    pWal->iBfTouchTo = pWal->hdr.mxFrame;
+  }else{
+    pWal->bBfTouchOk = 0;
+  }
   sqlite3_free(aFrame);
   return rc;
+}
+
+/*
+** The pages changed between snapshot aOld (mxFrame, salt1, salt2: what the
+** record cache reflects) and this connection's current snapshot.  Returns 1 and
+** sets *paPg/*pnPg (duplicates possible) when the touch list covers exactly that
+** range, else 0: the caller must rebuild the cache in full.
+*/
+int sqlite3WalBfTouched(Wal *pWal, const u32 *aOld, u32 **paPg, int *pnPg){
+  *paPg = 0;
+  *pnPg = 0;
+  if( pWal==0 || !pWal->bBfTouchOk ) return 0;
+  if( pWal->aBfTouchSalt[0]!=aOld[1] || pWal->aBfTouchSalt[1]!=aOld[2] ) return 0;
+  if( memcmp(pWal->aBfTouchSalt, pWal->hdr.aSalt, 8)!=0 ) return 0;
+  if( pWal->iBfTouchFrom!=aOld[0] || pWal->iBfTouchTo!=pWal->hdr.mxFrame ) return 0;
+  if( pWal->iBfIngested!=pWal->hdr.mxFrame ) return 0;
+  /* A shrinking file drops pages without writing a frame for them. */
+  if( pWal->hdr.nPage<pWal->nBfTouchPage ) return 0;
+  *paPg = pWal->aBfTouch;
+  *pnPg = pWal->nBfTouch;
+  return 1;
+}
+
+/* The record cache now reflects the current snapshot: start an empty list. */
+void sqlite3WalBfTouchReset(Wal *pWal){
+  if( pWal==0 ) return;
+  pWal->nBfTouch = 0;
+  pWal->iBfTouchFrom = pWal->hdr.mxFrame;
+  pWal->iBfTouchTo = pWal->hdr.mxFrame;
+  pWal->nBfTouchPage = pWal->hdr.nPage;
+  memcpy(pWal->aBfTouchSalt, pWal->hdr.aSalt, 8);
+  /* Only valid if the index is level with the snapshot; otherwise the next
+  ** catch-up would start from somewhere else and fail the gap test anyway. */
+  pWal->bBfTouchOk = (pWal->iBfIngested==pWal->hdr.mxFrame
+       && memcmp(pWal->aBfSalt, pWal->hdr.aSalt, 8)==0);
 }
 
 /* This connection's snapshot as (mxFrame, salt1, salt2): equal values mean the

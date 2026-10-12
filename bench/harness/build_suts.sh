@@ -24,6 +24,7 @@
 #   bf_nodirtycoa -DSQLITE_BF_NO_DIRTY_COA        item 4c: second chance for clean pages only
 #   bf_nolbref    -DSQLITE_BF_NO_LOWER_BOUND_REF  item 4b: a miss does not mark its lower bound
 #   bf_nocap      -DSQLITE_BF_NO_MINI_CAP         M5: mini-pages may grow to 4096 (pre-2026-10-07)
+#   bf_fullinval  -DSQLITE_BF_NO_INCR_INVALIDATE  a foreign commit rebuilds the whole record cache (pre-2026-10-12)
 #
 # Usage:
 #   sh bench/harness/build_suts.sh            # core variants (stock, bf, bf_ro)
@@ -106,6 +107,7 @@ if [ "$ALL" = 1 ]; then
   build_one bf_nolbref    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_LOWER_BOUND_REF"
   # M5 ablation (2026-10-07): no 2048 B mini-page cap; growth to 4096 as before.
   build_one bf_nocap      "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MINI_CAP"
+  build_one bf_fullinval  "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_INCR_INVALIDATE"
 fi
 
 # bf_off is the same binary as bf; the runner passes --bf-cache off.
