@@ -2778,3 +2778,38 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   X1 at N=8 keeps the scrambled win intact and turns raw from parity into a win; N=16 admits
   too few leaves.  Missing: v16 scrambled (replay probe: 0.473 at N=8 = record mode) and the
   rest of v16 raw.  X1 stays DEFAULT OFF pending the owner.
+
+### 2026-10-12 — Claude Opus 5.5 — concurrency model decided; multi-connection correctness (`61602bf`)
+
+- **Owner decision**: one writer + N readers, ONE record cache PER CONNECTION (duplicated, as
+  stock duplicates its page cache); no shared cache (S1a dropped); never modify stock to fit
+  BF.  Then: correctness debts before the heavy (VPS) campaign.
+- New oracle **`bench/mconn_oracle.c`**: one writer + K reader connections in one process
+  (separate pagers), seeded interleaving of writer txns (insert/update/delete, commit/rollback,
+  PASSIVE/RESTART checkpoints) and reader txns; every read (point, range ASC/DESC, count) is
+  checked against an in-process model of the snapshot that reader must see (taken at its
+  first read in the txn); fails on any `replay_dropped`.  Passes on stock first.  NOT in the
+  gate yet (owner protects gate time) -- run by hand, see its header.
+- It found three bugs the single-connection gate cannot see:
+  1. **Committed buffered rows invisible to other connections.**  `pBfWal` was filled only by
+     a connection's own recovery scan / own writes.  Fix `sqlite3WalBfCatchUp`: ingest
+     (iBfIngested, mxFrame] per WAL generation (salt).
+  2. **Reader record cache survived another connection's commit** (`pager_reset` never drops
+     mini-pages): stale clean records, replays stacked on old replays (merge scan emitted keys
+     twice).  Fix: `btreeBeginTrans` rebuilds the cache (`sqlite3BfBtreeSnapshotRehydrate`,
+     the rollback rehydrate) when the WAL snapshot (mxFrame, salts) differs from the one it
+     reflects (set at own commit).  First attempt keyed on the pager data version, which also
+     moves on OWN commits/checkpoints: spurious rebuilds dropped records in a 256 KiB ring
+     (gate xtable RED, replay_dropped 1329) -- replay cannot evict dirty records, so a rebuild
+     is only safe when it is really needed.  Rollback journal: drop the cache on data_version.
+     Counter `snapshot_rehydrate`.
+  3. **Durability (single connection)**: an UPDATE that declined buffering (UpdateCell refused
+     at the mini-page cap / stalled ring, or SAVEPOSITION) took the same-size overwrite fast
+     path BEFORE the pre-mutation flush, while the key had a newer dirty logged record; the WAL
+     kept that op with no CLEAR after it, so recovery / rollback / readers resurrected the old
+     value.  Fix: `bf_update_declined` flushes the table first for base-cell rows too.
+- Results: mconn 400/400 (60 seeds x default, 256 KiB ring, readfull, adaptive, 8 readers,
+  128 KiB + 8 readers; 20 SQLITE_DEBUG), replay_dropped 0.  Gate `--full` GREEN 51/51.
+- Open: deferred commit (`bf_group_commit>1`) with several WRITING connections is unsupported;
+  rollback-journal multi-connection is not exercised by the oracle (WAL only); a
+  single-connection crash repro for bug 3 would make it visible to the crash oracle too.
