@@ -2890,3 +2890,10 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   E=100: 350k / 205k / 359k; E=1000: 382k / 353k / 377k.  The remaining mixed-loop gap at E=10
   (stock 195k vs 161k) is the writer's commit path, not the reader.
 - Next: the threaded multi-reader driver (`bfbench --threads`) to measure this under direct I/O.
+- Follow-up (owner: "can the write work reach stock on a mixed workload?"), same micro, E=10,
+  writer statements timed: stock 12.5 us/commit, BF 20.9 (autockpt 1000); with autockpt=0
+  stock 12.0, BF 17.6.  So ~40% of the writer gap is checkpoint materialisation, ~60% is
+  commit-path CPU with no checkpoint at all.  BF writes ~1.27 frames/commit (record frame +
+  some page frames) vs stock's 1.0 -> 25% MORE WAL bytes for 1-row commits under the locked
+  page-sized frames.  Reader-only gap at E=10 (254k vs 295k/s) = catch-up preads + replay.
+  Not profiled yet (a perf run sampled setup code only; redo with the loop isolated).
