@@ -3017,3 +3017,6 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   over-approximation (absent point seeks widened to the neighbour key; leaf-granular CLEAR/write
   rules).  Next: stop page writes inside concurrent txns where possible, point seeks without
   widening, then measure.
+- Gate (owner: yes): + repro:stale_ckpt and mwriter (quick: 32 runs; full: 96 release + 32
+  debug), drivers compiled per run from a snapshot of sqlite3.c inside their tasks.  Quick
+  15/15 in 27 s; full 54/54 in 107 s (no wall-time change: they overlap difftest).

@@ -21,9 +21,16 @@ Tasks, per tier (quick = fewer seeds):
               promotion 100, SQLITE_DEBUG
   powerloss   powerloss_oracle.py: FULL, NORMAL, FULL+group 8, FULL+ring
   ring        ring_repro.sh (full tier only: needs the harness dataset)
+  stale_ckpt  stale_ckpt_repro.c: a stale-cache checkpoint must not erase another
+              connection's committed record frames (2026-10-13)
+  mwriter     mwriter_sweep.sh (BEGIN CONCURRENT, K writers, serialisability model):
+              quick = 2 seeds x {plain, checkcommit}; full = 4 seeds x {plain,
+              checkcommit, norange} + SQLITE_DEBUG 2 seeds
 
 Needs build/{sqlite3, sqlite3_buf, sqlite3_stock, sqlite3_dbg, sqlite3.c}; the
 power-loss driver is compiled into build/plvfs when sqlite3.c is newer than it.
+The stale_ckpt and mwriter drivers are compiled per run, inside their tasks, from
+a snapshot of sqlite3.c (so they overlap difftest and can never be stale).
 """
 import argparse, os, shutil, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -66,7 +73,12 @@ def main():
     shutil.copy2(plvfs, os.path.join(work, "plvfs"))
     bins["plvfs"] = os.path.join(work, "plvfs")
 
+    amal_snap = os.path.join(work, "sqlite3.c")
+    shutil.copy2(amal, amal_snap)
     B, ST, DBG = bins["sqlite3_buf"], bins["sqlite3_stock"], bins["sqlite3_dbg"]
+    def ccdrv(out, src, flags):
+        return (f"cc {flags} -DSQLITE_BF_INSERT_BUFFERING -I{BUILD} -I{ROOT}/src "
+                f"-o {work}/{out} {BENCH}/{src} {amal_snap} -lm -lpthread")
     tasks = []   # (name, shell command)
 
     def add(name, cmd): tasks.append((name, cmd))
@@ -120,6 +132,20 @@ def main():
                 f"python3 {BENCH}/powerloss/powerloss_oracle.py {seed}")
     if full:
         add("ring_repro", f"sh {BENCH}/ring_repro.sh")
+
+    add("repro:stale_ckpt", ccdrv("stale_ckpt", "stale_ckpt_repro.c", "-O1") +
+        f" && {work}/stale_ckpt {work}/stale_ckpt.db")
+    # mwriter: each task builds its own driver, then runs one shard of the sweep.
+    mw = ccdrv("mw_bf", "mwriter_oracle.c", "-O1 -g")
+    if full:
+        add("mwriter:release", f"{mw} && SEEDS=1 SEEDE=4 MODES='plain checkcommit norange' "
+                               f"bash {BENCH}/mwriter_sweep.sh {work}/mw_bf")
+        add("mwriter:debug", ccdrv("mw_bf_dbg", "mwriter_oracle.c", "-O0 -g -DSQLITE_DEBUG") +
+            f" && SEEDS=5 SEEDE=6 MODES='plain checkcommit' NOPS=12000 "
+            f"bash {BENCH}/mwriter_sweep.sh {work}/mw_bf_dbg")
+    else:
+        add("mwriter:release", f"{mw} && SEEDS=1 SEEDE=2 MODES='plain checkcommit' "
+                               f"bash {BENCH}/mwriter_sweep.sh {work}/mw_bf")
 
     print(f"gate: {'FULL' if full else 'quick'} tier, {len(tasks)} tasks, "
           f"{a.jobs} workers, snapshot in {work}", flush=True)
