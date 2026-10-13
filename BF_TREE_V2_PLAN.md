@@ -2968,3 +2968,9 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   ops committed since the snapshot at walLockForCommit), cache rebase that keeps the txn's own
   records, a multi-writer serialisability oracle, then a threaded driver: abort rate and
   throughput, stock+BC vs BF+BC.
+- Design doc: `docs/design/concurrent-engine.md` -- row-level OCC (read sets incl. absent keys
+  and ranges, private write sets, system transactions for merges), a logical + complete +
+  idempotent op log (CLEAR and rollback rehydrate retired), own log format with durable group
+  commit (fresh block per flush, no in-place rewrite), page index by LSN, mini-page region +
+  fuzzy checkpoint, per-page LSN as an optimisation only.  Stages C1-C5 (C1-C2 carry the
+  thesis claim).  write-path.md marked superseded.  Awaiting owner decisions (section 13).

@@ -1,6 +1,6 @@
 # Write path redesign: the record log lives in database pages
 
-Status: **PROPOSAL** (2026-10-13). WAL mode only. Compatibility is not a constraint
+Status: **SUPERSEDED** by `concurrent-engine.md` (owner did not like it). Was: PROPOSAL (2026-10-13). WAL mode only. Compatibility is not a constraint
 (owner); durability must stay at SQLite's level. Supersedes
 `persisted-mini-pages.md` (v2), which this design generalises (section 9).
 
