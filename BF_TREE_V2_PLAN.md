@@ -2932,3 +2932,10 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   generation packs ~34 x 120 B records per 4 KB frame (2,500 records ~ 75 frames vs 2,500 page
   frames today), so it may fit the locked page-sized-frame format.
 - Gate --full GREEN (both commits); mconn sweep 104 + 48 runs clean; bench/mconn_sweep.sh added.
+- Design proposal written: `docs/design/persisted-mini-pages.md` -- at checkpoint, store each
+  changed leaf's dirty records in an internal table `sqlite_bf_store` (WAL record-batch codec,
+  new op PERSIST, payload v5) instead of merging ~2,500 leaves; close still materialises, so a
+  db at rest stays a plain SQLite file.  Rejected first: re-logging records into the new WAL
+  generation (a kill between the restart's header write and the frames loses records committed
+  long ago).  Reference: never resets its WAL; its CPR snapshot writes unmerged mini-pages to a
+  separate file.  Awaiting owner approval (reopens "BF data on disk only in WAL record frames").
