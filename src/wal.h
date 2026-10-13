@@ -124,6 +124,9 @@ int sqlite3WalBfCatchUp(Wal *pWal);
 void sqlite3WalBfSnapshot(Wal *pWal, u32 *aOut);
 int sqlite3WalBfTouched(Wal *pWal, const u32 *aOld, u32 **paPg, int *pnPg);
 void sqlite3WalBfTouchReset(Wal *pWal);
+#ifdef SQLITE_BF_CONCURRENT
+int sqlite3WalBfConcurrentScan(Wal*, int(*)(void*,u32,u32,const u8*,int,int), void*, int*);
+#endif
 /* Write-amplification counters: record frames / page-image frames / commits. */
 void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
 /* True iff record payloads are staged for the pending commit. */

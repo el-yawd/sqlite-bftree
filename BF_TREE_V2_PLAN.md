@@ -2983,3 +2983,37 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   (configs/equiv_bc.json, unquotable: powersave, spreads to 91%) showed a possible systematic
   write-path difference (ycsb_a p99.9 0.7 ms pristine vs 11 ms merged stocks) -- to settle with
   a pre-merge stock (`26c168be8`) in the same run.  Pristine build kept at ../.pristine352.
+
+### 2026-10-13 (cont.) — Claude Opus 5.5 — C1: row-level validation for BEGIN CONCURRENT (correctness)
+
+- New oracle `bench/mwriter_oracle.c` (K writers, BEGIN CONCURRENT, model in commit order;
+  read-only txns serialise at their snapshot; counts FALSE conflicts) + `bench/mwriter_sweep.sh`.
+  Stock+BC passes (validates the oracle): **97% of its refusals are false conflicts**.
+- Built (docs/design/concurrent-engine.md C1): row-level read set per concurrent txn (point keys
+  incl. absent, scan spans, count = whole table) recorded by thin wrappers on the btree cursor
+  entry points; commit-time scan of other txns' record frames under the write lock (after
+  upstream's page check), which also ingests them so the record index has no gap; cache rebase
+  after commit via incremental invalidation; BF-served reads mark their leaf in upstream's page
+  read set; blind insert off inside concurrent txns; upstream's page loop skips record frames
+  (it called PagerLookup(0)).  Counters conc_validated / conc_conflicts / conc_ops_tested.
+- Conflict rules the oracle forced (all consequences of records keyed by LEAF + CLEAR, i.e. the
+  current format; P1/P2 of the design remove them): another txn's op on leaf L conflicts if WE
+  wrote page L (merge/split/rebalance moved its key) or merged L; another txn's CLEAR(L) is a
+  LOGICAL change (it deletes buffered-only rows with no page frame) and conflicts if we read or
+  wrote L.
+- **Pre-existing durability bug found and fixed** (not concurrency-specific):
+  bfCheckpointMaterialize decided "nothing buffered" from a STALE cache before beginning its
+  write txn; a reader's checkpoint (sqlite3_close runs TRUNCATE) then reset the log and erased the
+  writer's committed record frames.  Repro `bench/stale_ckpt_repro.c` (pre-fix: 549/550 rows;
+  fixed: 550).  Fix: begin the write txn first (cache caught up), then decide.
+- Also: walFrames now advances the ingest watermark and touch list over the committer's own
+  frames (a commit with page frames used to break incremental invalidation's continuity).
+- Results: gate --full 51/51; mconn 48/48; mwriter 240 release + 48 debug runs, 0 failed.
+  bench/concurrent_conflict.c: BF+BC now refuses the same-row update and commits two rows on
+  one leaf (stock+BC refuses both).
+- NOT done: the false-conflict claim.  BF still refuses ~97% falsely in mwriter: ~3/4 by
+  upstream's PAGE check -- our own page writes (range-scan table flush, page-path insert
+  fallback -> table flush, merges, checkpoint materialise) -- and ~1/4 by row-level
+  over-approximation (absent point seeks widened to the neighbour key; leaf-granular CLEAR/write
+  rules).  Next: stop page writes inside concurrent txns where possible, point seeks without
+  widening, then measure.

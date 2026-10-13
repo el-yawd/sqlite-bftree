@@ -16,6 +16,16 @@
 #include "btreeInt.h"
 #include "bf_cache.h"
 
+/* C1 (2026-10-13): in a buffering build with BEGIN CONCURRENT compiled in, the
+** cursor entry points below are thin wrappers that record what each move
+** observed (sqlite3BfRsNote) around the unchanged bodies, which this macro
+** renames.  Without SQLITE_BF_CONCURRENT the body IS the public function. */
+#ifdef SQLITE_BF_CONCURRENT
+# define BF_RS_BODY(pub, body) static int body
+#else
+# define BF_RS_BODY(pub, body) int pub
+#endif
+
 /*
 ** The header string that appears at the beginning of every
 ** SQLite database.
@@ -4131,6 +4141,9 @@ trans_begun:
 #ifndef SQLITE_OMIT_CONCURRENT
   if( bConcurrent && rc==SQLITE_OK && sqlite3PagerIsWal(pBt->pPager) ){
     rc = sqlite3PagerBeginConcurrent(pBt->pPager);
+#ifdef SQLITE_BF_CONCURRENT
+    if( rc==SQLITE_OK ) sqlite3BfRsBegin(pBt);   /* C1: row-level read set */
+#endif
     if( rc==SQLITE_OK && wrflag ){
       rc = btreePtrmapAllocate(pBt);
     }
@@ -4966,6 +4979,9 @@ static void btreeEndTransaction(Btree *p){
     /* Set the current transaction state to TRANS_NONE and unlock the
     ** pager if this call closed the only read or write transaction.  */
     p->inTrans = TRANS_NONE;
+#ifdef SQLITE_BF_CONCURRENT
+    if( pBt->bfRsActive ) sqlite3BfRsEnd(pBt);
+#endif
     unlockBtreeIfUnused(pBt);
   }
 
@@ -5031,6 +5047,11 @@ int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
       BfCache *pBfC = sqlite3PagerGetBfCache(pBt->pPager);
       u32 aSnap[3];
       if( pBfC && sqlite3PagerBfSnapshot(pBt->pPager, aSnap) ){
+#ifdef SQLITE_BF_CONCURRENT
+        /* C1: a concurrent commit that others preceded -- bring the cache
+        ** from the transaction's snapshot (aSnapSeen) to the new one first. */
+        sqlite3BfBtreeConcurrentRebase(p);
+#endif
         memcpy(pBfC->aSnapSeen, aSnap, sizeof(aSnap));
         pBfC->bSnapSeen = 1;
         sqlite3PagerBfTouchReset(pBt->pPager);
@@ -5454,6 +5475,7 @@ static int btreeCursor(
   pCur->bfBlindSeek = 0;
   pCur->bfBlindHit = 0;
   pCur->bfAbsentLeaf = 0;
+  pCur->bfRsIdx = 0;
   pCur->bfAbsentKey = 0;
   pCur->bfAbsentGen = 0;
   pCur->bfIxBound = 0;
@@ -6764,7 +6786,15 @@ static int bfMergeEnsureScratch(BtCursor *pCur){
 }
 #endif /* SQLITE_BF_INSERT_BUFFERING */
 
+#ifdef SQLITE_BF_CONCURRENT
+static int btreeFirstBody(BtCursor*, int*);
 int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
+  int rc = btreeFirstBody(pCur, pRes);
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_FIRST, 0, rc);
+  return rc;
+}
+#endif
+BF_RS_BODY(sqlite3BtreeFirst, btreeFirstBody)(BtCursor *pCur, int *pRes){
   int rc;
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
   int bMerge;
@@ -6841,7 +6871,15 @@ int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
 ** Return SQLITE_OK on success or some error code (ex: SQLITE_NOMEM) if
 ** something goes wrong.
 */
+#ifdef SQLITE_BF_CONCURRENT
+static int btreeIsEmptyBody(BtCursor*, int*);
 int sqlite3BtreeIsEmpty(BtCursor *pCur, int *pRes){
+  int rc = btreeIsEmptyBody(pCur, pRes);
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_ALL, 0, rc);
+  return rc;
+}
+#endif
+BF_RS_BODY(sqlite3BtreeIsEmpty, btreeIsEmptyBody)(BtCursor *pCur, int *pRes){
   int rc;
 
   assert( cursorOwnsBtShared(pCur) );
@@ -6899,7 +6937,15 @@ static SQLITE_NOINLINE int btreeLast(BtCursor *pCur, int *pRes){
   }
   return rc;
 }
+#ifdef SQLITE_BF_CONCURRENT
+static int btreeLastBody(BtCursor*, int*);
 int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
+  int rc = btreeLastBody(pCur, pRes);
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_LAST, 0, rc);
+  return rc;
+}
+#endif
+BF_RS_BODY(sqlite3BtreeLast, btreeLastBody)(BtCursor *pCur, int *pRes){
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
 #ifndef SQLITE_OMIT_BF_CACHE
@@ -7062,6 +7108,11 @@ int sqlite3BtreeBfArmBlind(BtCursor *pCur, i64 iKey){
   if( pCur->pKeyInfo!=0 ) return 0;       /* not curIntKey: see bfScanCanMerge */
   if( pCur->pgnoRoot<=1 || (pCur->curFlags & BTCF_WriteFlag)==0 ) return 0;
   if( btreeGetBfCache(pCur->pBt)==0 ) return 0;
+#ifdef SQLITE_BF_CONCURRENT
+  /* A blind upsert reads neither the row nor the leaf, so a concurrent
+  ** transaction could not validate it: seek normally. */
+  if( pCur->pBt->bfRsActive ) return 0;
+#endif
   pCur->bfBlindKey = iKey;
   pCur->bfBlindArmed = 1;
   return 1;
@@ -7122,7 +7173,15 @@ static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey,
 
 #endif
 
-int sqlite3BtreeTableMoveto(
+#ifdef SQLITE_BF_CONCURRENT
+static int btreeTableMovetoBody(BtCursor*, i64, int, int*);
+int sqlite3BtreeTableMoveto(BtCursor *pCur, i64 intKey, int biasRight, int *pRes){
+  int rc = btreeTableMovetoBody(pCur, intKey, biasRight, pRes);
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_SEEK, intKey, rc);
+  return rc;
+}
+#endif
+BF_RS_BODY(sqlite3BtreeTableMoveto, btreeTableMovetoBody)(
   BtCursor *pCur,          /* The cursor to be moved */
   i64 intKey,              /* The table key */
   int biasRight,           /* If true, bias the search to the high end */
@@ -7678,6 +7737,9 @@ int sqlite3BtreeTableMovetoForScan(
   pCur->bfScan = 1;          /* M3: rows read from here on are scan rows */
   pCur->bfScanLeaf = 0;
 #endif
+#ifdef SQLITE_BF_CONCURRENT
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_SEEK, intKey, rc);
+#endif
   return rc;
 }
 static int btreeTableMovetoForScan(
@@ -8163,7 +8225,15 @@ static SQLITE_NOINLINE int btreeNext(BtCursor *pCur){
     return moveToLeftmost(pCur);
   }
 }
+#ifdef SQLITE_BF_CONCURRENT
+static int btreeNextBody(BtCursor*, int);
 int sqlite3BtreeNext(BtCursor *pCur, int flags){
+  int rc = btreeNextBody(pCur, flags);
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_NEXT, 0, rc);
+  return rc;
+}
+#endif
+BF_RS_BODY(sqlite3BtreeNext, btreeNextBody)(BtCursor *pCur, int flags){
   MemPage *pPage;
   UNUSED_PARAMETER( flags );  /* Used in COMDB2 but not native SQLite */
   assert( cursorOwnsBtShared(pCur) );
@@ -8292,7 +8362,15 @@ static SQLITE_NOINLINE int btreePrevious(BtCursor *pCur){
   }
   return rc;
 }
+#ifdef SQLITE_BF_CONCURRENT
+static int btreePreviousBody(BtCursor*, int);
 int sqlite3BtreePrevious(BtCursor *pCur, int flags){
+  int rc = btreePreviousBody(pCur, flags);
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_PREV, 0, rc);
+  return rc;
+}
+#endif
+BF_RS_BODY(sqlite3BtreePrevious, btreePreviousBody)(BtCursor *pCur, int flags){
   assert( cursorOwnsBtShared(pCur) );
   assert( flags==0 || flags==1 );
   UNUSED_PARAMETER( flags );  /* Used in COMDB2 but not native SQLite */
@@ -12809,7 +12887,15 @@ int sqlite3BtreeUpdateMeta(Btree *p, int idx, u32 iMeta){
 ** Otherwise, if an error is encountered (i.e. an IO error or database
 ** corruption) an SQLite error code is returned.
 */
+#ifdef SQLITE_BF_CONCURRENT
+static int btreeCountBody(sqlite3*, BtCursor*, i64*);
 int sqlite3BtreeCount(sqlite3 *db, BtCursor *pCur, i64 *pnEntry){
+  int rc = btreeCountBody(db, pCur, pnEntry);
+  if( pCur->pBt->bfRsActive ) sqlite3BfRsNote(pCur, BF_RS_ALL, 0, rc);
+  return rc;
+}
+#endif
+BF_RS_BODY(sqlite3BtreeCount, btreeCountBody)(sqlite3 *db, BtCursor *pCur, i64 *pnEntry){
   i64 nEntry = 0;                      /* Value to return in *pnEntry */
   int rc;                              /* Return code */
 
@@ -13689,10 +13775,35 @@ static int bfCheckpointMaterialize(Btree *p){
 
   if( !sqlite3PagerIsWal(pBt->pPager) ) return SQLITE_OK; /* flushed at commit */
   pBf = sqlite3PagerGetBfCache(pBt->pPager);
-  if( pBf==0 || pBf->bDirtyInserts==0 ) return SQLITE_OK; /* nothing logged */
+  if( pBf==0 ) return SQLITE_OK;
 
+  /* Begin the write transaction FIRST, and only then ask whether anything is
+  ** buffered.  Beginning it brings this connection's cache up to the newest
+  ** snapshot (the btreeBeginTrans hook); before that, the cache describes
+  ** whatever snapshot this connection last read, and "nothing buffered" there
+  ** says nothing about records other connections committed since.  Found
+  ** 2026-10-13 (bench/mwriter_oracle.c, wal_autocheckpoint=50): a connection
+  ** whose last transaction predated another's commit skipped materialisation,
+  ** the checkpoint backfilled the log, and the next restart erased the other
+  ** connection's committed rows.  It needs no BEGIN CONCURRENT: any reader
+  ** that checkpoints with a stale cache -- sqlite3_close runs a TRUNCATE
+  ** checkpoint -- did the same to a single writer's buffered rows.  The cost
+  ** is the write lock on every checkpoint (SQLITE_BUSY if a commit holds it:
+  ** the checkpoint is retried later, and the log is kept meanwhile). */
   rc = sqlite3BtreeBeginTrans(p, 1, 0);
+#ifdef SQLITE_BF_MCONN_TRACE
+  { u32 aS[3]; sqlite3PagerBfSnapshot(pBt->pPager, aS);
+    fprintf(stderr, "  MATERIALIZE cache=%p rc=%d snap mx=%u dirty=%d\n", (void*)pBf, rc,
+            aS[0], pBf->bDirtyInserts); }
+#endif
   if( rc!=SQLITE_OK ) return rc;
+  if( pBf->bDirtyInserts==0 ){
+    /* Nothing logged at the newest snapshot: an empty commit, no frames. */
+    rc = sqlite3BtreeCommitPhaseOne(p, 0);
+    if( rc==SQLITE_OK ) rc = sqlite3BtreeCommitPhaseTwo(p, 0);
+    else sqlite3BtreeRollback(p, SQLITE_ABORT_ROLLBACK, 0);
+    return rc;
+  }
 
   /* Force CommitPhaseOne's flush branch: turn logged records into base-page
   ** writes (page-image frames) rather than re-logging them. */
@@ -13721,6 +13832,10 @@ int sqlite3BtreeCheckpoint(Btree *p, int eMode, int *pnLog, int *pnCkpt){
       if( rc==SQLITE_OK )
 #endif
       rc = sqlite3PagerCheckpoint(pBt->pPager, p->db, eMode, pnLog, pnCkpt);
+#ifdef SQLITE_BF_MCONN_TRACE
+      fprintf(stderr, "  CHECKPOINT by pager %p rc=%d log=%d ckpt=%d\n", (void*)pBt->pPager,
+              rc, pnLog?*pnLog:-1, pnCkpt?*pnCkpt:-1);
+#endif
     }
     sqlite3BtreeLeave(p);
   }
@@ -13959,6 +14074,14 @@ int sqlite3BtreeExclusiveLock(Btree *p){
     (p->db->eConcurrent==CONCURRENT_SCHEMA) ? 0 : pBt->pPage1->pDbPage,
     &pgno
   );
+#ifdef SQLITE_BF_CONCURRENT
+  /* C1: upstream checked the pages this transaction read; check the record
+  ** ops other transactions committed against the rows it read, and ingest
+  ** them before our own frames are written. */
+  if( rc==SQLITE_OK && p->db->eConcurrent && pBt->bfRsActive ){
+    rc = sqlite3BfBtreeConcurrentValidate(p);
+  }
+#endif
 #ifdef SQLITE_OMIT_CONCURRENT
   assert( pgno==0 );
 #else

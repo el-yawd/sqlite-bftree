@@ -4552,6 +4552,22 @@ int sqlite3PagerBfReplayPages(Pager *pPager, BfCache *pBf,
   return SQLITE_OK;
 }
 
+#ifdef SQLITE_BF_CONCURRENT
+/* C1: true iff the current CONCURRENT transaction read page pgno. */
+int sqlite3PagerBfPageWasRead(Pager *pPager, Pgno pgno){
+  return pPager->pAllRead!=0 && sqlite3BitvecTestNotNull(pPager->pAllRead, pgno);
+}
+/* C1: record-level validation of a BEGIN CONCURRENT commit (wal.c). */
+int sqlite3PagerBfConcurrentScan(Pager *pPager,
+    int (*xOp)(void*, u32, u32, const u8*, int, int), void *pCtx, int *pbOther){
+  *pbOther = 0;
+  if( pPager && pagerUseWal(pPager) ){
+    return sqlite3WalBfConcurrentScan(pPager->pWal, xOp, pCtx, pbOther);
+  }
+  return SQLITE_OK;
+}
+#endif
+
 /* Bytes the ring needs to hold what sqlite3PagerBfReplayLog would replay. */
 u64 sqlite3PagerBfReplayBound(Pager *pPager, BfCache *pBf){
 #ifndef SQLITE_OMIT_WAL

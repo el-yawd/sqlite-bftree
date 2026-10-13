@@ -26,7 +26,15 @@
 #define _BF_CACHE_H_
 
 /* Forward declarations */
+/* C1: the BEGIN CONCURRENT row-level machinery exists only in a buffering
+** build with concurrency compiled in. */
+#if defined(SQLITE_BF_INSERT_BUFFERING) && !defined(SQLITE_OMIT_CONCURRENT) \
+ && !defined(SQLITE_BF_CONCURRENT)
+# define SQLITE_BF_CONCURRENT 1     /* also defined early by sqliteInt.h */
+#endif
 typedef struct BfCache BfCache;
+typedef struct BfRsRange BfRsRange;
+struct BfRsRange { u32 root; i64 lo; i64 hi; };  /* C1 read-set entry */
 typedef struct BfCircularBuffer BfCircularBuffer;
 typedef struct BfMiniPage BfMiniPage;
 typedef struct BfMapEntry BfMapEntry;
@@ -561,6 +569,20 @@ struct BfCache {
   u64 nDirtyBalance;
   u64 nLeafMerge;           /* merge-on-full: one leaf merged to take a write */
   u64 nLeafMergeEscalate;   /* ... or merge-on-evict, escalated to a table sweep */
+  /* C1 (2026-10-13): BEGIN CONCURRENT read set, row-level.  Every key range a
+  ** concurrent transaction observed on a BF rowid table -- point seeks (found or
+  ** absent: [k,k]), the span a scan covered, a whole table for count() -- so
+  ** commit can test the RECORD ops other transactions committed since the
+  ** snapshot.  Page-level validation cannot: a buffered write changes no page.
+  ** docs/design/concurrent-engine.md section 2. */
+  BfRsRange *aRs;
+  int nRs, nRsAlloc;
+  u8 bRsActive;             /* a concurrent transaction is recording */
+  u8 bRsAll;                /* overflowed: every op on any table conflicts */
+  u8 bConcRebase;           /* commit scan saw other commits: rebase the cache */
+  u64 nConcValidate;        /* concurrent commits validated row-level */
+  u64 nConcConflict;        /* ... refused for a row-level conflict */
+  u64 nConcOps;             /* record ops from other commits tested */
   u32 pgnoFlushOwner;       /* leaf bfFlushOneMiniPage is replaying, else 0 */
   u8 bSweepAll;             /* sqlite3BfBtreeFlushAllDirty is running */
   u64 nEvictBytes;          /* Bytes the eviction sweeps reclaimed (was misnamed
@@ -1001,6 +1023,19 @@ SQLITE_PRIVATE int sqlite3BfBtreeLogAllDirty(Btree *p);
 SQLITE_PRIVATE int sqlite3BfBtreeFlushTableForMutation(BtCursor *pCur);
 SQLITE_PRIVATE int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur);
 SQLITE_PRIVATE int sqlite3BfBtreeMergeFullLeaf(BtCursor *pCur, int nData);
+#ifdef SQLITE_BF_CONCURRENT
+SQLITE_PRIVATE void sqlite3BfRsBegin(BtShared *pBt);
+SQLITE_PRIVATE void sqlite3BfRsEnd(BtShared *pBt);
+SQLITE_PRIVATE void sqlite3BfRsNote(BtCursor *pCur, int eOp, i64 iKey, int rc);
+SQLITE_PRIVATE int sqlite3BfBtreeConcurrentValidate(Btree *p);
+SQLITE_PRIVATE void sqlite3BfBtreeConcurrentRebase(Btree *p);
+#define BF_RS_SEEK  1
+#define BF_RS_FIRST 2
+#define BF_RS_LAST  3
+#define BF_RS_NEXT  4
+#define BF_RS_PREV  5
+#define BF_RS_ALL   6
+#endif
 SQLITE_PRIVATE void sqlite3BfBtreeNoteDirtyEvictRetry(BtCursor *pCur);
 SQLITE_PRIVATE void sqlite3BfBtreeDirtyEvictStat(Btree*, u64*, u64*, u64*, u64*);
 /* Discard all BF state for a B-tree (called at rollback). */

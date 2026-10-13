@@ -3978,6 +3978,12 @@ static int walLockForCommit(
           if( iMax>(head.mxFrame-sLoc.iZero) ) iMax = (head.mxFrame-sLoc.iZero);
           for(i=iMin; rc==SQLITE_OK && i<=iMax; i++){
             PgHdr *pPg;
+#ifndef SQLITE_OMIT_BF_CACHE
+            /* A BF record frame occupies the slot without a page number: it
+            ** wrote no page.  Its ops are validated row by row afterwards
+            ** (sqlite3WalBfConcurrentScan). */
+            if( sLoc.aPgno[i-1]==0 ) continue;
+#endif
             if( sLoc.aPgno[i-1]==1 ){
               /* Check that the schema cookie has not been modified. If
               ** it has not, the commit can proceed. */
@@ -4519,6 +4525,9 @@ static int walFrames(
   int isCommit,                   /* True if this is a commit */
   int sync_flags                  /* Flags to pass to OsSync() (or 0) */
 ){
+#ifndef SQLITE_OMIT_BF_CACHE
+  u32 iBfBase = 0;                /* frames <= this were not written by this call */
+#endif
   int rc;                         /* Used to catch return codes */
   u32 iFrame;                     /* Next frame address */
   PgHdr *p;                       /* Iterator to run through pList with. */
@@ -4535,7 +4544,11 @@ static int walFrames(
   ** page, and the last BF record frame carries the nTruncate commit marker
   ** itself instead of dragging page 1 into the WAL for it.  See
   ** sqlite3WalBfCommitOnRecordOk(). */
+#ifndef SQLITE_OMIT_BF_CACHE
   assert( pList || pWal->nBfStage>0 );
+#else
+  assert( pList );
+#endif
   assert( pWal->writeLock );
 
   /* If this frame set completes a transaction, then nTruncate>0.  If
@@ -4570,6 +4583,9 @@ static int walFrames(
     return rc;
   }
   iFrame = pWal->hdr.mxFrame;
+#ifndef SQLITE_OMIT_BF_CACHE
+  iBfBase = iFrame;
+#endif
 
   /* Setup information needed to write frames into the WAL */
   w.pWal = pWal;
@@ -4813,6 +4829,16 @@ static int walFrames(
       walIndexWriteHdr(pWal);
       pWal->iCallback = iFrame;
     }
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* (iBfBase, iFrame] are this connection's own frames: their record ops
+    ** were ingested above and the record cache already reflects their pages,
+    ** so the ingest watermark and the touch list move over them.  Before
+    ** 2026-10-13 the watermark stopped at the last RECORD frame, so a commit
+    ** that also wrote page frames broke the touch list's continuity -- harmless
+    ** with one writer, a full cache rebuild per commit with several. */
+    if( pWal->iBfIngested>=iBfBase ) pWal->iBfIngested = iFrame;
+    if( pWal->bBfTouchOk && pWal->iBfTouchTo>=iBfBase ) pWal->iBfTouchTo = iFrame;
+#endif
   }
 
   WALTRACE(("WAL%p: frame write %s\n", pWal, rc ? "failed" : "ok"));
@@ -5075,6 +5101,114 @@ void sqlite3WalBfTouchReset(Wal *pWal){
   pWal->bBfTouchOk = (pWal->iBfIngested==pWal->hdr.mxFrame
        && memcmp(pWal->aBfSalt, pWal->hdr.aSalt, 8)==0);
 }
+
+#ifdef SQLITE_BF_CONCURRENT
+/*
+** C1 (2026-10-13): BEGIN CONCURRENT commit, record-level half of validation.
+** Called with the WRITER lock held, after walLockForCommit passed the page
+** check and before this transaction writes any frame.  pWal->hdr is still the
+** transaction's snapshot; the wal-index header is the head of the log.
+**
+** Pass 1 calls xOp(pCtx, leaf, root, key, nKey, op) for every record op in a frame
+** committed after the snapshot; non-zero = conflict -> SQLITE_BUSY_SNAPSHOT,
+** nothing ingested.  Pass 2 ingests those frames into the record index and
+** extends the touch list, so the index has no gap when our own frames follow
+** and the cache can be rebased incrementally after the commit.  *pbOther is
+** set when there were such frames.  A log restart since the snapshot is
+** treated as a conflict (conservative; rare: it needs a full backfill).
+*/
+static int walBfConcurrentScan(
+  Wal *pWal,
+  int (*xOp)(void*, u32, u32, const u8*, int, int),
+  void *pCtx,
+  int *pbOther
+){
+  WalIndexHdr head;
+  u32 iFrame, iLast;
+  u8 *aFrame;
+  int szPage, szFrame, pass;
+  int rc = SQLITE_OK;
+  *pbOther = 0;
+  assert( pWal->writeLock );
+  memcpy(&head, (void*)walIndexHdr(pWal), sizeof(head));
+  if( memcmp(head.aSalt, pWal->hdr.aSalt, 8)!=0 ) return SQLITE_BUSY_SNAPSHOT;
+  if( head.mxFrame<=pWal->hdr.mxFrame ) return SQLITE_OK;
+  if( pWal->iBfIngested!=pWal->hdr.mxFrame
+   || memcmp(pWal->aBfSalt, pWal->hdr.aSalt, 8)!=0 ){
+    return SQLITE_BUSY_SNAPSHOT;     /* index not level with the snapshot */
+  }
+  *pbOther = 1;
+  iLast = head.mxFrame;
+  szPage = walPagesize(pWal);
+  szFrame = szPage + WAL_FRAME_HDRSIZE;
+  aFrame = (u8*)sqlite3_malloc64(szFrame);
+  if( aFrame==0 ) return SQLITE_NOMEM_BKPT;
+  if( !(pWal->bBfTouchOk && pWal->iBfTouchTo==pWal->hdr.mxFrame) ){
+    pWal->bBfTouchOk = 0;
+  }
+  for(pass=1; pass<=2 && rc==SQLITE_OK; pass++){
+    for(iFrame=pWal->hdr.mxFrame+1; rc==SQLITE_OK && iFrame<=iLast; iFrame++){
+      i64 iOffset = walFrameOffset(iFrame, szPage);
+      u32 pgno;
+      rc = sqlite3OsRead(pWal->pWalFd, aFrame, WAL_FRAME_HDRSIZE, iOffset);
+      if( rc!=SQLITE_OK ) break;
+      pgno = sqlite3Get4byte(aFrame);
+      if( pgno!=WAL_BF_RECORD_PGNO ){
+        if( pass==2 ) walBfTouch(pWal, pgno);
+        /* A page another transaction wrote: offered as op -1 (pgno in leaf). */
+        if( pass==1 && xOp(pCtx, pgno, 0, 0, 0, -1) ) rc = SQLITE_BUSY_SNAPSHOT;
+        continue;
+      }
+      rc = sqlite3OsRead(pWal->pWalFd, &aFrame[WAL_FRAME_HDRSIZE], szPage,
+                         iOffset + WAL_FRAME_HDRSIZE);
+      if( rc!=SQLITE_OK ) break;
+      {
+        BfWalIter it;
+        BfWalRec r;
+        if( sqlite3BfWalIterInit(&it, &aFrame[WAL_FRAME_HDRSIZE], szPage)
+              !=BFWAL_OK ){
+          rc = SQLITE_CORRUPT_BKPT;
+          break;
+        }
+        while( rc==SQLITE_OK && sqlite3BfWalIterNext(&it, &r)==BFWAL_OK ){
+          if( pass==1 ){
+            if( xOp(pCtx, r.pgno, r.rootPgno, r.pKey, (int)r.nKey, r.op) ){
+              rc = SQLITE_BUSY_SNAPSHOT;
+            }
+          }else{
+            walBfTouch(pWal, r.pgno);
+          }
+        }
+      }
+      if( pass==2 && rc==SQLITE_OK ){
+        rc = walBfIngestRecordFrame(pWal, &aFrame[WAL_FRAME_HDRSIZE], iFrame);
+      }
+    }
+  }
+  if( rc==SQLITE_OK ){
+    pWal->iBfIngested = iLast;
+    if( pWal->bBfTouchOk ) pWal->iBfTouchTo = iLast;
+  }else if( rc!=SQLITE_BUSY_SNAPSHOT ){
+    pWal->bBfTouchOk = 0;
+  }
+  sqlite3_free(aFrame);
+  return rc;
+}
+/* The wal-index is shared memory: read it inside SEH_TRY, as upstream's
+** sqlite3WalLockForCommit does. */
+int sqlite3WalBfConcurrentScan(
+  Wal *pWal,
+  int (*xOp)(void*, u32, u32, const u8*, int, int),
+  void *pCtx,
+  int *pbOther
+){
+  int rc = SQLITE_OK;
+  SEH_TRY {
+    rc = walBfConcurrentScan(pWal, xOp, pCtx, pbOther);
+  } SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  return rc;
+}
+#endif /* SQLITE_BF_CONCURRENT */
 
 /* This connection's snapshot as (mxFrame, salt1, salt2): equal values mean the
 ** same committed log state, so the record cache built for one fits the other. */

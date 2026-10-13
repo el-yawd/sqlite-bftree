@@ -1441,6 +1441,13 @@ typedef int VList;
 ** pointer types (i.e. FuncDef) defined above.
 */
 #include "os.h"
+/* BF C1: the BEGIN CONCURRENT row-level machinery (bf_cache.h) exists only in a
+** buffering build with concurrency compiled in.  Defined here, before pager.h
+** and wal.h, which declare its hooks. */
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
+ && !defined(SQLITE_OMIT_CONCURRENT)
+# define SQLITE_BF_CONCURRENT 1
+#endif
 #include "pager.h"
 #include "btree.h"
 #include "vdbe.h"

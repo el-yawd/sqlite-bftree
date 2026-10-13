@@ -304,6 +304,10 @@ u64 sqlite3PagerBfReplayBound(Pager *pPager, BfCache *pBf);
 int sqlite3PagerBfTouched(Pager*, const u32 *aOld, u32 **paPg, int *pnPg);
 void sqlite3PagerBfTouchReset(Pager*);
 int sqlite3PagerBfReplayPages(Pager*, BfCache*, const u32 *aPg, int nPg);
+#ifdef SQLITE_BF_CONCURRENT
+int sqlite3PagerBfPageWasRead(Pager*, Pgno);
+int sqlite3PagerBfConcurrentScan(Pager*, int(*)(void*,u32,u32,const u8*,int,int), void*, int*);
+#endif
 void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage);
 int sqlite3PagerBfHasDirty(Pager *pPager);
 

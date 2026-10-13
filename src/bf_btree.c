@@ -1026,6 +1026,9 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[11] = pBf ? pBf->nDirtyBalance : 0;
   aOut[12] = pBf ? pBf->nLeafMerge : 0;
   aOut[13] = pBf ? pBf->nLeafMergeEscalate : 0;
+  aOut[14] = pBf ? pBf->nConcValidate : 0;
+  aOut[15] = pBf ? pBf->nConcConflict : 0;
+  aOut[16] = pBf ? pBf->nConcOps : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -3222,5 +3225,267 @@ int sqlite3BfBtreeApplyDelete(
   UNUSED_PARAMETER(pKey); UNUSED_PARAMETER(nKey);
   return SQLITE_OK;
 }
+
+
+#ifdef SQLITE_BF_CONCURRENT
+/* -------------------------------------------------------------------------
+** C1 (2026-10-13): row-level validation for BEGIN CONCURRENT.
+**
+** Upstream BEGIN CONCURRENT validates at commit by PAGE: a transaction may
+** commit if no page it read was written by a transaction that committed after
+** its snapshot.  A buffered write changes no page -- it is a record frame -- so
+** that check is blind to it: two transactions updating the same row both
+** committed (bench/concurrent_conflict.c, bench/mwriter_oracle.c: a lost
+** update).  It is also what removes the false conflicts page validation has on
+** rows that merely share a leaf (97% of stock's refusals in mwriter_oracle).
+**
+** So a concurrent transaction records the key ranges it observed on BF rowid
+** tables -- every seek (found or absent: an absent key is how a concurrent
+** insert is caught), the span every scan covered, the whole table for count()
+** -- and commit tests each RECORD op committed by others since the snapshot
+** against them (sqlite3BfBtreeConcurrentValidate, called by
+** sqlite3BtreeExclusiveLock right after upstream's page check).  Page frames
+** keep being checked by upstream's page rule; reads BF served without reading
+** the leaf mark the leaf there too (sqlite3PagerUsePage), so a page-path write
+** to that leaf still conflicts.  docs/design/concurrent-engine.md section 2.
+*/
+#define BF_RS_MAX 8192           /* ranges per transaction before "whole db" */
+
+static int bfRsAdd(BfCache *pBf, u32 root, i64 lo, i64 hi){
+  BfRsRange *r;
+  if( pBf->bRsAll ) return 0;
+  if( pBf->nRs>=pBf->nRsAlloc ){
+    int nNew = pBf->nRsAlloc ? pBf->nRsAlloc*2 : 64;
+    BfRsRange *aNew;
+    if( nNew>BF_RS_MAX ){ pBf->bRsAll = 1; return 0; }
+    aNew = (BfRsRange*)sqlite3_realloc64(pBf->aRs, (u64)nNew*sizeof(BfRsRange));
+    if( aNew==0 ){ pBf->bRsAll = 1; return 0; }  /* coarser, still correct */
+    pBf->aRs = aNew;
+    pBf->nRsAlloc = nNew;
+  }
+  r = &pBf->aRs[pBf->nRs++];
+  r->root = root;
+  r->lo = lo;
+  r->hi = hi;
+  return pBf->nRs;               /* 1 + index */
+}
+
+void sqlite3BfRsBegin(BtShared *pBt){
+  BfCache *pBf = sqlite3PagerGetBfCache(pBt->pPager);
+  if( pBf==0 || pBf->bRsActive ) return;
+  pBf->bRsActive = 1;
+  pBf->bRsAll = 0;
+  pBf->nRs = 0;
+  pBf->bConcRebase = 0;
+  pBt->bfRsActive = 1;
+}
+
+void sqlite3BfRsEnd(BtShared *pBt){
+  BfCache *pBf = sqlite3PagerGetBfCache(pBt->pPager);
+  BtCursor *pCur;
+  pBt->bfRsActive = 0;
+  for(pCur=pBt->pCursor; pCur; pCur=pCur->pNext) pCur->bfRsIdx = 0;
+  if( pBf ){
+    pBf->bRsActive = 0;
+    pBf->bRsAll = 0;
+    pBf->nRs = 0;
+  }
+}
+
+/*
+** Record what a cursor move observed.  eOp is BF_RS_*; iKey is the sought key
+** for BF_RS_SEEK; rc the move's result.  Each seek / First / Last starts a new
+** range, each Next / Prev widens the cursor's current one -- to the key it
+** reached, or to the end of the table when it ran off.  A seek that did not
+** find its key covers the gap to wherever the cursor landed, which is the gap
+** an insert would have to fill to change the answer.
+*/
+void sqlite3BfRsNote(BtCursor *pCur, int eOp, i64 iKey, int rc){
+  BfCache *pBf = btreeGetBfCache(pCur->pBt);   /* NULL inside a flush replay */
+  BfRsRange *r = 0;
+  int bValid;
+  i64 cur = 0;
+  u32 root = (u32)pCur->pgnoRoot;
+  if( pBf==0 || !pBf->bRsActive || !pCur->curIntKey || root<=1 ) return;
+  if( rc!=SQLITE_OK && rc!=SQLITE_DONE ){
+    pBf->bRsAll = 1;            /* unknown position: be conservative */
+    return;
+  }
+  bValid = pCur->eState==CURSOR_VALID;
+  if( bValid ) cur = sqlite3BtreeIntegerKey(pCur);
+  if( pCur->bfRsIdx>0 && pCur->bfRsIdx<=pBf->nRs
+   && pBf->aRs[pCur->bfRsIdx-1].root==root ){
+    r = &pBf->aRs[pCur->bfRsIdx-1];
+  }
+  switch( eOp ){
+    case BF_RS_SEEK:
+      pCur->bfRsIdx = bfRsAdd(pBf, root,
+          bValid && cur<iKey ? cur : iKey, bValid && cur>iKey ? cur : iKey);
+      /* Served from the mini-page without reading the leaf: put the leaf in
+      ** upstream's page read set, so a page-path write to it still conflicts. */
+      if( (pCur->curFlags & BTCF_BfLeaf)!=0 && pCur->bfLeaf ){
+        sqlite3PagerUsePage(pCur->pBt->pPager, pCur->bfLeaf);
+      }
+      break;
+    case BF_RS_FIRST:
+      pCur->bfRsIdx = bfRsAdd(pBf, root, SMALLEST_INT64,
+                              bValid ? cur : LARGEST_INT64);
+      break;
+    case BF_RS_LAST:
+      pCur->bfRsIdx = bfRsAdd(pBf, root, bValid ? cur : SMALLEST_INT64,
+                              LARGEST_INT64);
+      break;
+    case BF_RS_NEXT:
+      if( r==0 ){
+        /* positioned by a path that did not record: assume it began anywhere */
+        pCur->bfRsIdx = bfRsAdd(pBf, root, SMALLEST_INT64, SMALLEST_INT64);
+        if( pCur->bfRsIdx==0 ) break;
+        r = &pBf->aRs[pCur->bfRsIdx-1];
+      }
+      if( rc==SQLITE_DONE || !bValid ) r->hi = LARGEST_INT64;
+      else if( cur>r->hi ) r->hi = cur;
+      break;
+    case BF_RS_PREV:
+      if( r==0 ){
+        pCur->bfRsIdx = bfRsAdd(pBf, root, LARGEST_INT64, LARGEST_INT64);
+        if( pCur->bfRsIdx==0 ) break;
+        r = &pBf->aRs[pCur->bfRsIdx-1];
+      }
+      if( rc==SQLITE_DONE || !bValid ) r->lo = SMALLEST_INT64;
+      else if( cur<r->lo ) r->lo = cur;
+      break;
+    default: /* BF_RS_ALL */
+      pCur->bfRsIdx = bfRsAdd(pBf, root, SMALLEST_INT64, LARGEST_INT64);
+      break;
+  }
+}
+
+/* Did this transaction observe (root, key)? */
+static int bfRsHit(BfCache *pBf, u32 root, i64 key){
+  int i;
+  if( pBf->bRsAll ) return 1;
+  for(i=0; i<pBf->nRs; i++){
+    const BfRsRange *r = &pBf->aRs[i];
+    if( r->root==root && r->lo<=key && key<=r->hi ) return 1;
+  }
+  return 0;
+}
+
+/* sqlite3PagerBfConcurrentScan callback: one record op another transaction
+** committed after our snapshot.  Non-zero = conflict. */
+typedef struct BfRsCtx BfRsCtx;
+struct BfRsCtx { BfCache *pBf; Pager *pPager; };
+static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
+                          const u8 *pKey, int nKey, int op){
+  BfCache *pBf = ((BfRsCtx*)pCtx)->pBf;
+  Pager *pPager = ((BfRsCtx*)pCtx)->pPager;
+  DbPage *pPg;
+  int i;
+  if( op<0 ){
+    /* A page frame another transaction committed.  Upstream's page check
+    ** must already have refused a commit that also WROTE this page (writing
+    ** it means reading it); if we get here with it written, that check missed
+    ** -- diagnose loudly in debug builds, refuse in all. */
+    pPg = sqlite3PagerLookup(pPager, leaf);
+    if( pPg ){
+      int bWritten = sqlite3PagerIswriteable(pPg);
+      sqlite3PagerUnref(pPg);
+      if( bWritten ){
+#ifdef SQLITE_DEBUG
+        fprintf(stderr, "BF-CONC: page %u written by us AND by a later commit, "
+                        "upstream page check did not refuse\n", leaf);
+#endif
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if( op==BFWAL_OP_CLEAR ){
+    /* NOT purely physical.  CLEAR(leaf) says "every earlier op of this leaf is
+    ** in its base page", and replay drops those ops; when the merge applied a
+    ** delete of a row that existed only as a buffered insert, the base page is
+    ** unchanged -- no page frame at all -- and the CLEAR alone is what deletes
+    ** the row (mwriter_oracle seed 2 with MW_NORANGE: a concurrent DELETE was
+    ** undone by a transaction that read and merged the same leaf).  So a CLEAR
+    ** conflicts with any transaction that read or wrote that leaf. */
+    if( sqlite3PagerBfPageWasRead(pPager, leaf) ) return 1;
+    pPg = sqlite3PagerLookup(pPager, leaf);
+    if( pPg ){
+      int bWritten = sqlite3PagerIswriteable(pPg);
+      sqlite3PagerUnref(pPg);
+      if( bWritten ) return 1;
+    }
+    return 0;
+  }
+  pBf->nConcOps++;
+  /* This transaction WROTE page `leaf` -- a merge, a split, or a rebalance of
+  ** a sibling.  The op is keyed to that leaf, but our image of it was built
+  ** without the op and may have moved the op's key to another leaf: replayed
+  ** under `leaf`, the record would hide behind the older base cell wherever
+  ** the key lives now (mwriter_oracle seed 2: a merge of leaves 4 and 6
+  ** rebalanced leaf 9 while another transaction updated a key on it).  With
+  ** records keyed by leaf that is a conflict; logical keys (design P1) remove
+  ** it. */
+  pPg = sqlite3PagerLookup(pPager, leaf);
+  if( pPg ){
+    int bWritten = sqlite3PagerIswriteable(pPg);
+    sqlite3PagerUnref(pPg);
+    if( bWritten ) return 1;
+  }
+  /* This transaction MERGED leaf `leaf` (it will log CLEAR(leaf)) from its own
+  ** snapshot's base, which lacks this op.  In log order the op precedes our
+  ** CLEAR, so replay would skip it although our page image never applied it:
+  ** a lost committed row (mwriter_oracle seed 3: a concurrent DELETE came back
+  ** after the deleting transaction's leaf was merged by another).  Under the
+  ** current CLEAR format that is a conflict; the concurrent engine's
+  ** idempotent op log (docs/design/concurrent-engine.md P2) removes it. */
+  for(i=0; i+1<pBf->nFlushed; i+=2){
+    if( pBf->aFlushed[i]==leaf ) return 1;
+  }
+  if( nKey!=8 ) return 1;              /* not a rowid key: be conservative */
+  return bfRsHit(pBf, root, bfDecodeRowid(pKey));
+}
+
+/*
+** Called with the WAL write lock held, after upstream's page validation passed
+** (sqlite3BtreeExclusiveLock).  Tests every record op committed since our
+** snapshot against the read set and, if none conflicts, ingests those frames
+** into this connection's record index -- before our own frames are written,
+** so the index has no gap -- and arms the cache rebase that CommitPhaseTwo
+** runs.  Returns SQLITE_BUSY_SNAPSHOT on a conflict.
+*/
+int sqlite3BfBtreeConcurrentValidate(Btree *p){
+  BfCache *pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  BfRsCtx ctx;
+  int rc, bOther = 0;
+  if( pBf==0 || !pBf->bRsActive ) return SQLITE_OK;
+  pBf->nConcValidate++;
+  ctx.pBf = pBf;
+  ctx.pPager = p->pBt->pPager;
+  rc = sqlite3PagerBfConcurrentScan(p->pBt->pPager, bfRsOpCallback, &ctx, &bOther);
+  if( rc==SQLITE_BUSY_SNAPSHOT ) pBf->nConcConflict++;
+  if( rc==SQLITE_OK && bOther ) pBf->bConcRebase = 1;
+  return rc;
+}
+
+/*
+** After a concurrent commit that other commits preceded: this connection's
+** cache was built for the transaction's snapshot and holds its own records; the
+** others' records are only in the log.  Bring the cache to the new snapshot by
+** dropping and replaying exactly the leaves they touched (incremental
+** invalidation; the touch list was extended by the commit scan and by our own
+** frames).  Our own records are in the log too by now, so replaying a leaf we
+** both touched loses nothing.  On any failure, forget the snapshot so the next
+** transaction rebuilds the cache in full.
+*/
+void sqlite3BfBtreeConcurrentRebase(Btree *p){
+  BfCache *pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf==0 || !pBf->bConcRebase ) return;
+  pBf->bConcRebase = 0;
+  if( sqlite3BfBtreeSnapshotAdvance(p)!=SQLITE_OK ){
+    pBf->bSnapSeen = 0;
+  }
+}
+#endif /* SQLITE_BF_CONCURRENT */
 
 #endif /* SQLITE_OMIT_BF_CACHE */

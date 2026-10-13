@@ -442,16 +442,17 @@ void sqlite3PragmaBfCacheStats(
         "replay_applied", "replay_superseded", "replay_torn", "replay_dropped",
         "rollback_rehydrate", "clear_logged", "snapshot_rehydrate",
         "ring_grow", "ring_peak", "snapshot_incremental", "snapshot_incr_pages", "dirty_balance",
-        "leaf_merge", "leaf_merge_escalate"
+        "leaf_merge", "leaf_merge_escalate",
+        "conc_validated", "conc_conflicts", "conc_ops_tested"
       };
-      u64 aReplay[14];
+      u64 aReplay[17];
       int iR;
       memset(aReplay, 0, sizeof(aReplay));
       if( pBt ){
         extern void sqlite3BfBtreeReplayStat(Btree*, u64*);
         sqlite3BfBtreeReplayStat(pBt, aReplay);
       }
-      for(iR=0; iR<14; iR++){
+      for(iR=0; iR<17; iR++){
         sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, azReplay[iR], P4_STATIC);
         sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&aReplay[iR],
                               P4_INT64);

@@ -467,6 +467,7 @@ struct BtShared {
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
   u8 bfForceBaseFlush;  /* Phase 2: force CommitPhaseOne to flush BF records to
                         ** base pages even in WAL mode (checkpoint materialise) */
+  u8 bfRsActive;        /* C1: mirrors BfCache.bRsActive (cheap cursor-move test) */
 #endif
 };
 
@@ -593,6 +594,10 @@ struct BtCursor {
   ** adds a key to a mini-page, so until it runs the key stays absent.  Lets
   ** the leaf exit and fetchPayload skip re-probing the same leaf for the same
   ** key (tombstone, dirty-op, record-exists).  SQLITE_BF_NO_PROBE_MEMO. */
+  /* C1 (2026-10-13): 1 + index of this cursor's current range in the BEGIN
+  ** CONCURRENT read set (BfCache.aRs), 0 if none.  Each seek / First / Last
+  ** starts a range; Next / Prev widen it. */
+  int bfRsIdx;
   Pgno bfAbsentLeaf;
   i64 bfAbsentKey;
   u64 bfAbsentGen;
