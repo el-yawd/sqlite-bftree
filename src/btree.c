@@ -10980,6 +10980,23 @@ int sqlite3BtreeInsert(
             if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
           }
         }
+        /* Merge-on-full: the leaf's own mini-page is full of dirty records.
+        ** Merge that one leaf, re-seek, retry once. */
+        if( bfrc==SQLITE_FULL && sqlite3BfBtreeMergeFullLeaf(pCur, pX->nData) ){
+          rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
+          if( rc ) return rc;
+          if( loc==0 && pCur->eState==CURSOR_VALID && pCur->pPage
+           && pCur->pPage->leaf && !pCur->bfOnMini ){
+            bfrc = sqlite3BfBtreeUpdateCell(pCur, pX->nKey, pX->pData,
+                                            pX->nData);
+            if( bfrc==SQLITE_OK ){
+              pCur->eState = CURSOR_INVALID;
+              pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+              return SQLITE_OK;
+            }
+            if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+          }
+        }
         goto bf_update_declined;      /* base cell, nothing buffered: as before */
       }
       if( bfrc==SQLITE_OK ){
@@ -10991,6 +11008,22 @@ int sqlite3BtreeInsert(
         return SQLITE_OK;
       }
       if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+      /* Merge-on-full first: merging just this leaf puts the row in base, and
+      ** the retry then shadows that cell from a now-roomy mini-page. */
+      if( sqlite3BfBtreeMergeFullLeaf(pCur, pX->nData) ){
+        rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, 0, &loc);
+        if( rc ) return rc;
+        if( loc==0 && pCur->eState==CURSOR_VALID && pCur->pPage
+         && pCur->pPage->leaf && !pCur->bfOnMini ){
+          bfrc = sqlite3BfBtreeUpdateCell(pCur, pX->nKey, pX->pData, pX->nData);
+          if( bfrc==SQLITE_OK ){
+            pCur->eState = CURSOR_INVALID;
+            pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+            return SQLITE_OK;
+          }
+          if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+        }
+      }
       /* BF refused (mini-page full at max size class): materialise this table's
       ** buffered rows and re-seek so the overwrite lands on a real base cell,
       ** clearing bfOnMini so the paths below operate on a physical cell. */
@@ -11179,6 +11212,22 @@ int sqlite3BtreeInsert(
         }
       }
       if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+    }
+    /* Merge-on-full: the target leaf's own mini-page is full of dirty records.
+    ** Merge that one leaf (not the table), re-seek, retry once. */
+    if( bfrc==SQLITE_FULL && sqlite3BfBtreeMergeFullLeaf(pCur, pX->nData) ){
+      rc = sqlite3BtreeTableMoveto(pCur, pX->nKey, (flags & BTREE_APPEND)!=0,
+                                   &loc);
+      if( rc ) return rc;
+      if( loc!=0 && pCur->eState==CURSOR_VALID ){
+        bfrc = sqlite3BfBtreeInsertCell(pCur, keyBuf, 8, pX->pData, pX->nData);
+        if( bfrc==SQLITE_OK ){
+          pCur->eState = CURSOR_INVALID;
+          pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+          return SQLITE_OK;
+        }
+        if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+      }
     }
     /* Still refused (full / not on a usable leaf) — fall through to base write. */
   }

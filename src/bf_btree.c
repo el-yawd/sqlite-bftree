@@ -320,6 +320,7 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
 
   pBf->bBypassActive = 1;
   pBf->pgnoRootForFlush = pgnoRoot;
+  pBf->pgnoFlushOwner = pMini->ownerPgno;
 
   rc = sqlite3BtreeCursor(pBtree, pgnoRoot, BTREE_WRCSR, NULL/*rowid table*/,
                           &tmpCur);
@@ -334,6 +335,7 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
 
   pBf->bBypassActive = 0;
   pBf->pgnoRootForFlush = 0;
+  pBf->pgnoFlushOwner = 0;
 
   /* Mark applied records clean; leave failed ones dirty for retry. */
   if( ctx.nErrors==0 ){
@@ -399,9 +401,11 @@ int sqlite3BfBtreeFlushAllDirty(Btree *p){
   ** flushed. */
   if( p->inTrans!=TRANS_WRITE ) return SQLITE_OK;
 
+  pBf->bSweepAll = 1;
   if( sqlite3BfDirtyListIterate(pBf, bfFlushAllCallback, &ctx) ){
     sqlite3BfMapIterate(pBf, bfFlushAllCallback, &ctx);   /* list overflowed */
   }
+  pBf->bSweepAll = 0;
   pBf->bDirtyInserts = 0;  /* all buffered inserts materialised */
   return SQLITE_OK;
 }
@@ -1019,6 +1023,9 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[8] = pBf ? pBf->nRingPeak : 0;
   aOut[9] = pBf ? pBf->nSnapshotIncr : 0;
   aOut[10] = pBf ? pBf->nSnapshotIncrPages : 0;
+  aOut[11] = pBf ? pBf->nDirtyBalance : 0;
+  aOut[12] = pBf ? pBf->nLeafMerge : 0;
+  aOut[13] = pBf ? pBf->nLeafMergeEscalate : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -2047,6 +2054,83 @@ int sqlite3BfBtreePrepareForScan(BtCursor *pCur){
 ** instead of the stalled leaf, and left every later insert paying too — but
 ** `pg frames/commit` moves, so report it beside these counters.
 */
+/*
+** Single-leaf merges and sibling rebalances (2026-10-13).
+**
+** A merge of ONE leaf's mini-page (merge-on-eviction above, merge-on-full
+** below) applies its records through a cursor, and an insert there can run
+** balance_nonroot over up to three sibling leaves.  If a sibling also holds
+** DIRTY records, those stay keyed to the sibling while the balance may move
+** their base cells next door: a point read then descends to the new leaf, finds
+** no record there, and returns the base cell's OLDER value.  The table flush
+** the mutation paths use never has this problem (every dirty leaf of the table
+** is merged in the same sweep), which is why it was the only merge for so long.
+**
+** sqlite3BfBtreeForgetPage counts exactly that event (nDirtyBalance: a balance
+** reached a dirty leaf other than the one being merged, outside a sweep).  When
+** it moved, finish the job with the table sweep before anything reads: it
+** applies every dirty record by rowid from the root, so a misplaced record lands
+** where its key lives now, and the stale copies are dropped (BF_MINI_F_STALE).
+** Measured rare (0 in a 30,000-commit run with a 256 KiB ring and 385 single-
+** leaf merges), but it must be impossible, not rare.
+*/
+static void bfEscalateIfMisplaced(BfCache *pBf, Btree *pBtree, Pgno root,
+                                  u64 nBalBefore){
+  if( pBf->nDirtyBalance==nBalBefore ) return;
+  pBf->nLeafMergeEscalate++;
+  bfFlushTableDirty(pBf, pBtree, root);
+}
+
+/*
+** Merge-on-full (2026-10-13), as ../bf-tree does: when a buffered write is
+** refused because the target leaf's OWN mini-page is full of dirty records,
+** merge that one mini-page into its leaf and let the caller re-seek and buffer
+** again.  The fallback before this materialised the WHOLE table (~2,500 dirty
+** leaves on a 100k-row update workload, 9% of the writer's CPU and most of its
+** page frames) to make room for one record.
+**
+** Returns 1 if the leaf was merged (the caller MUST re-seek: the merge can
+** rebalance), else 0 and the caller keeps its old fallback.  Declines when a
+** merge cannot help: the record can never fit a mini-page, the leaf's mini-page
+** is clean (the write path compacts clean records itself), or the cursor is not
+** on a leaf of a known table.  Ablation: SQLITE_BF_NO_LEAF_MERGE.
+*/
+int sqlite3BfBtreeMergeFullLeaf(BtCursor *pCur, int nData){
+#if defined(SQLITE_BF_NO_LEAF_MERGE)
+  UNUSED_PARAMETER(pCur);
+  UNUSED_PARAMETER(nData);
+  return 0;
+#else
+  BfCache *pBf;
+  BfMapEntry *pEntry;
+  BfMiniPage *pMini;
+  u32 leaf;
+  u64 nBal;
+  if( !pCur || !pCur->pBt || !pCur->pBtree || !pCur->curIntKey ) return 0;
+  if( pCur->pgnoRoot<=1 ) return 0;
+  pBf = btreeGetBfCache(pCur->pBt);
+  if( !pBf ) return 0;
+  if( pCur->pBtree->inTrans!=TRANS_WRITE
+   || pBf->bBypassActive || pBf->bMergingActive ) return 0;
+  if( !bfDirtyRecordFits(pBf, nData) ) return 0;
+  leaf = bfCursorLeafPgno(pCur);
+  if( leaf==0 ) return 0;
+  pEntry = sqlite3BfMapLookup(pBf, leaf);
+  if( !pEntry || pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ) return 0;
+  pMini = (BfMiniPage*)pEntry->pPage;
+  if( !sqlite3BfMiniPageIsDirty(pMini) ) return 0;
+  if( (void*)pMini==pBf->pEvictProtect ) return 0;
+  if( pMini->rootPgno!=(u32)pCur->pgnoRoot ) return 0;
+  nBal = pBf->nDirtyBalance;
+  if( bfFlushOneMiniPage(pBf, pCur->pBtree, pCur->pgnoRoot, pMini)!=SQLITE_OK ){
+    return 0;
+  }
+  pBf->nLeafMerge++;
+  bfEscalateIfMisplaced(pBf, pCur->pBtree, pCur->pgnoRoot, nBal);
+  return 1;
+#endif
+}
+
 int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur){
 #if defined(SQLITE_BF_NO_DIRTY_EVICT)
   UNUSED_PARAMETER(pCur);
@@ -2109,10 +2193,14 @@ int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur){
       pBf->nDirtyEvictRefused++;
       break;
     }
-    if( bfFlushOneMiniPage(pBf, pCur->pBtree, (Pgno)pMini->rootPgno, pMini)
-          !=SQLITE_OK ){
-      pBf->nDirtyEvictRefused++;
-      break;
+    {
+      u64 nBal = pBf->nDirtyBalance;
+      Pgno root = (Pgno)pMini->rootPgno;
+      if( bfFlushOneMiniPage(pBf, pCur->pBtree, root, pMini)!=SQLITE_OK ){
+        pBf->nDirtyEvictRefused++;
+        break;
+      }
+      bfEscalateIfMisplaced(pBf, pCur->pBtree, root, nBal);
     }
     /* Re-look-up: the replay may have rebalanced and re-pointed the entry. */
     pEntry = sqlite3BfMapLookup(pBf, pgnoStall);
@@ -2921,6 +3009,9 @@ void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno){
       pEntry->locType = BF_LOC_NULL;
       pEntry->pPage   = 0;
     }else{
+      if( pgno!=pBf->pgnoFlushOwner && !pBf->bMergingActive && !pBf->bSweepAll ){
+        pBf->nDirtyBalance++;
+      }
       /* Phase 2 makes the comment above only half true: records stay DIRTY
       ** across commits by design, so a mini-page here often IS dirty and used
       ** to be left completely untouched -- stale CLEAN records included.  Those

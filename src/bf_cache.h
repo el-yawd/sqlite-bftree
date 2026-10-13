@@ -554,6 +554,15 @@ struct BfCache {
   u64 nPageFetchMiss;       /* pcache2 xFetch that allocated/recycled a page */
   u64 nFullPageHit;         /* Lookups found in full page cache */
   u64 nMergeToBase;         /* Mini-pages merged to base page */
+  /* A rebalance or free reached a leaf whose mini-page still held DIRTY records,
+  ** outside a whole-table or whole-cache flush sweep (2026-10-13).  Its dirty
+  ** records stay keyed to that leaf while the balance may move their base cells
+  ** to a sibling -- see sqlite3BfBtreeForgetPage. */
+  u64 nDirtyBalance;
+  u64 nLeafMerge;           /* merge-on-full: one leaf merged to take a write */
+  u64 nLeafMergeEscalate;   /* ... or merge-on-evict, escalated to a table sweep */
+  u32 pgnoFlushOwner;       /* leaf bfFlushOneMiniPage is replaying, else 0 */
+  u8 bSweepAll;             /* sqlite3BfBtreeFlushAllDirty is running */
   u64 nEvictBytes;          /* Bytes the eviction sweeps reclaimed (was misnamed
                             ** nEvictions; the reported entry count is
                             ** cb.nEvictions) */
@@ -991,6 +1000,7 @@ SQLITE_PRIVATE int sqlite3BfBtreeLogAllDirty(Btree *p);
 ** was done (caller should re-seek its cursor). */
 SQLITE_PRIVATE int sqlite3BfBtreeFlushTableForMutation(BtCursor *pCur);
 SQLITE_PRIVATE int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur);
+SQLITE_PRIVATE int sqlite3BfBtreeMergeFullLeaf(BtCursor *pCur, int nData);
 SQLITE_PRIVATE void sqlite3BfBtreeNoteDirtyEvictRetry(BtCursor *pCur);
 SQLITE_PRIVATE void sqlite3BfBtreeDirtyEvictStat(Btree*, u64*, u64*, u64*, u64*);
 /* Discard all BF state for a B-tree (called at rollback). */
