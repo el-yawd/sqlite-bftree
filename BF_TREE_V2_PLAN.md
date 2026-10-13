@@ -2939,3 +2939,8 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   generation (a kill between the restart's header write and the frames loses records committed
   long ago).  Reference: never resets its WAL; its CPR snapshot writes unmerged mini-pages to a
   separate file.  Awaiting owner approval (reopens "BF data on disk only in WAL record frames").
+- Design v2 (owner rejected the hidden table: "modifying base file format is the correct way to
+  go, fuck compatibility"): native MP page type (0x10) packing leaves' dirty records, chain
+  anchored in header bytes 72-83 (head + persist epoch), format version 3, segments per persist
+  with tombstones for leaves CLEARed since the last persist, no reset while records are newer
+  than the last persist, close persists instead of writing back.  `docs/design/persisted-mini-pages.md`.

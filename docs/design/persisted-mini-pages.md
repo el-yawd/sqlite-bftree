@@ -1,14 +1,16 @@
-# Persisted mini-pages: checkpoint without writing every dirty leaf back
+# Persisted mini-pages: a native page type, so a checkpoint stops writing every dirty leaf back
 
-Status: **PROPOSAL, awaiting owner approval** (2026-10-13). WAL mode only.
-Reopens one locked decision (section 9). Branch: `writes-commit-path`.
+Status: **PROPOSAL v2** (2026-10-13). WAL mode only.
+
+v2 replaces v1's hidden-table design. Owner: "modifying the base file format is the
+correct way to go, fuck compatibility".
 
 ## 1. Problem
 
-Before every checkpoint, `bfCheckpointMaterialize` (btree.c) runs a write transaction
-that merges every buffered record into its base leaf. Each dirty leaf becomes a 4 KB
-WAL page frame, and the checkpoint then copies it into the db file. The cost scales
-with the number of dirty leaves, not with the bytes that changed.
+Before every checkpoint, `bfCheckpointMaterialize` (btree.c) merges every buffered
+record into its base leaf. Each dirty leaf is written as a 4 KB WAL page frame and
+then copied into the db file. The cost scales with the number of dirty leaves, not the
+bytes that changed.
 
 Measured (1-row UPDATE commits, 100k rows, default autocheckpoint):
 
@@ -17,162 +19,174 @@ Measured (1-row UPDATE commits, 100k rows, default autocheckpoint):
 | stock | 3.25 µs |
 | BF | 10.19 µs, of which materialization at checkpoint is 3.4 µs |
 
-On that workload a typical checkpoint writes about 2,500 leaves to carry about 2,500
-changed rows, roughly one row per 4 KB page.
+A typical checkpoint writes about 2,500 leaves to carry about 2,500 changed rows.
 
 The leaves are written back because the WAL reset after a checkpoint discards the
-record frames, so the records must be durable somewhere else first. The reference
-never resets its WAL. Its CPR snapshot writes the mini-pages, unmerged, to a separate
-snapshot file (`../bf-tree/src/snapshot.rs`).
+record frames. The reference never resets its WAL; its CPR snapshot writes the
+mini-pages, unmerged, to a separate file (`../bf-tree/src/snapshot.rs`).
 
 ## 2. Idea
 
-Do what the reference's snapshot does, inside the db file and through SQLite's own
-transactions. At checkpoint, write each changed leaf's **dirty records** into a row of
-a hidden table, instead of merging them into the leaf. The db file is then complete
-(base pages plus stored records), so the WAL reset is exactly as safe as in stock.
-Recovery and reopen load the stored records back into the cache as buffered records.
+Make mini-pages part of the database file format. A new page type, the **mini-page
+page** (`MP`), packs the dirty records of many leaves. At checkpoint, the changed
+leaves' dirty records are written into MP pages instead of being merged into their
+leaves.
 
-## 3. Why a hidden table, not a new page type
+MP pages are ordinary database pages, written through the WAL like any other page. So
+after the checkpoint the db file is complete (base pages plus MP pages), and the WAL
+reset is exactly as safe as in stock. On open or recovery, the MP pages are loaded back
+into the cache as buffered records.
 
-A raw "mini-page page" type would need its own free-space management, its own
-integrity-check support (otherwise `PRAGMA integrity_check` reports "Page N is never
-used"), autovacuum relocation handling, and parsing changes in btree.c.
+## 3. File format changes
 
-A rowid table gets all of that for free:
-- B-tree packing, about 25 rows of ~150 B per page;
-- the freelist;
-- integrity checking;
-- crash atomicity through the WAL.
+**Database header**
+- Bytes 18/19 (read/write format version) become 3. Stock SQLite then refuses to open
+  the file, rather than silently reading leaves that are missing their buffered rows.
+- Bytes 72–75 (currently unused): **MP head**, the pgno of the newest MP page, or 0.
+- Bytes 76–83: **persist epoch**, a u64 incremented by every persist.
 
-Its pages are ordinary table pages, so stock SQLite can still open the file.
-
-## 4. On-disk format
-
+**MP page** (page type byte `0x10`, which SQLite does not use)
 ```
-CREATE TABLE sqlite_bf_store(leaf INTEGER PRIMARY KEY, ops BLOB)   -- internal, like sqlite_stat1
+offset 0   u8   type = 0x10
+       1   u8   flags
+       2   u16  nSlot
+       4   u16  first free byte
+       6   u32  next MP page (older), 0 = end of chain
+      10   u64  epoch of the persist that wrote this page
+      18   ...  slots, packed
+slot:  u32 leaf | u32 root | u16 len | u8 kind (0 = records, 1 = tombstone) | len bytes
 ```
 
-- `leaf`: the user-table leaf the records are keyed to (the cache's map key).
-- `ops`: that leaf's **dirty** records, encoded as a WAL record-batch payload
-  (`bf_wal.c` codec, with rootPgno per op). This reuses the decoder, its fuzz and
-  ESBMC coverage, and the replay code. Clean records are a cache and are not stored.
-- The table is created lazily by the first persist, which bumps the schema cookie
-  once. It is never buffered by BF itself: its writes are page-path only.
+The slot body is the leaf's dirty records in the WAL record-batch encoding (`bf_wal.c`).
+This reuses its decoder, its fuzz and ESBMC coverage, and the replay code. Clean records
+are a cache and are not stored. A capped mini-page (2,048 B) always fits one page.
 
-New WAL op `BFWAL_OP_PERSIST` (payload v5), logged once per persisted leaf in the
-persist commit. It means "this leaf's records up to here are in its `sqlite_bf_store`
-row". It is the counterpart of `CLEAR`, which means "up to here they are in base
-pages".
+**Chain semantics.** Each persist writes a new **segment**: one or more MP pages linked
+in front of the chain, carrying the same epoch. Walking the chain from the head, the
+first slot seen for a leaf is that leaf's current state. That slot is either its records
+or a tombstone ("records merged into the leaf since").
+
+**Compaction.** When chain pages exceed 2× the pages needed for the live slots, the
+persist rewrites the live slots into a fresh segment and frees the old pages to the
+ordinary freelist.
+
+**Integrity check** learns the MP chain: pages reachable from the MP head are in use,
+and their slots must decode.
+
+## 4. New WAL op
+
+`BFWAL_OP_PERSIST` (payload v5) is logged once per persisted leaf, in the persist commit.
+It means "this leaf's records up to here are in the MP chain". It is the counterpart of
+`CLEAR`, which means "up to here they are in base pages".
 
 ## 5. Invariants
 
-- **I1 (durability).** Every committed record that is not in base pages can be
-  reconstructed from two sources, in order: the leaf's store row as of the snapshot,
-  then the leaf's record ops after its last `PERSIST` or `CLEAR` marker that is
-  ≤ mxFrame. This replaces today's rule ("base pages, then ops after the last CLEAR").
-- **I2 (merge deletes the row).** Every merge of leaf L deletes row L **in the same
-  transaction** that logs L's `CLEAR`. This covers merge-on-full, merge-on-evict, the
-  table sweep, commit-time flush, and materialize. So a row can never be older than a
-  CLEAR, and replay never has to choose between the two.
-- **I3 (completeness).** Every row is in every caught-up cache as a dirty mini-page.
-  This already holds for replayed records. Replay-fit (`ring_grow`, fail loudly with
-  `SQLITE_FULL`) covers capacity.
+- **I1 (replay).** Leaf L's dirty set at a snapshot is built as follows:
+  1. Take L's current slot in the MP chain as of that snapshot, ignoring it if it is a
+     tombstone, or if a `CLEAR(L)` in the log is newer than that slot's `PERSIST(L)`.
+  2. Then apply L's record ops after its last marker (`CLEAR` or `PERSIST`) that is
+     ≤ mxFrame.
 
-## 6. Checkpoint flow (replaces `bfCheckpointMaterialize` in WAL mode)
+  Today's rule is the special case with an empty chain.
+- **I2 (tombstones before a reset).** A merge only logs `CLEAR(L)`, as today, with no
+  extra write. The next persist writes a tombstone for every leaf `CLEAR`ed since the
+  previous persist. Since a reset follows a persist, no stale slot can outlive the
+  `CLEAR` that killed it.
+- **I3 (no reset with unpersisted records).** `walRestartLog` (our wal.c) refuses to
+  reset while a record op or `CLEAR` is newer than the last persist commit. That
+  happens when a commit lands between the persist and the backfill. The log then keeps
+  growing until the next checkpoint persists. The writer's WAL index is caught up when
+  it reaches `walRestartLog`, so the check is local.
+- **I4 (completeness).** Every live slot is in every caught-up cache as a dirty
+  mini-page. Replay-fit (`ring_grow`, fail with `SQLITE_FULL`) covers capacity.
 
-1. Begin a write transaction. As today, any connection may run it: its cache is
-   complete for the latest snapshot. Stage any open deferred-commit batch first, as
-   materialize does (D2 ordering).
-2. The leaves to persist are those with record ops after their last marker in the
-   connection's WAL index. This is connection-independent: no per-cache "changed"
-   bits are needed.
-3. For each such leaf, apply the policy (section 7). Either:
-   - **persist**: upsert the row with the leaf's full current dirty set, and log `PERSIST(L)`; or
-   - **merge**: today's flush, which logs `CLEAR(L)` and deletes row L.
-4. Commit. Stock backfill follows, and a later writer resets the WAL as usual.
+## 6. Checkpoint flow (replaces `bfCheckpointMaterialize`)
 
-Records stay dirty in the cache after a persist. They are merged later by
-merge-on-full, merge-on-evict or close, exactly as now.
+1. Begin a write transaction. As today, any connection may run it. Stage any open
+   deferred-commit batch first (D2 ordering).
+2. Find the leaves with record ops after their last marker (from the WAL index;
+   connection-independent), plus the leaves `CLEAR`ed since the last persist.
+3. Apply the policy (section 7) to each changed leaf:
+   - **persist**: write a slot with the leaf's full current dirty set, and log `PERSIST(L)`; or
+   - **merge**: today's flush, which logs `CLEAR(L)` and gets a tombstone.
+4. Write the segment, update the MP head and epoch in page 1 (dirty anyway in every
+   commit), compact if due, and commit.
+5. Stock backfill follows; a later writer resets the WAL (subject to I3).
+
+Records stay dirty in the cache. They are merged later by merge-on-full, merge-on-evict
+or the policy.
 
 ## 7. Policy: persist or merge
 
-A merge writes one 4 KB leaf. A persist writes about the leaf's dirty bytes, plus a
-share of a store page. Rules:
+A merge writes a 4 KB leaf. A persist writes the leaf's dirty bytes into a shared MP
+page. Merge when the dirty bytes reach `PRAGMA bf_persist_max` (default 1024 B, to be
+swept); otherwise persist. The chain's live size is bounded by the dirty set, which is
+bounded by the ring budget.
 
-- Merge when the leaf's dirty bytes reach `PRAGMA bf_persist_max` (default 1024 B,
-  about a quarter page; to be swept).
-- Otherwise persist.
+## 8. Replay paths
 
-The store size is bounded by the dirty set, which is bounded by the ring budget.
+| path | change |
+|---|---|
+| recovery / reopen | walk the MP chain (newest first, first slot per leaf wins), then apply ops after the markers (I1) |
+| rollback rehydrate | same, plus carry |
+| reader full rebuild (log reset) | same as recovery; reads the MP chain at its snapshot |
+| reader incremental | a persist changes no record values, so a `PERSIST(L)` is just a marker and needs no reload; `CLEAR` handling is unchanged |
+| replay bound (`ring_grow`) | plus live slot sizes |
 
-## 8. Replay paths (every one changes)
+Main implementation risk, to check first: the replay reads MP pages through the pager
+while it rebuilds the cache.
 
-| path | today | new |
-|---|---|---|
-| recovery / reopen | ops after the last CLEAR | scan `sqlite_bf_store`, then ops after the last marker |
-| rollback rehydrate | same as recovery, plus carry | same, plus carry |
-| reader full rebuild | same as recovery | same as recovery |
-| reader incremental | drop touched leaves, replay their ops | also re-read the touched leaves' store rows (a point lookup). Store-table page frames and `PERSIST` ops name the leaves, so the touch list is unchanged |
-| replay bound (`ring_grow`) | ops after the last CLEAR | plus row sizes |
+## 9. Lifecycle
 
-Reading the store table during replay means reading pages inside the replay. Recovery
-and rehydrate already run with the pager readable, so this is the main implementation
-risk to check first.
-
-## 9. Lifecycle and locked decisions
-
-- **Close: unchanged.** Close still materializes everything and runs a TRUNCATE
-  checkpoint, then deletes all rows. So **a db at rest is a plain SQLite file**: stock
-  SQLite sees an empty `sqlite_bf_store` table. Only a crashed or still-open db holds
-  stored records.
-- **journal_mode away from WAL, VACUUM:** merge all first (I2 empties the store).
-- **`DROP TABLE` / `DELETE FROM`:** these already flush the table first, so I2 deletes its rows.
-- **Autovacuum:** BF is already off under autovacuum (`bf_btree.c:75`), so no page relocation.
-- **Locked decision reopened:** "the only BF data on disk is in WAL record frames"
-  becomes "...or in `sqlite_bf_store` while the db is open or after a crash". The other
-  locked decisions hold: one WAL, page-sized frames, no sidecar file, single writer.
-  Stock code is not modified to fit this; the stock baseline is untouched.
+- **Close: persist and checkpoint, with no write-back.** That removes today's close
+  burst. A db at rest holds MP pages and needs this engine to open.
+- **journal_mode away from WAL, VACUUM:** merge everything first, which empties the chain.
+- **`DROP TABLE` / `DELETE FROM`:** these already flush the table first, so its leaves
+  get tombstones at the next persist.
+- **Autovacuum:** BF is already off under autovacuum (`bf_btree.c:75`), so MP pages are never relocated.
+- **Locked decisions:**
+  - Reopened: "BF data on disk only in WAL record frames" becomes "...and in MP pages".
+  - Kept: one WAL, page-sized WAL frames, no sidecar file, single writer.
+  - Fairness: the stock baseline is not modified; this is the BF engine's own format.
 
 ## 10. Crash cases (new oracle coverage)
 
-Kill (SIGKILL) and power-loss (the existing powerloss harness) at each point:
+Each under SIGKILL (crash oracle) and power loss (powerloss harness):
 
 1. before the persist commit;
-2. after the persist commit, before backfill;
+2. after it, before backfill;
 3. mid-backfill;
-4. after the reset, inside the first new-generation commit;
-5. inside a merge that deletes a row;
-6. a reader rebuilding across a persist and a reset.
+4. after the reset, in the first new-generation commit;
+5. a commit between the persist and the backfill (I3 must block the reset);
+6. compaction;
+7. a reader rebuilding across a persist and a reset.
 
-Expected outcome in all cases: committed records survive, and the differential oracle
-matches stock. Cases 1–3 rely on the old log being intact. Case 4 relies on the db file
-holding the rows. Case 5 relies on transaction atomicity.
+Pass condition: the differential oracle matches stock, and `integrity_check` (with MP
+support) is ok.
 
 ## 11. Measurement
 
 - Ablation: `SQLITE_BF_NO_PERSIST` (today's materialize).
-- Counters: `persist_rows`, `persist_bytes`, `persist_merges`, `store_pages`.
-- Report WAL page frames per checkpoint and µs per commit beside the existing write
-  arms, under direct I/O (`28d0d2b`).
+- Counters: `persist_slots`, `persist_tombstones`, `persist_merges`, `mp_pages`, `mp_compactions`.
+- Report WAL page frames per checkpoint and µs per commit beside the write arms, under
+  direct I/O.
 - Expected: page frames per checkpoint go from about the dirty-leaf count (~2,500) to
-  about store pages touched (~100) plus merged leaves. Checkpoint cost per commit drops
-  from 3.4 µs toward stock's backfill cost.
-- Not expected: any change to the commit-path gap (about 1.8x instructions, plan
-  2026-10-13).
+  about the MP pages written (~2,500 × ~150 B ≈ 90) plus merged leaves.
+- Not expected: any change to the commit-path gap (~1.8x instructions).
 
 ## 12. Stages
 
-1. **S1 (~1.5 days).** Store table, payload v5 `PERSIST`, persist transaction, recovery
-   load. Crash cases 1–4 under the single-connection oracles.
-2. **S2 (~1 day).** I2 in every merge path. Rollback, reader full and incremental
-   replay. mconn sweep. Crash cases 5–6.
-3. **S3 (~1 day).** Policy sweep, counters, ablation, gate variants, a
-   `results/persist` campaign.
+1. **S1 (~2 days).** MP page format, header fields, format version, persist
+   transaction, chain load at recovery, integrity check. Crash cases 1–4 on the
+   single-connection oracles.
+2. **S2 (~1.5 days).** I1/I2/I3 in every replay path (rollback, reader full and
+   incremental), the reset guard, compaction. mconn sweep. Crash cases 5–7.
+3. **S3 (~1 day).** Policy sweep, counters, ablation, gate variants, a `results/persist` campaign.
 
-## 13. Open questions for the owner
+## 13. Open questions
 
-1. Is reopening the "BF data only in WAL record frames" decision acceptable? The db at
-   rest stays a plain SQLite file.
-2. Is the table name and visibility OK? It is listed in `sqlite_schema`, like `sqlite_stat1`.
-3. Policy default: should the threshold be swept in the campaign, or fixed now?
+1. Close persists and does not write back, so a db at rest needs this engine to open. Is that OK?
+2. Should the slot store only dirty records (proposed), or the whole mini-page image
+   (the reference snapshots raw mini-pages)? Whole images would also keep clean records
+   across a reopen (a warm restart), at about 2–4x the bytes.
+3. Policy default: sweep it in the campaign, or fix it now?
