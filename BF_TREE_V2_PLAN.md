@@ -2952,3 +2952,19 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   incremental analogue of the reference's CPR snapshot.  Stages W0-W5; W5 (delta frames)
   only if W4's direct-I/O numbers say WAL volume still matters.  Awaiting owner decisions
   (section 13).
+
+### 2026-10-13 (cont.) — Claude Opus 5.5 — BEGIN CONCURRENT merged (branch `begin-concurrent-exp`, worktree ../bc-exp)
+
+- Owner: experiment with upstream BEGIN CONCURRENT; hypothesis: its page-level false conflicts
+  are amortised by mini-pages (buffered writes do not modify leaf pages).
+- Merged upstream `begin-concurrent` 8a1edc2f3 (branch-only diff vs trunk merge-base 0e62f142b)
+  by per-file 3-way merge; 13 conflicts, `78a63a25a`.  Gate --full 51/51, mconn 48/48.
+- First result (`bench/concurrent_conflict.c`, rows 500/501 on one leaf):
+  stock+BC: same row -> 2nd commit rejected; different rows -> 2nd commit rejected (FALSE
+  conflict).  BF+BC: different rows -> both commit (hypothesis holds), SAME ROW -> BOTH COMMIT,
+  v=1: LOST UPDATE.  BC validates pages read against page frames committed since the
+  snapshot; buffered writes produce record frames only, so record-level validation is needed.
+- Next: record-level validation (read set of keys/ranges per BF table, checked against record
+  ops committed since the snapshot at walLockForCommit), cache rebase that keeps the txn's own
+  records, a multi-writer serialisability oracle, then a threaded driver: abort rate and
+  throughput, stock+BC vs BF+BC.
