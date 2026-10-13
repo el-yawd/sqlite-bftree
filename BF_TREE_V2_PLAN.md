@@ -2944,3 +2944,11 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   anchored in header bytes 72-83 (head + persist epoch), format version 3, segments per persist
   with tombstones for leaves CLEARed since the last persist, no reset while records are newer
   than the last persist, close persists instead of writing back.  `docs/design/persisted-mini-pages.md`.
+- Write plan (owner: compatibility no constraint, follow the reference, keep durability):
+  `docs/design/write-path.md` supersedes the MP-slot design.  The record log moves into
+  database LOG PAGES written through the pager (new page type, seq-ordered entries, chain in
+  header bytes 72-91): stock WAL frames again, stock checkpoint (no write-back), recovery =
+  stock + chain replay, readers invalidate by seq across resets, log GC/compaction as the
+  incremental analogue of the reference's CPR snapshot.  Stages W0-W5; W5 (delta frames)
+  only if W4's direct-I/O numbers say WAL volume still matters.  Awaiting owner decisions
+  (section 13).

@@ -1,6 +1,6 @@
 # Persisted mini-pages: a native page type, so a checkpoint stops writing every dirty leaf back
 
-Status: **PROPOSAL v2** (2026-10-13). WAL mode only.
+Status: **SUPERSEDED** by `write-path.md` (2026-10-13) -- kept for the reasoning. WAL mode only.
 
 v2 replaces v1's hidden-table design. Owner: "modifying the base file format is the
 correct way to go, fuck compatibility".
