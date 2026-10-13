@@ -372,6 +372,8 @@ sqlite3_uint64 sqlite3BtreeSeekCount(Btree*);
 # define sqlite3BtreeSeekCount(X) 0
 #endif
 
+int sqlite3BtreeExclusiveLock(Btree *pBt);
+
 #ifndef NDEBUG
 int sqlite3BtreeCursorIsValid(BtCursor*);
 #endif

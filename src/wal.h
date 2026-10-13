@@ -34,7 +34,7 @@
 # define sqlite3WalDbsize(y)                     0
 # define sqlite3WalBeginWriteTransaction(y)      0
 # define sqlite3WalEndWriteTransaction(x)        0
-# define sqlite3WalUndo(x,y,z)                   0
+# define sqlite3WalUndo(w,x,y,z)                 0
 # define sqlite3WalSavepoint(y,z)
 # define sqlite3WalSavepointUndo(y,z)            0
 # define sqlite3WalFrames(u,v,w,x,y,z)           0
@@ -95,7 +95,7 @@ int sqlite3WalBeginWriteTransaction(Wal *pWal);
 int sqlite3WalEndWriteTransaction(Wal *pWal);
 
 /* Undo any frames written (but not committed) to the log */
-int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx);
+int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx, int);
 
 /* Return an integer that records the current (uncommitted) write
 ** position in the WAL */
@@ -175,6 +175,15 @@ int sqlite3WalSnapshotCheck(Wal *pWal, sqlite3_snapshot *pSnapshot);
 void sqlite3WalSnapshotUnlock(Wal *pWal);
 #endif
 
+#ifndef SQLITE_OMIT_CONCURRENT
+/* Tell the wal layer that we want to commit a concurrent transaction */
+int sqlite3WalLockForCommit(Wal *pWal, PgHdr *pPg, Bitvec *pRead, Pgno*);
+
+/* Upgrade the state of the client to take into account changes written
+** by other connections */
+int sqlite3WalUpgradeSnapshot(Wal *pWal);
+#endif /* SQLITE_OMIT_CONCURRENT */
+
 #ifdef SQLITE_ENABLE_ZIPVFS
 /* If the WAL file is not empty, return the number of bytes of content
 ** stored in each frame (i.e. the db page-size when the WAL was created).
@@ -193,6 +202,13 @@ void sqlite3WalDb(Wal *pWal, sqlite3 *db);
 #ifdef SQLITE_USE_SEH
 int sqlite3WalSystemErrno(Wal*);
 #endif
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+  void sqlite3WalStat(Wal*,sqlite3_str*);
+#endif
+
+/* sqlite3_wal_info() data */
+int sqlite3WalInfo(Wal *pWal, u32 *pnPrior, u32 *pnFrame);
 
 #endif /* ifndef SQLITE_OMIT_WAL */
 #endif /* SQLITE_WAL_H */

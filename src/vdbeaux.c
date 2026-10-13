@@ -2966,10 +2966,27 @@ static int vdbeCommit(sqlite3 *db, Vdbe *p){
         assert( i!=1 );
         nTrans++;
       }
-      rc = sqlite3PagerExclusiveLock(pPager);
+      rc = sqlite3BtreeExclusiveLock(pBt);
       sqlite3BtreeLeave(pBt);
     }
   }
+
+#ifndef SQLITE_OMIT_CONCURRENT
+  if( db->eConcurrent && (rc & 0xFF)==SQLITE_BUSY ){
+    /* An SQLITE_BUSY or SQLITE_BUSY_SNAPSHOT was encountered while 
+    ** attempting to take the WRITER lock on a wal file. Release the
+    ** WRITER locks on all wal files and return early.  */
+    for(i=0; i<db->nDb; i++){
+      Btree *pBt = db->aDb[i].pBt;
+      if( sqlite3BtreeTxnState(pBt)==SQLITE_TXN_WRITE ){
+        sqlite3BtreeEnter(pBt);
+        sqlite3PagerDropExclusiveLock(sqlite3BtreePager(pBt));
+        sqlite3BtreeLeave(pBt);
+      }
+    }
+  }
+#endif
+
   if( rc!=SQLITE_OK ){
     return rc;
   }
@@ -3378,6 +3395,7 @@ int sqlite3VdbeHalt(Vdbe *p){
           sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
           sqlite3CloseSavepoints(db);
           db->autoCommit = 1;
+          db->eConcurrent = CONCURRENT_NONE;
           p->nChange = 0;
         }
       }
@@ -3416,9 +3434,9 @@ int sqlite3VdbeHalt(Vdbe *p){
           ** is required. */
           rc = vdbeCommit(db, p);
         }
-        if( rc==SQLITE_BUSY && p->readOnly ){
+        if( (rc & 0xFF)==SQLITE_BUSY && p->readOnly ){
           sqlite3VdbeLeave(p);
-          return SQLITE_BUSY;
+          return rc;
         }else if( rc!=SQLITE_OK ){
           sqlite3SystemError(db, rc);
           p->rc = rc;
@@ -3446,6 +3464,7 @@ int sqlite3VdbeHalt(Vdbe *p){
         sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
         sqlite3CloseSavepoints(db);
         db->autoCommit = 1;
+        db->eConcurrent = CONCURRENT_NONE;
         p->nChange = 0;
       }
     }
@@ -3467,6 +3486,7 @@ int sqlite3VdbeHalt(Vdbe *p){
         sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
         sqlite3CloseSavepoints(db);
         db->autoCommit = 1;
+        db->eConcurrent = CONCURRENT_NONE;
         p->nChange = 0;
       }
     }

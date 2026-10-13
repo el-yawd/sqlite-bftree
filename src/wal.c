@@ -550,6 +550,7 @@ struct Wal {
   WalIndexHdr hdr;           /* Wal-index header for current transaction */
   u32 minFrame;              /* Ignore wal frames before this one */
   u32 iReCksum;              /* On commit, recalculate checksums from here */
+  u32 nPriorFrame;           /* For sqlite3WalInfo() */
   const char *zWalName;      /* Name of WAL file */
   u32 nCkpt;                 /* Checkpoint sequence counter in the wal-header */
 #ifndef SQLITE_OMIT_BF_CACHE
@@ -584,6 +585,7 @@ struct Wal {
   u32 aBfTouchSalt[2];
   u8 bBfTouchOk;
 #endif
+  FastPrng sPrng;            /* Random number generator */
 #ifdef SQLITE_USE_SEH
   u32 lockMask;              /* Mask of locks held */
   void *pFree;               /* Pointer to sqlite3_free() if exception thrown */
@@ -1151,7 +1153,7 @@ static const char *walLockName(int lockIdx){
 /*
 ** Set or release locks on the WAL.  Locks are either shared or exclusive.
 ** A lock cannot be moved directly between shared and exclusive - it must go
-** through the unlocked state first.
+** through the concurrent state first.
 **
 ** In locking_mode=EXCLUSIVE, all of these routines become no-ops.
 */
@@ -1469,7 +1471,7 @@ static int walIndexRecover(Wal *pWal){
   /* Obtain an exclusive lock on all byte in the locking range not already
   ** locked by the caller. The caller is guaranteed to have locked the
   ** WAL_WRITE_LOCK byte, and may have also locked the WAL_CKPT_LOCK byte.
-  ** If successful, the same bytes that are locked here are unlocked before
+  ** If successful, the same bytes that are locked here are concurrent before
   ** this function returns.
   */
   assert( pWal->ckptLock==1 || pWal->ckptLock==0 );
@@ -1821,6 +1823,7 @@ int sqlite3WalOpen(
   pRet->syncHeader = 1;
   pRet->padToSectorBoundary = 1;
   pRet->exclusiveMode = (bNoShm ? WAL_HEAPMEMORY_MODE: WAL_NORMAL_MODE);
+  sqlite3FastPrngInit(&pRet->sPrng);
 
   /* Open file handle on the write-ahead log file. */
   flags = (SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_WAL);
@@ -2477,7 +2480,7 @@ static int walCheckpoint(
       rc = SQLITE_BUSY;
     }else if( eMode>=SQLITE_CHECKPOINT_RESTART ){
       u32 salt1;
-      sqlite3_randomness(4, &salt1);
+      sqlite3FastRandomness(&pWal->sPrng, 4, &salt1);
       assert( pInfo->nBackfill==pWal->hdr.mxFrame );
       rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(1), WAL_NREADER-1);
       if( rc==SQLITE_OK ){
@@ -2692,6 +2695,49 @@ int sqlite3WalClose(
 }
 
 /*
+** Try to copy the wal-index header from shared-memory into (*pHdr). Return
+** zero if successful or non-zero otherwise. If the header is corrupted
+** (either because the two copies are inconsistent or because the checksum 
+** values are incorrect), the read fails and non-zero is returned.
+*/
+static int walIndexLoadHdr(Wal *pWal, WalIndexHdr *pHdr){
+  u32 aCksum[2];                  /* Checksum on the header content */
+  WalIndexHdr h2;                 /* Second copy of the header content */
+  WalIndexHdr volatile *aHdr;     /* Header in shared memory */
+
+  /* The first page of the wal-index must be mapped at this point. */
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+
+  /* Read the header. This might happen concurrently with a write to the
+  ** same area of shared memory on a different CPU in a SMP,
+  ** meaning it is possible that an inconsistent snapshot is read
+  ** from the file. If this happens, return non-zero.
+  **
+  ** There are two copies of the header at the beginning of the wal-index.
+  ** When reading, read [0] first then [1].  Writes are in the reverse order.
+  ** Memory barriers are used to prevent the compiler or the hardware from
+  ** reordering the reads and writes.
+  */
+  aHdr = walIndexHdr(pWal);
+  memcpy(pHdr, (void *)&aHdr[0], sizeof(h2));
+  walShmBarrier(pWal);
+  memcpy(&h2, (void *)&aHdr[1], sizeof(h2));
+
+  if( memcmp(&h2, pHdr, sizeof(h2))!=0 ){
+    return 1;   /* Dirty read */
+  }  
+  if( h2.isInit==0 ){
+    return 1;   /* Malformed header - probably all zeros */
+  }
+  walChecksumBytes(1, (u8*)&h2, sizeof(h2)-sizeof(h2.aCksum), 0, aCksum);
+  if( aCksum[0]!=h2.aCksum[0] || aCksum[1]!=h2.aCksum[1] ){
+    return 1;   /* Checksum does not match */
+  }
+
+  return 0;
+}
+
+/*
 ** Try to read the wal-index header.  Return 0 on success and 1 if
 ** there is a problem.
 **
@@ -2709,43 +2755,10 @@ int sqlite3WalClose(
 ** is read successfully and the checksum verified, return zero.
 */
 static SQLITE_NO_TSAN int walIndexTryHdr(Wal *pWal, int *pChanged){
-  u32 aCksum[2];                  /* Checksum on the header content */
-  WalIndexHdr h1, h2;             /* Two copies of the header content */
-  WalIndexHdr volatile *aHdr;     /* Header in shared memory */
+  WalIndexHdr h1;                 /* Copy of the header content */
 
-  /* The first page of the wal-index must be mapped at this point. */
-  assert( pWal->nWiData>0 && pWal->apWiData[0] );
-
-  /* Read the header. This might happen concurrently with a write to the
-  ** same area of shared memory on a different CPU in a SMP,
-  ** meaning it is possible that an inconsistent snapshot is read
-  ** from the file. If this happens, return non-zero.
-  **
-  ** tag-20200519-1:
-  ** There are two copies of the header at the beginning of the wal-index.
-  ** When reading, read [0] first then [1].  Writes are in the reverse order.
-  ** Memory barriers are used to prevent the compiler or the hardware from
-  ** reordering the reads and writes.  TSAN and similar tools can sometimes
-  ** give false-positive warnings about these accesses because the tools do not
-  ** account for the double-read and the memory barrier. The use of mutexes
-  ** here would be problematic as the memory being accessed is potentially
-  ** shared among multiple processes and not all mutex implementations work
-  ** reliably in that environment.
-  */
-  aHdr = walIndexHdr(pWal);
-  memcpy(&h1, (void *)&aHdr[0], sizeof(h1)); /* Possible TSAN false-positive */
-  walShmBarrier(pWal);
-  memcpy(&h2, (void *)&aHdr[1], sizeof(h2));
-
-  if( memcmp(&h1, &h2, sizeof(h1))!=0 ){
-    return 1;   /* Dirty read */
-  }
-  if( h1.isInit==0 ){
-    return 1;   /* Malformed header - probably all zeros */
-  }
-  walChecksumBytes(1, (u8*)&h1, sizeof(h1)-sizeof(h1.aCksum), 0, aCksum);
-  if( aCksum[0]!=h1.aCksum[0] || aCksum[1]!=h1.aCksum[1] ){
-    return 1;   /* Checksum does not match */
+  if( walIndexLoadHdr(pWal, &h1) ){
+    return 1;
   }
 
   if( memcmp(&pWal->hdr, &h1, sizeof(WalIndexHdr)) ){
@@ -3537,6 +3550,7 @@ static int walBeginReadTransaction(Wal *pWal, int *pChanged){
   testcase( rc==SQLITE_PROTOCOL );
   testcase( rc==SQLITE_OK );
 
+  pWal->nPriorFrame = pWal->hdr.mxFrame;
 #ifdef SQLITE_ENABLE_SNAPSHOT
   if( rc==SQLITE_OK ){
     if( pSnapshot && memcmp(pSnapshot, &pWal->hdr, sizeof(WalIndexHdr))!=0 ){
@@ -3800,6 +3814,38 @@ Pgno sqlite3WalDbsize(Wal *pWal){
   return 0;
 }
 
+/*
+** Take the WRITER lock on the WAL file. Return SQLITE_OK if successful,
+** or an SQLite error code otherwise. This routine does not invoke any
+** busy-handler callbacks, that is done at a higher level.
+*/
+static int walWriteLock(Wal *pWal){
+  int rc;
+
+  /* Cannot start a write transaction without first holding a read lock */
+  assert( pWal->readLock>=0 );
+  assert( pWal->writeLock==0 );
+  assert( pWal->iReCksum==0 );
+#ifndef SQLITE_OMIT_BF_CACHE
+  sqlite3WalBfPrune(pWal);   /* before any frame number can be reused */
+#endif
+
+  /* If this is a read-only connection, obtaining a write-lock is not
+  ** possible. In this case return SQLITE_READONLY. Otherwise, attempt
+  ** to grab the WRITER lock. Set Wal.writeLock to true and return
+  ** SQLITE_OK if successful, or leave Wal.writeLock clear and return 
+  ** an SQLite error code (possibly SQLITE_BUSY) otherwise. */
+  if( pWal->readOnly ){
+    rc = SQLITE_READONLY;
+  }else{
+    rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    if( rc==SQLITE_OK ){
+      pWal->writeLock = 1;
+    }
+  }
+
+  return rc;
+}
 
 /*
 ** This function starts a write transaction on the WAL.
@@ -3826,45 +3872,237 @@ int sqlite3WalBeginWriteTransaction(Wal *pWal){
     return SQLITE_OK;
   }
 #endif
-
-  /* Cannot start a write transaction without first holding a read
-  ** transaction. */
-  assert( pWal->readLock>=0 );
-#ifndef SQLITE_OMIT_BF_CACHE
-  sqlite3WalBfPrune(pWal);   /* before any frame number can be reused */
-#endif
-  assert( pWal->writeLock==0 && pWal->iReCksum==0 );
-
-  if( pWal->readOnly ){
-    return SQLITE_READONLY;
-  }
-
-  /* Only one writer allowed at a time.  Get the write lock.  Return
-  ** SQLITE_BUSY if unable.
-  */
-  rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1);
-  if( rc ){
-    return rc;
-  }
-  pWal->writeLock = 1;
-
-  /* If another connection has written to the database file since the
-  ** time the read transaction on this connection was started, then
-  ** the write is disallowed.
-  */
-  SEH_TRY {
-    if( memcmp(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr))!=0 ){
-      rc = SQLITE_BUSY_SNAPSHOT;
+  
+  rc = walWriteLock(pWal);
+  if( rc==SQLITE_OK ){
+    /* If another connection has written to the database file since the
+    ** time the read transaction on this connection was started, then
+    ** the write is disallowed. Release the WRITER lock and return
+    ** SQLITE_BUSY_SNAPSHOT in this case.  */
+    SEH_TRY {
+      if( memcmp(&pWal->hdr, (void*)walIndexHdr(pWal),sizeof(WalIndexHdr))!=0 ){
+        rc = SQLITE_BUSY_SNAPSHOT;
+      }
     }
-  }
-  SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
-
-  if( rc!=SQLITE_OK ){
-    walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
-    pWal->writeLock = 0;
+    SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+    if( rc!=SQLITE_OK ){
+      walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+      pWal->writeLock = 0;
+    }
   }
   return rc;
 }
+
+/*
+** This function is called by a writer that has a read-lock on aReadmark[0]
+** (pWal->readLock==0). This function relinquishes that lock and takes a
+** lock on a different aReadmark[] slot. 
+**
+** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
+*/
+static int walUpgradeReadlock(Wal *pWal){
+  int cnt;
+  int rc;
+  assert( pWal->writeLock && pWal->readLock==0 );
+  walUnlockShared(pWal, WAL_READ_LOCK(0));
+  pWal->readLock = -1;
+  cnt = 0;
+  do{
+    int notUsed;
+    rc = walTryBeginRead(pWal, &notUsed, 1, &cnt);
+  }while( rc==WAL_RETRY );
+  assert( (rc&0xff)!=SQLITE_BUSY ); /* BUSY not possible when useWal==1 */
+  testcase( (rc&0xff)==SQLITE_IOERR );
+  testcase( rc==SQLITE_PROTOCOL );
+  testcase( rc==SQLITE_OK );
+  return rc;
+}
+
+
+#ifndef SQLITE_OMIT_CONCURRENT
+/*
+** This function does the work of sqlite3WalLockForCommit(). The difference
+** between this function and sqlite3WalLockForCommit() is that the latter
+** encloses everything in a SEH_TRY {} block.
+*/
+static int walLockForCommit(
+  Wal *pWal, 
+  PgHdr *pPg1, 
+  Bitvec *pAllRead, 
+  Pgno *piConflict
+){
+  int rc = walWriteLock(pWal);
+
+  /* If the database has been modified since this transaction was started,
+  ** check if it is still possible to commit. The transaction can be 
+  ** committed if:
+  **
+  **   a) None of the pages in pList have been modified since the 
+  **      transaction opened, and
+  **
+  **   b) The database schema cookie has not been modified since the
+  **      transaction was started.
+  */
+  if( rc==SQLITE_OK ){
+    WalIndexHdr head;
+
+    if( walIndexLoadHdr(pWal, &head) ){
+      /* This branch is taken if the wal-index header is corrupted. This 
+      ** occurs if some other writer has crashed while committing a 
+      ** transaction to this database since the current concurrent transaction
+      ** was opened.  */
+      rc = SQLITE_BUSY_SNAPSHOT;
+    }else if( memcmp(&pWal->hdr, (void*)&head, sizeof(WalIndexHdr))!=0 ){
+      int iHash;
+      int iLast = walFramePage(head.mxFrame);
+      u32 iFirst = pWal->hdr.mxFrame+1;     /* First wal frame to check */
+      if( memcmp(pWal->hdr.aSalt, (u32*)head.aSalt, sizeof(u32)*2) ){
+        assert( pWal->readLock==0 );
+        iFirst = 1;
+      }
+      if( pPg1==0 ){
+        /* If pPg1==0, then the current transaction modified the database
+        ** schema. This means it conflicts with all other transactions. */
+        *piConflict = 1;
+        rc = SQLITE_BUSY_SNAPSHOT;
+      }
+      for(iHash=walFramePage(iFirst); rc==SQLITE_OK && iHash<=iLast; iHash++){
+        WalHashLoc sLoc;
+
+        rc = walHashGet(pWal, iHash, &sLoc);
+        if( rc==SQLITE_OK ){
+          u32 i, iMin, iMax;
+          assert( head.mxFrame>=sLoc.iZero );
+          iMin = (sLoc.iZero >= iFirst) ? 1 : (iFirst - sLoc.iZero);
+          iMax = (iHash==0) ? HASHTABLE_NPAGE_ONE : HASHTABLE_NPAGE;
+          if( iMax>(head.mxFrame-sLoc.iZero) ) iMax = (head.mxFrame-sLoc.iZero);
+          for(i=iMin; rc==SQLITE_OK && i<=iMax; i++){
+            PgHdr *pPg;
+            if( sLoc.aPgno[i-1]==1 ){
+              /* Check that the schema cookie has not been modified. If
+              ** it has not, the commit can proceed. */
+              u8 aNew[4];
+              u8 *aOld = &((u8*)pPg1->pData)[40];
+              int sz;
+              i64 iOffset;
+              sz = pWal->hdr.szPage;
+              sz = (sz&0xfe00) + ((sz&0x0001)<<16);
+              iOffset = walFrameOffset(i+sLoc.iZero, sz) + WAL_FRAME_HDRSIZE+40;
+              rc = sqlite3OsRead(pWal->pWalFd, aNew, sizeof(aNew), iOffset);
+              if( rc==SQLITE_OK && memcmp(aOld, aNew, sizeof(aNew)) ){
+                rc = SQLITE_BUSY_SNAPSHOT;
+              }
+            }else if( sqlite3BitvecTestNotNull(pAllRead, sLoc.aPgno[i-1]) ){
+              *piConflict = sLoc.aPgno[i-1];
+              rc = SQLITE_BUSY_SNAPSHOT;
+            }else
+            if( (pPg = sqlite3PagerLookup(pPg1->pPager, sLoc.aPgno[i-1])) ){
+              /* Page aPgno[i-1], which is present in the pager cache, has been
+              ** modified since the current CONCURRENT transaction was started.
+              ** However it was not read by the current transaction, so is not
+              ** a conflict. There are two possibilities: (a) the page was
+              ** allocated at the of the file by the current transaction or 
+              ** (b) was present in the cache at the start of the transaction.
+              **
+              ** For case (a), do nothing. This page will be moved within the
+              ** database file by the commit code to avoid the conflict. The
+              ** call to PagerUnref() is to release the reference grabbed by
+              ** the sqlite3PagerLookup() above.  
+              **
+              ** In case (b), drop the page from the cache - otherwise
+              ** following the snapshot upgrade the cache would be inconsistent
+              ** with the database as stored on disk. */
+              if( sqlite3PagerIswriteable(pPg) ){
+                sqlite3PagerUnref(pPg);
+              }else{
+                sqlite3PcacheDrop(pPg);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  pWal->nPriorFrame = pWal->hdr.mxFrame;
+  return rc;
+}
+
+/* 
+** This function is only ever called when committing a "BEGIN CONCURRENT"
+** transaction. It may be assumed that no frames have been written to
+** the wal file. The second parameter is a pointer to the in-memory 
+** representation of page 1 of the database (which may or may not be
+** dirty). The third is a bitvec with a bit set for each page in the
+** database file that was read by the current concurrent transaction.
+**
+** This function performs three tasks:
+**
+**   1) It obtains the WRITER lock on the wal file,
+**
+**   2) It checks that there are no conflicts between the current
+**      transaction and any transactions committed to the wal file since
+**      it was opened, and
+**
+**   3) It ejects any non-dirty pages from the page-cache that have been
+**      written by another client since the CONCURRENT transaction was started
+**      (so as to avoid ending up with an inconsistent cache after the
+**      current transaction is committed).
+**
+** If no error occurs and the caller may proceed with committing the 
+** transaction, SQLITE_OK is returned. SQLITE_BUSY is returned if the WRITER
+** lock cannot be obtained. Or, if the WRITER lock can be obtained but there
+** are conflicts with a committed transaction, SQLITE_BUSY_SNAPSHOT. Finally,
+** if an error (i.e. an OOM condition or IO error), an SQLite error code
+** is returned.
+*/
+int sqlite3WalLockForCommit(
+  Wal *pWal, 
+  PgHdr *pPg1, 
+  Bitvec *pAllRead, 
+  Pgno *piConflict
+){
+  int rc = SQLITE_OK;
+  SEH_TRY {
+    rc = walLockForCommit(pWal, pPg1, pAllRead, piConflict);
+  } SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  return rc;
+}
+
+/* !defined(SQLITE_OMIT_CONCURRENT)
+**
+** This function is called as part of committing an CONCURRENT transaction.
+** It is assumed that sqlite3WalLockForCommit() has already been successfully
+** called and so (a) the WRITER lock is held and (b) it is known that the
+** wal-index-header stored in shared memory is not corrupt.
+**
+** Before returning, this function upgrades the client so that it is 
+** operating on the database snapshot currently at the head of the wal file
+** (even if the CONCURRENT transaction ran against an older snapshot).
+**
+** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
+*/
+int sqlite3WalUpgradeSnapshot(Wal *pWal){
+  int rc = SQLITE_OK;
+  assert( pWal->writeLock );
+
+  SEH_TRY {
+    assert( pWal->szPage==pWal->hdr.szPage );
+    memcpy(&pWal->hdr, (void*)walIndexHdr(pWal), sizeof(WalIndexHdr));
+    assert( pWal->szPage==pWal->hdr.szPage || pWal->szPage==0 );
+    pWal->szPage = pWal->hdr.szPage;
+
+    /* If this client has its read-lock on slot aReadmark[0] and the entire
+    ** wal has not been checkpointed, switch it to a different slot. Otherwise
+    ** any reads performed between now and committing the transaction will
+    ** read from the old snapshot - not the one just upgraded to.  */
+    if( pWal->readLock==0 && pWal->hdr.mxFrame!=walCkptInfo(pWal)->nBackfill ){
+      rc = walUpgradeReadlock(pWal);
+    }
+  } SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  return rc;
+}
+#endif   /* SQLITE_OMIT_CONCURRENT */
 
 /*
 ** End a write transaction.  The commit has already been done.  This
@@ -3892,9 +4130,14 @@ int sqlite3WalEndWriteTransaction(Wal *pWal){
 ** Otherwise, if the callback function does not return an error, this
 ** function returns SQLITE_OK.
 */
-int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
+int sqlite3WalUndo(
+  Wal *pWal, 
+  int (*xUndo)(void *, Pgno), 
+  void *pUndoCtx,
+  int bConcurrent                 /* True if this is a CONCURRENT transaction */
+){
   int rc = SQLITE_OK;
-  if( ALWAYS(pWal->writeLock) ){
+  if( pWal->writeLock ){
     Pgno iMax = pWal->hdr.mxFrame;
     Pgno iFrame;
 
@@ -3903,7 +4146,13 @@ int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
       ** was in before the client began writing to the database.
       */
       memcpy(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr));
-
+#ifndef SQLITE_OMIT_CONCURRENT
+      if( bConcurrent ){
+        pWal->hdr.aCksum[0]++;
+      }
+#else
+      UNUSED_PARAMETER(bConcurrent);
+#endif
       for(iFrame=pWal->hdr.mxFrame+1;
           ALWAYS(rc==SQLITE_OK) && iFrame<=iMax;
           iFrame++
@@ -3949,7 +4198,6 @@ int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
 ** point in the event of a savepoint rollback (via WalSavepointUndo()).
 */
 void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
-  assert( pWal->writeLock );
   aWalData[0] = pWal->hdr.mxFrame;
   aWalData[1] = pWal->hdr.aFrameCksum[0];
   aWalData[2] = pWal->hdr.aFrameCksum[1];
@@ -3965,7 +4213,7 @@ void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
 int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
   int rc = SQLITE_OK;
 
-  assert( pWal->writeLock );
+  assert( pWal->writeLock || aWalData[0]==pWal->hdr.mxFrame );
   assert( aWalData[3]!=pWal->nCkpt || aWalData[0]<=pWal->hdr.mxFrame );
 
   if( aWalData[3]!=pWal->nCkpt ){
@@ -4016,14 +4264,13 @@ int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
 */
 static int walRestartLog(Wal *pWal){
   int rc = SQLITE_OK;
-  int cnt;
 
   if( pWal->readLock==0 ){
     volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
     assert( pInfo->nBackfill==pWal->hdr.mxFrame );
     if( pInfo->nBackfill>0 ){
       u32 salt1;
-      sqlite3_randomness(4, &salt1);
+      sqlite3FastRandomness(&pWal->sPrng, 4, &salt1);
       rc = walLockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
       if( rc==SQLITE_OK ){
         /* If all readers are using WAL_READ_LOCK(0) (in other words if no
@@ -4037,21 +4284,21 @@ static int walRestartLog(Wal *pWal){
         ** to handle if this transaction is rolled back.  */
         walRestartHdr(pWal, salt1);
         walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
+        pWal->nPriorFrame = 0;
       }else if( rc!=SQLITE_BUSY ){
         return rc;
       }
     }
-    walUnlockShared(pWal, WAL_READ_LOCK(0));
-    pWal->readLock = -1;
-    cnt = 0;
-    do{
-      int notUsed;
-      rc = walTryBeginRead(pWal, &notUsed, 1, &cnt);
-    }while( rc==WAL_RETRY );
-    assert( (rc&0xff)!=SQLITE_BUSY ); /* BUSY not possible when useWal==1 */
-    testcase( (rc&0xff)==SQLITE_IOERR );
-    testcase( rc==SQLITE_PROTOCOL );
-    testcase( rc==SQLITE_OK );
+
+    /* Regardless of whether or not the wal file was restarted, change the
+    ** read-lock held by this client to a slot other than aReadmark[0]. 
+    ** Clients with a lock on aReadmark[0] read from the database file 
+    ** only - never from the wal file. This means that if a writer holding
+    ** a lock on aReadmark[0] were to commit a transaction but not close the
+    ** read-transaction, subsequent read operations would read directly from
+    ** the database file - ignoring the new pages just appended
+    ** to the wal file. */
+    rc = walUpgradeReadlock(pWal);
   }
   return rc;
 }
@@ -4190,7 +4437,7 @@ static int walWriteWalHeader(Wal *pWal, int szPage, int sync_flags){
     sqlite3Put4byte(&aWalHdr[4], WAL_MAX_VERSION);
     sqlite3Put4byte(&aWalHdr[8], szPage);
     sqlite3Put4byte(&aWalHdr[12], pWal->nCkpt);
-    if( pWal->nCkpt==0 ) sqlite3_randomness(8, pWal->hdr.aSalt);
+    if( pWal->nCkpt==0 ) sqlite3FastRandomness(&pWal->sPrng, 8, pWal->hdr.aSalt);
     memcpy(&aWalHdr[16], pWal->hdr.aSalt, 8);
     walChecksumBytes(1, aWalHdr, WAL_HDRSIZE-2*4, 0, aCksum);
     sqlite3Put4byte(&aWalHdr[24], aCksum[0]);
@@ -4976,7 +5223,7 @@ int sqlite3WalCheckpoint(
       if( pWal->hdr.mxFrame && walPagesize(pWal)!=nBuf ){
         rc = SQLITE_CORRUPT_BKPT;
       }else if( eMode2!=SQLITE_CHECKPOINT_NOOP ){
-        rc = walCheckpoint(pWal, db, eMode2, xBusy2, pBusyArg, sync_flags,zBuf);
+        rc = walCheckpoint(pWal, db, eMode2, xBusy2, pBusyArg, sync_flags, zBuf);
       }
 
       /* If no error occurred, set the output variables. */
@@ -5225,5 +5472,75 @@ int sqlite3WalFramesize(Wal *pWal){
 sqlite3_file *sqlite3WalFile(Wal *pWal){
   return pWal->pWalFd;
 }
+
+/* 
+** Return the values required by sqlite3_wal_info().
+*/
+int sqlite3WalInfo(Wal *pWal, u32 *pnPrior, u32 *pnFrame){
+  int rc = SQLITE_OK;
+  if( pWal ){
+    *pnFrame = pWal->hdr.mxFrame;
+    *pnPrior = pWal->nPriorFrame;
+  }
+  return rc;
+}
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+/*
+** Helper function to sqlite3WalStat().
+**
+** Append JSON-5 structure elements onto describing the current state
+** of pWal onto the end of pStr.  This function is for debugging and
+** analysis only and is not included in production builds.
+*/
+static void walIndexHdrStat(volatile WalIndexHdr *pHdr, sqlite3_str *pStr){
+  sqlite3_str_appendf(pStr, "iVersion:%u",pHdr->iVersion);
+  sqlite3_str_appendf(pStr, ",iChange:%u",pHdr->iChange);
+  sqlite3_str_appendf(pStr, ",isInit:%u",pHdr->isInit);
+  sqlite3_str_appendf(pStr, ",bigEndCksum:%u",pHdr->bigEndCksum);
+  sqlite3_str_appendf(pStr, ",szPage:%u",pHdr->szPage);
+  sqlite3_str_appendf(pStr, ",mxFrame:%u",pHdr->mxFrame);
+  sqlite3_str_appendf(pStr, ",nPage:%u",pHdr->nPage);
+#if 0  /* Not often needed.  Declutter. */
+  sqlite3_str_appendf(pStr, ",aFrameCksum:[0x%08x,0x%08x]",
+                      pHdr->aFrameCksum[0], pHdr->aFrameCksum[1]);
+  sqlite3_str_appendf(pStr, ",aSalt:[0x%08x,0x%08x]",
+                      pHdr->aSalt[0], pHdr->aSalt[1]);
+  sqlite3_str_appendf(pStr, ",aCksum:[0x%08x,0x%08x]",
+                      pHdr->aCksum[0], pHdr->aCksum[1]);
+#endif
+}
+#endif /* SQLITE_DEBUG || SQLITE_ENABLE_WALSTAT */
+
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_WALSTAT)
+/*
+** Append JSON-5 structure elements onto describing the current state
+** of pWal onto the end of pStr.  This function is for debugging and
+** analysis only and is not included in production builds.
+*/
+void sqlite3WalStat(Wal *pWal, sqlite3_str *pStr){
+  SEH_TRY {
+    int i;
+    volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+    volatile WalIndexHdr *pHdr = walIndexHdr(pWal);
+    sqlite3_str_appendf(pStr, "hdr0:{");
+    walIndexHdrStat(pHdr,pStr);
+    sqlite3_str_appendf(pStr, "},ckpt:{");
+    sqlite3_str_appendf(pStr, "nBackfill:%u",pInfo->nBackfill);
+    sqlite3_str_appendf(pStr, ",aReadMark:[%u", pInfo->aReadMark[0]);
+    for(i=1; i<WAL_NREADER; i++){
+      sqlite3_str_appendf(pStr, ",%u", pInfo->aReadMark[i]);
+    }
+    sqlite3_str_appendf(pStr, "],nBackfillAttempted:%u}", 
+                        pInfo->nBackfillAttempted);
+
+    sqlite3_str_appendf(pStr, ",nWiData:%d", pWal->nWiData);
+    sqlite3_str_appendf(pStr, ",readLock:%d", pWal->readLock);
+    sqlite3_str_appendf(pStr, ",minFrame:%u", pWal->minFrame);
+  }
+  SEH_EXCEPT( ; )
+}
+#endif /* SQLITE_DEBUG || SQLITE_ENABLE_WALSTAT */
 
 #endif /* #ifndef SQLITE_OMIT_WAL */

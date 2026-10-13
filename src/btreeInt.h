@@ -232,6 +232,7 @@
 typedef struct MemPage MemPage;
 typedef struct BtLock BtLock;
 typedef struct CellInfo CellInfo;
+typedef struct BtreePtrmap BtreePtrmap;
 
 /*
 ** This is a magic string that appears at the beginning of every
@@ -275,6 +276,9 @@ struct MemPage {
   u8 intKey;           /* True if table b-trees.  False for index b-trees */
   u8 intKeyLeaf;       /* True if the leaf of an intKey table */
   Pgno pgno;           /* Page number for this page */
+#ifndef SQLITE_OMIT_CONCURRENT
+  Pgno pgnoRoot;       /* Root page of b-tree that this page belongs to */
+#endif
   /* Only the first 8 bytes (above) are zeroed by pager.c when a new page
   ** is allocated. All fields that follow must be initialized before use */
   u8 leaf;             /* True if a leaf page */
@@ -456,6 +460,9 @@ struct BtShared {
   Btree *pWriter;       /* Btree with currently open write transaction */
 #endif
   u8 *pTmpSpace;        /* Temp space sufficient to hold a single cell */
+#ifndef SQLITE_OMIT_CONCURRENT
+  BtreePtrmap *pMap;
+#endif
   int nPreformatSize;   /* Size of last cell written by TransferRow() */
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
   u8 bfForceBaseFlush;  /* Phase 2: force CommitPhaseOne to flush BF records to
@@ -740,12 +747,19 @@ struct BtCursor {
 ** (sqliteMallocRaw), it is not possible to use conditional compilation.
 ** So, this macro is defined instead.
 */
-#ifndef SQLITE_OMIT_AUTOVACUUM
-#define ISAUTOVACUUM(pBt) (pBt->autoVacuum)
-#else
+#ifdef SQLITE_OMIT_AUTOVACUUM
 #define ISAUTOVACUUM(pBt) 0
+#else
+#define ISAUTOVACUUM(pBt) (pBt->autoVacuum)
 #endif
 
+#ifdef SQLITE_OMIT_CONCURRENT
+# define ISCONCURRENT 0
+#else
+# define ISCONCURRENT (pBt->pMap!=0)
+#endif
+
+#define REQUIRE_PTRMAP (ISAUTOVACUUM(pBt) || ISCONCURRENT)
 
 /*
 ** This structure is passed around through all the PRAGMA integrity_check

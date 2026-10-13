@@ -129,6 +129,33 @@ void sqlite3_randomness(int N, void *pBuf){
   sqlite3_mutex_leave(mutex);
 }
 
+/*
+** Initialize a fast PRNG.  A Fast PRNG is called "fast" because it does
+** not need a mutex to operate, though it does use a mutex to initialize.
+** The quality of the randomness is not as good as the global PRNG.
+*/
+void sqlite3FastPrngInit(FastPrng *pPrng){
+  sqlite3_randomness(sizeof(*pPrng), pPrng);
+  pPrng->x |= 1;
+}
+
+/*
+** Generate N bytes of pseudo-randomness using a FastPrng
+*/
+void sqlite3FastRandomness(FastPrng *pPrng, int N, void *P){
+  unsigned char *pOut = (unsigned char*)P;
+  while( N-->0 ){
+    /* "x" is a variant of LFSR called "Xorshift" by George Marsaglia */
+    pPrng->x ^= pPrng->x <<13;
+    pPrng->x ^= pPrng->x >>7;
+    pPrng->x ^= pPrng->x <<17;
+    /* "y" is a LCG using Don Kunth's constants from MMIX */
+    pPrng->y = (pPrng->y)*6364136223846793005LL + 1442695040888963407LL;
+    /* XOR the two streams together to give the final result */
+    *(pOut++) = (pPrng->x ^ pPrng->y) & 0xff;
+  }
+}
+
 #ifndef SQLITE_UNTESTABLE
 /*
 ** For testing purposes, we sometimes want to preserve the state of

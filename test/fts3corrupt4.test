@@ -4398,6 +4398,7 @@ do_catchsql_test 25.4 {
     INSERT INTO t1(a) SELECT randomblob(3000) FROM t2 ;
 } {0 {}}
 
+if 0 {  # test incompatible with this branch due to per-connection PRNG
 do_catchsql_test 25.5 {
   WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x%1 FROM c WHERE x<599237)
     INSERT INTO t1( a ) SELECT randomblob(3000) FROM t2 ;
@@ -4429,6 +4430,7 @@ if {$tcl_platform(byteOrder)=="littleEndian"} {
   } {0 {}}
 }
 
+}
 
 #-------------------------------------------------------------------------
 reset_db

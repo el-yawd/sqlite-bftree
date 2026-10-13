@@ -802,6 +802,7 @@ TESTSRC = \
   $(TOP)/ext/fts3/fts3_term.c \
   $(TOP)/ext/fts3/fts3_test.c  \
   $(TOP)/ext/session/test_session.c \
+  $(TOP)/ext/session/sqlite3changebatch.c \
   $(TOP)/ext/recover/sqlite3recover.c \
   $(TOP)/ext/recover/dbdata.c \
   $(TOP)/ext/recover/test_recover.c \

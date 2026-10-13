@@ -90,8 +90,10 @@ void sqlite3TableLock(
   u8 isWriteLock,    /* True for a write lock */
   const char *zName  /* Name of the table to be locked */
 ){
+#ifdef SQLITE_OMIT_CONCURRENT
   if( iDb==1 ) return;
   if( !sqlite3BtreeSharable(pParse->db->aDb[iDb].pBt) ) return;
+#endif
   lockTable(pParse, iDb, iTab, isWriteLock, zName);
 }
 
@@ -5254,7 +5256,7 @@ void sqlite3BeginTransaction(Parse *pParse, int type){
   }
   v = sqlite3GetVdbe(pParse);
   if( !v ) return;
-  if( type!=TK_DEFERRED ){
+  if( type==TK_IMMEDIATE || type==TK_EXCLUSIVE ){
     for(i=0; i<db->nDb; i++){
       int eTxnType;
       Btree *pBt = db->aDb[i].pBt;
@@ -5269,7 +5271,7 @@ void sqlite3BeginTransaction(Parse *pParse, int type){
       sqlite3VdbeUsesBtree(v, i);
     }
   }
-  sqlite3VdbeAddOp0(v, OP_AutoCommit);
+  sqlite3VdbeAddOp3(v, OP_AutoCommit, 0, 0, (type==TK_CONCURRENT));
 }
 
 /*
