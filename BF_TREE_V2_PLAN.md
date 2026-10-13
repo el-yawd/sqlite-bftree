@@ -2974,3 +2974,12 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   commit (fresh block per flush, no in-place rewrite), page index by LSN, mini-page region +
   fuzzy checkpoint, per-page LSN as an optimisation only.  Stages C1-C5 (C1-C2 carry the
   thesis claim).  write-path.md marked superseded.  Awaiting owner decisions (section 13).
+- begin-concurrent-exp is now THE working branch (worktree removed; main checkout switched).
+  SUTs: every plain SUT builds with -DSQLITE_OMIT_CONCURRENT; new stock_bc / bf_bc keep BEGIN
+  CONCURRENT (build_suts.sh); runner/report treat stock* alike and add a bf_bc/stock_bc table.
+- Stock equivalence after the merge: CORRECTNESS done -- pristine 3.52.0 shell vs merged-tree
+  stock (OMIT_CONCURRENT): 45 generated workloads (12 generators x seeds), byte-identical output.
+  PERFORMANCE pending (owner: no benchmarks on this machine for now).  A first 4 s pass
+  (configs/equiv_bc.json, unquotable: powersave, spreads to 91%) showed a possible systematic
+  write-path difference (ycsb_a p99.9 0.7 ms pristine vs 11 ms merged stocks) -- to settle with
+  a pre-merge stock (`26c168be8`) in the same run.  Pristine build kept at ../.pristine352.

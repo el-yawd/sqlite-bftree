@@ -18,6 +18,13 @@
 #   bf_nowbdel    -DSQLITE_BF_NO_WRITEBACK_DELETE
 #   bf_noshortcut -DSQLITE_BF_NO_DESCENT_SHORTCUT
 #   bf_nocompact  -DSQLITE_BF_NO_MINIPAGE_COMPACT
+#   stock_bc      -DSQLITE_OMIT_BF_CACHE, BEGIN CONCURRENT compiled in
+#   bf_bc         Phase 2 default, BEGIN CONCURRENT compiled in
+#
+# BEGIN CONCURRENT (upstream branch, merged 2026-10-13, 78a63a25a): every SUT
+# except *_bc is built with -DSQLITE_OMIT_CONCURRENT ($PLAIN), so the plain
+# comparison is stock-vs-bf exactly as before the merge, and the concurrent one
+# is stock_bc-vs-bf_bc.  Both pairs come from the one amalgamation.
 #   bf_noshed     -DSQLITE_BF_NO_UPGRADE_SHED     upgrades keep cold records (pre-2026-10-06)
 #   bf_nofull     -DSQLITE_BF_NO_FULL_PAGE        M2: no full-page (BF_LOC_FULL) copies
 #   bf_noscan     -DSQLITE_BF_NO_SCAN_PROMOTION   M3: scans promote records at the read rate
@@ -84,30 +91,33 @@ build_one() { # $1=name  $2=extra flags
 }
 
 echo "==> compiling SUTs into $OUT"
-build_one stock "-DSQLITE_OMIT_BF_CACHE"
-build_one bf    "-DSQLITE_BF_INSERT_BUFFERING"
-build_one bf_ro ""
+PLAIN="-DSQLITE_OMIT_CONCURRENT"
+build_one stock    "$PLAIN -DSQLITE_OMIT_BF_CACHE"
+build_one bf       "$PLAIN -DSQLITE_BF_INSERT_BUFFERING"
+build_one bf_ro    "$PLAIN"
+build_one stock_bc "-DSQLITE_OMIT_BF_CACHE"
+build_one bf_bc    "-DSQLITE_BF_INSERT_BUFFERING"
 
 if [ "$ALL" = 1 ]; then
-  build_one bf_nomerge    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MERGE_SCAN"
-  build_one bf_nowbdel    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_WRITEBACK_DELETE"
-  build_one bf_noshortcut "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_DESCENT_SHORTCUT"
-  build_one bf_nocompact  "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MINIPAGE_COMPACT"
+  build_one bf_nomerge    "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MERGE_SCAN"
+  build_one bf_nowbdel    "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_WRITEBACK_DELETE"
+  build_one bf_noshortcut "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_DESCENT_SHORTCUT"
+  build_one bf_nocompact  "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MINIPAGE_COMPACT"
   # Since 2026-10-06 upgrades shed cold records by default, as the reference.
-  build_one bf_noshed     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPGRADE_SHED"
+  build_one bf_noshed     "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPGRADE_SHED"
   # D3 ablations (2026-09-30): existing-row UPDATE buffering, blind REPLACE.
-  build_one bf_noupd      "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPDATE_BUFFER"
-  build_one bf_noblind    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_BLIND_INSERT"
+  build_one bf_noupd      "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_UPDATE_BUFFER"
+  build_one bf_noblind    "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_BLIND_INSERT"
   # M2 ablation (2026-10-03): leaves are never copied whole into the ring.
-  build_one bf_nofull     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_FULL_PAGE"
+  build_one bf_nofull     "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_FULL_PAGE"
   # M3 ablation (2026-10-05): scan rows promote records (pre-M3), no per-leaf dice.
-  build_one bf_noscan     "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_SCAN_PROMOTION"
+  build_one bf_noscan     "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_SCAN_PROMOTION"
   # Item 4 ablations (2026-10-06): dirty/write-path copy-on-access, lower-bound REF.
-  build_one bf_nodirtycoa "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_DIRTY_COA"
-  build_one bf_nolbref    "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_LOWER_BOUND_REF"
+  build_one bf_nodirtycoa "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_DIRTY_COA"
+  build_one bf_nolbref    "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_LOWER_BOUND_REF"
   # M5 ablation (2026-10-07): no 2048 B mini-page cap; growth to 4096 as before.
-  build_one bf_nocap      "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MINI_CAP"
-  build_one bf_fullinval  "-DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_INCR_INVALIDATE"
+  build_one bf_nocap      "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_MINI_CAP"
+  build_one bf_fullinval  "$PLAIN -DSQLITE_BF_INSERT_BUFFERING -DSQLITE_BF_NO_INCR_INVALIDATE"
 fi
 
 # bf_off is the same binary as bf; the runner passes --bf-cache off.

@@ -332,7 +332,7 @@ def build_argv(run, dbpath, jsonpath, page_floor):
         argv += ["--direct-io"]
 
     # --- the memory split: identical totals, different spending -------------
-    if sut == "stock":
+    if sut.startswith("stock"):     # stock, stock_bc (BEGIN CONCURRENT)
         argv += ["--page-cache-bytes", str(budget)]
     elif sut == "bf_off":
         # BF compiled in but switched off: same page-cache budget as stock, so
@@ -647,7 +647,8 @@ def main():
         # this harness ever compared the request against what the build
         # reports, which is how an entire campaign ran at half the configured
         # record-cache size without a single warning.  Check it every run.
-        if record.get("run") and r["sut"] not in ("stock", "bf_off"):
+        if record.get("run") and r["sut"] != "bf_off" \
+                and not r["sut"].startswith("stock"):
             got = ((record["run"].get("result") or {}).get("bf") or {}) \
                     .get("buffer_size")
             want = r["mem_split"]["ring"]

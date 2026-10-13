@@ -350,7 +350,7 @@ def main():
         # the columns that tell a win from a coincidence: a throughput change
         # with a flat ring size and a flat buffered% is not a record-cache
         # effect.  cb_capacity, cached_records and upgrades are GAUGES.
-        bf_suts = [s for s in suts if s != "stock"]
+        bf_suts = [s for s in suts if not s.startswith("stock")]
         det = [(ax, s, groups[(exp, ax, s)]) for ax in axes for s in bf_suts
                if (exp, ax, s) in groups
                and any(m["bf_ring_MiB"] is not None or m["bf_buffered_pct"] is not None
@@ -397,16 +397,20 @@ def main():
         # campaigns gave 9913 / 11652 / 8102 ops/s (23% spread), so a before /
         # after taken from two results directories means nothing.  Both
         # baselines therefore have to be SUTs inside the same run.
-        for base in ("stock", "bf_pre"):
-            if "bf" not in suts or base not in suts:
+        # bf_bc/stock_bc: the same comparison with BEGIN CONCURRENT compiled
+        # into both (build_suts.sh); never cross the two pairs.
+        for sut_bf, base in (("bf", "stock"), ("bf", "bf_pre"),
+                             ("bf_bc", "stock_bc")):
+            if sut_bf not in suts or base not in suts:
                 continue
             W("")
-            W("| config | ops/s bf/%s | p50 %s/bf | p99 %s/bf | "
-              "read bytes/op %s/bf | WAL B/commit %s/bf |"
-              % (base, base, base, base, base))
+            W("| config | ops/s %s/%s | p50 %s/%s | p99 %s/%s | "
+              "read bytes/op %s/%s | WAL B/commit %s/%s |"
+              % (sut_bf, base, base, sut_bf, base, sut_bf, base, sut_bf,
+                 base, sut_bf))
             W("|---|---|---|---|---|---|")
             for ax in axes:
-                b = groups.get((exp, ax, "bf"))
+                b = groups.get((exp, ax, sut_bf))
                 st = groups.get((exp, ax, base))
                 if not b or not st:
                     continue

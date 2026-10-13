@@ -1,0 +1,56 @@
+{
+  "name": "equiv_bc",
+  "_comment": [
+    "Engine equivalence after the BEGIN CONCURRENT merge (2026-10-13): pristine",
+    "3.52.0 stock (bfbench_stock352, built by hand from tag 2c93b1d) vs the merged",
+    "tree's stock (OMIT_CONCURRENT) vs stock_bc (concurrency compiled in, unused).",
+    "All three must match within noise for the plain stock-vs-bf comparison to keep",
+    "its meaning.  Same dataset and knobs as smoke.json; 3 interleaved repeats.",
+    "Second pass: stockpre = stock from the merge's parent 26c168be8 (hand-built), 15 s runs."
+  ],
+  "datasets": {
+    "small": {
+      "records": 2000000,
+      "value_len": 100,
+      "key_spacing": 16
+    }
+  },
+  "defaults": {
+    "dataset": "small",
+    "suts": [
+      "stock352",
+      "stockpre",
+      "stock",
+      "stock_bc"
+    ],
+    "repeats": 3,
+    "seconds": 15,
+    "warmup_seconds": 3,
+    "dist": "zipf",
+    "theta": 0.9,
+    "budget_bytes": "32M",
+    "memmax": "384M",
+    "synchronous": "normal",
+    "journal": "wal",
+    "ops_per_txn": 1,
+    "drop_cache": true
+  },
+  "experiments": [
+    {
+      "name": "point_read",
+      "workload": "read=100"
+    },
+    {
+      "name": "update",
+      "workload": "update=100"
+    },
+    {
+      "name": "insert",
+      "workload": "insert=100"
+    },
+    {
+      "name": "ycsb_a",
+      "workload": "read=50,update=50"
+    }
+  ]
+}
