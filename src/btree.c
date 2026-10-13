@@ -6652,6 +6652,9 @@ int sqlite3BtreeTableMoveto(
  && !defined(SQLITE_BF_NO_PROBE_MEMO)
   Pgno bfAbsentPg = 0;      /* H2: the shortcut found NO record here (leaf) */
 #endif
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  int bfExactOp;             /* exact-match probe: dirty op on the leaf, or -1 */
+#endif
 
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
@@ -6775,6 +6778,13 @@ int sqlite3BtreeTableMoveto(
             return SQLITE_OK;
           }
 #endif
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+          /* One mini-page probe answers both questions below -- a tombstone
+          ** and a shadowing insert -- where there used to be two (2026-10-13:
+          ** the pair was ~10% of a buffered-UPDATE commit's cycles). */
+          bfExactOp = (pCur->curFlags & BTCF_BfLeaf)==0
+                ? sqlite3BfBtreeKeyDirtyOpAny(pCur, pPage->pgno, intKey) : -1;
+#endif
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING) \
  && !defined(SQLITE_BF_NO_WRITEBACK_DELETE)
           /* Write-back delete (Stage 2.3): the base cell physically exists but
@@ -6786,8 +6796,7 @@ int sqlite3BtreeTableMoveto(
           ** shared bf_status==2 handling never sees it; check here.  Skipped for
           ** BF-served cursors (no physical leaf) — KeyTombstoned no-ops fast
           ** (one map lookup) when the leaf has no mini-page or BF is off/bypass. */
-          if( (pCur->curFlags & BTCF_BfLeaf)==0
-           && sqlite3BfBtreeKeyTombstoned(pCur, pPage->pgno, intKey) ){
+          if( bfExactOp==BFOP_DELETE ){
             /* Report not-found, and DROP the exact-key claim: the cursor is
             ** physically parked on the (tombstoned) cell, but leaving
             ** BTCF_ValidNKey + info.nKey==intKey set would make the insert
@@ -6810,9 +6819,7 @@ int sqlite3BtreeTableMoveto(
           ** Not while the shortcut is suppressed: those seeks position for
           ** iteration over a table the caller has just materialised, or
           ** re-descend a BF-served cursor onto its physical cell to step it. */
-          if( (pCur->curFlags & BTCF_BfLeaf)==0
-           && sqlite3BfBtreeKeyDirtyOp(pCur, pPage->pgno, intKey)==BFOP_INSERT
-          ){
+          if( bfExactOp==BFOP_INSERT ){
             BfCache *pBfSh = btreeGetBfCache(pCur->pBt);
             if( pBfSh && !pBfSh->bShortcutSuppressed ){
               int rcSh = btreeBfParkOnMini(pCur, intKey);

@@ -964,7 +964,7 @@ SQLITE_PRIVATE int sqlite3BfBtreeKeyTombstoned(BtCursor *pCur, Pgno leaf,
 #if defined(SQLITE_BF_INSERT_BUFFERING)
 /* D3-core: the DIRTY op (BFOP_INSERT / BFOP_DELETE) buffered for rowid on leaf,
 ** or -1 when the leaf holds no dirty record for it. */
-SQLITE_PRIVATE int sqlite3BfBtreeKeyDirtyOp(BtCursor *pCur, Pgno leaf, i64 rowid);
+SQLITE_PRIVATE int sqlite3BfBtreeKeyDirtyOpAny(BtCursor *pCur, Pgno leaf, i64 rowid);
 /* D3b: the known-leaf bitmap (BfCache.aLeafBit) and the blind upsert. */
 SQLITE_PRIVATE void sqlite3BfLeafBitSet(BfCache *pBf, u32 pgno);
 SQLITE_PRIVATE void sqlite3BfLeafBitClear(BfCache *pBf, u32 pgno);

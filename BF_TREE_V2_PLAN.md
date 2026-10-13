@@ -2897,3 +2897,38 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   some page frames) vs stock's 1.0 -> 25% MORE WAL bytes for 1-row commits under the locked
   page-sized frames.  Reader-only gap at E=10 (254k vs 295k/s) = catch-up preads + replay.
   Not profiled yet (a perf run sampled setup code only; redo with the loop isolated).
+
+### 2026-10-13 — Claude Opus 5.5 — writes: commit-path profile, merge-on-full (branch `writes-commit-path`)
+
+- Method: writer-only loop (100k rows x 100 B, one 1-row UPDATE per commit, prepared, pinned
+  to a P-core).  Wall time on this laptop swings +-10% run to run, `perf stat` instruction
+  counts multiplex on the hybrid CPU (not deterministic), callgrind is exact but counts
+  `rep stos` per byte (a 4 KB memset shows as ~4k instr).  So: callgrind for exact deltas,
+  perf cycles restricted to the measured loop (setup excluded) for attribution.
+- `3c6fa09` merge-on-full: a buffered write refused because the target leaf's own mini-page is
+  full now merges THAT leaf and retries (the reference's behaviour) instead of flushing the
+  whole table (~2,500 leaves, 9% of writer CPU).  Page frames 13,528 -> 5,928 per 100k commits.
+  Ablation SQLITE_BF_NO_LEAF_MERGE; counters leaf_merge, leaf_merge_escalate.
+- LATENT BUG found and closed: any single-leaf merge (item 3's merge-on-eviction too) can run
+  balance_nonroot over a sibling that still holds dirty records; they stay keyed to the sibling
+  while their base cells may move, and a point read returns the older base value.  New counter
+  dirty_balance (ForgetPage); every single-leaf merge escalates to the table sweep when it
+  moves.  Observed: 1 in a 30k-commit run with a 256 KiB ring.  The btree.c:9761 comment had
+  named the gap since Phase 1 ("will need re-routing here").
+- Exact-match seek: one mini-page probe answers tombstone + shadow (was two searches);
+  -252 instr/commit.  Dead sqlite3BfBtreeKeyDirtyOp removed.
+- Where the writer gap is (autocheckpoint OFF): stock 10,989 instr/commit, BF ~20,100.
+  Per-commit real time beyond stock: the seek probe's first touch of a cold mini-page (~1.3 us
+  incl. IsDirty -- structural: an update touches the leaf AND its mini-page), own-frame index
+  ingestion ~0.6 us (cold per-page op arrays that grow without bound while the log never
+  restarts; also heap outside the BF budget), merges 0.36 us (real write-back), LogAllDirty
+  0.34 us (serialisation).
+- With the DEFAULT autocheckpoint (1000) the picture is different: stock 3.25 us/commit, BF
+  10.19 us (3.1x).  bfCheckpointMaterialize = 3.4 us/commit: every checkpoint applies every
+  dirty leaf (~2,500) as WAL page frames, then backfills them.  Checkpoint architecture is the
+  dominant write cost, not the commit path.  Per the agreed order it waits for the threaded
+  driver + direct-I/O measurement.  Note for that decision: records surviving a log restart
+  (#2) does NOT need sub-page frames -- re-logging the still-dirty records into the new
+  generation packs ~34 x 120 B records per 4 KB frame (2,500 records ~ 75 frames vs 2,500 page
+  frames today), so it may fit the locked page-sized-frame format.
+- Gate --full GREEN (both commits); mconn sweep 104 + 48 runs clean; bench/mconn_sweep.sh added.

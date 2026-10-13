@@ -1732,16 +1732,23 @@ int sqlite3BfBtreeKeyTombstoned(BtCursor *pCur, Pgno leaf, i64 rowid){
 ** wins, as in the reference, whose insert is an upsert (mini_page_op.rs:474).
 ** The merge scans already honour that (bfMergePick: insKey==baseKey); the point
 ** seek's exact-match exit asks this function, and parks on the mini-page record
-** when the answer is BFOP_INSERT.  Returns the dirty op or -1.
+** when the answer is BFOP_INSERT.
+**
+** Since 2026-10-13 the same probe also answers the tombstone question
+** (BFOP_DELETE: report the row absent), which the exact-match exit used to ask
+** sqlite3BfBtreeKeyTombstoned separately -- two searches of one mini-page, ~10%
+** of a buffered-UPDATE commit's cycles.  Returns BFOP_INSERT, BFOP_DELETE or
+** -1.  Gated on the mini-page's O(1) dirty flag only, not bDirtyInserts:
+** KeyTombstoned never consulted that one, and a tombstone must not be missed.
 */
-int sqlite3BfBtreeKeyDirtyOp(BtCursor *pCur, Pgno leaf, i64 rowid){
+int sqlite3BfBtreeKeyDirtyOpAny(BtCursor *pCur, Pgno leaf, i64 rowid){
   BfCache    *pBf;
   BfMapEntry *pEntry;
   u8          keyBuf[8], op = 0;
 
   if( !pCur || !pCur->pBt || leaf<=1 ) return -1;
   pBf = btreeGetBfCache(pCur->pBt);
-  if( !pBf || !pBf->bDirtyInserts ) return -1;   /* no dirty record anywhere */
+  if( !pBf ) return -1;
   pEntry = sqlite3BfMapLookup(pBf, leaf);
   if( !pEntry || pEntry->locType!=BF_LOC_MINI || !pEntry->pPage ) return -1;
   if( !sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage) ) return -1;
