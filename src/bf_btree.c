@@ -3176,16 +3176,18 @@ void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno){
 ** cache is keyed by pgno and relocation would orphan/corrupt it.  BF is disabled
 ** outright for auto-vacuum databases (btreeUsesBfCache), so this must hold; the
 ** assert in relocatePage catches any future regression that re-enables BF there.
-** Returns 1 if a mini-page is mapped under pgno, else 0.
+** Returns 1 if a DIRTY mini-page is mapped under pgno, else 0 (clean ones are
+** forgotten by relocatePage: BEGIN CONCURRENT commits renumber pages too).
 */
-int sqlite3BfBtreeDebugHasMiniPage(BtShared *pBt, Pgno pgno){
+int sqlite3BfBtreeDebugHasDirtyMiniPage(BtShared *pBt, Pgno pgno){
   BfCache    *pBf;
   BfMapEntry *pEntry;
   if( !pBt ) return 0;
   pBf = sqlite3PagerGetBfCache(pBt->pPager);
   if( !pBf ) return 0;
   pEntry = sqlite3BfMapLookup(pBf, pgno);
-  return (pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage) ? 1 : 0;
+  return (pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage
+          && sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage)) ? 1 : 0;
 }
 #endif /* SQLITE_DEBUG */
 
@@ -3628,6 +3630,76 @@ static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
     bfRsFitAdd((BfRsCtx*)pCtx, leaf, pKey, nKey, nVal, op);
   }
   return 0;
+}
+
+/*
+** C1 (2026-10-17): a BEGIN CONCURRENT commit may RENUMBER the pages it
+** allocated at the end of the file (btreeFixUnlocked: another transaction
+** committed the same page numbers), after validation and after its records
+** were logged -- and BF keys records by leaf page number.  bench/mt_oracle.c,
+** debug build: relocatePage met a mini-page on the page it was moving.  A
+** record logged under the old number would replay onto the other
+** transaction's page, and this cache would keep it keyed there.
+**
+** So the commit first merges every dirty mini-page of a page this transaction
+** allocated (pgno >= iFirst, the file size at its snapshot + 1) into that page:
+** the rows then move with the page image.  Done before validation, from
+** sqlite3BtreeExclusiveLock, so whatever the merge writes is validated like
+** any page write of the transaction.  The CLEARs of those pages are dropped:
+** a page this transaction allocated had no committed op keyed to it (a freed
+** page's records were flushed, with a CLEAR, when it was freed), and a CLEAR
+** logged under a number that then changes would erase the other transaction's
+** records on its page.
+*/
+typedef struct BfNewPgCtx BfNewPgCtx;
+struct BfNewPgCtx { u32 iFirst; u32 *a; int n, nAlloc; int bOom; };
+static int bfNewPgCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
+  BfNewPgCtx *c = (BfNewPgCtx*)pCtx;
+  if( pgno<c->iFirst || pEntry->locType!=BF_LOC_MINI || pEntry->pPage==0 ) return 0;
+  if( !sqlite3BfMiniPageIsDirty((BfMiniPage*)pEntry->pPage) ) return 0;
+  if( c->n>=c->nAlloc ){
+    int nNew = c->nAlloc ? c->nAlloc*2 : 16;
+    u32 *aNew = (u32*)sqlite3_realloc64(c->a, (u64)nNew*sizeof(u32));
+    if( aNew==0 ){ c->bOom = 1; return 1; }
+    c->a = aNew;
+    c->nAlloc = nNew;
+  }
+  c->a[c->n++] = pgno;
+  return 0;
+}
+int sqlite3BfBtreeFlushNewPages(Btree *p, u32 iFirst){
+  BfCache *pBf;
+  BfNewPgCtx c;
+  int i, j;
+  if( p==0 || p->pBt==0 || p->inTrans!=TRANS_WRITE ) return SQLITE_OK;
+  pBf = btreeGetBfCache(p->pBt);
+  if( pBf==0 ) return SQLITE_OK;
+  memset(&c, 0, sizeof(c));
+  c.iFirst = iFirst;
+  sqlite3BfMapIterate(pBf, bfNewPgCallback, &c);
+  if( c.bOom ){ sqlite3_free(c.a); return SQLITE_NOMEM_BKPT; }
+  for(i=0; i<c.n; i++){
+    BfMapEntry *pEntry = sqlite3BfMapLookup(pBf, c.a[i]);
+    BfMiniPage *pMini;
+    u64 nBal;
+    Pgno root;
+    if( pEntry==0 || pEntry->locType!=BF_LOC_MINI || pEntry->pPage==0 ) continue;
+    pMini = (BfMiniPage*)pEntry->pPage;
+    if( !sqlite3BfMiniPageIsDirty(pMini) || pMini->rootPgno<=1 ) continue;
+    root = (Pgno)pMini->rootPgno;
+    nBal = pBf->nDirtyBalance;
+    if( bfFlushOneMiniPage(pBf, p, root, pMini)!=SQLITE_OK ) break;
+    bfEscalateIfMisplaced(pBf, p, root, nBal);
+  }
+  sqlite3_free(c.a);
+  /* No CLEAR for a page this transaction allocated (see above). */
+  for(i=j=0; i+1<pBf->nFlushed; i+=2){
+    if( pBf->aFlushed[i]>=iFirst ) continue;
+    pBf->aFlushed[j++] = pBf->aFlushed[i];
+    pBf->aFlushed[j++] = pBf->aFlushed[i+1];
+  }
+  pBf->nFlushed = j;
+  return SQLITE_OK;
 }
 
 /*

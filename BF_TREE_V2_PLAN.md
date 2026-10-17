@@ -3102,3 +3102,40 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - Correctness: gate --full GREEN 54/54; mconn 96/96; mwriter 576 release + 96 SQLITE_DEBUG runs.
 - Next: C2b, durable group commit across in-process BEGIN CONCURRENT writers (needs a threaded
   driver; see docs/design/concurrent-engine.md section 3.2).
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — C2b step 1: a threaded oracle, and three concurrency bugs it found
+
+- **New oracle `bench/mt_oracle.c` + `bench/mt_sweep.sh`** (gate: `mt:release`, quick 1 seed / full
+  4 seeds x 8 configurations): T threads, own connection each, BEGIN CONCURRENT bank transfers
+  with retry, 3% `PRAGMA wal_checkpoint`, 12% read-only snapshot sums; invariants: constant
+  total in every snapshot, final balances equal what the per-thread commit logs moved, hist rows
+  = exactly the committed transfers, integrity_check, all again after a reopen.  mwriter
+  interleaves on one thread, so none of the bugs below was reachable by it.  `MT_LOG=1` prints
+  `sqlite3_log`.  Stock+BC passes (validates the oracle); at 4 threads BF retries 4-5x less
+  than stock (row-level validation, real threads; not a benchmark).
+- **Bug 1 -- checkpoint backfilled unmaterialised record frames (committed-data loss).**  The
+  checkpoint materialise commit flushes every buffered record into pages under the write lock,
+  then releases it and backfills up to the CURRENT head.  Record frames are kept out of the
+  wal-index, so the backfill simply skips them -- including record frames another connection
+  committed after the materialise, which are in no page.  nBackfill==mxFrame then allows a log
+  restart, which erases them.  Needs only a checkpoint racing a commit: a reader's checkpoint
+  (e.g. at close) beside a single writer hits it too.  Fix: `Wal.bBfCkptCap` -- the materialise
+  commit sets a cap (its own frame, `sqlite3WalBfSetCkptCap`); `walCheckpoint` backfills no
+  further; a restart since then caps at 0.
+- **Bug 2 -- catch-up read frames a writer was overwriting (SQLITE_CORRUPT, line 83988).**  A
+  snapshot on WAL read-mark 0 reads the db file only (log fully backfilled), so a writer may
+  restart the log meanwhile; `sqlite3WalBfCatchUp` still read those frames and found another
+  generation's salt.  Fix: at read-mark 0 forget the record index instead of reading -- with bug
+  1 fixed every record op there is in a page.
+- **Bug 3 -- BEGIN CONCURRENT renumbers pages after their records were logged.**  When another
+  transaction committed the same new page numbers, `btreeFixUnlocked` relocates this
+  transaction's new pages (relocatePage), AFTER `LogAllDirty` logged records keyed to their old
+  numbers -- which replay onto the other transaction's pages (debug assert in relocatePage).
+  Fix: `sqlite3BfBtreeFlushNewPages`, from `sqlite3BtreeExclusiveLock` before validation, merges
+  every dirty mini-page of a page >= `pMap->iFirst` into it and drops those pages' CLEARs (no
+  committed op can be keyed to a page this transaction allocated; a CLEAR under a number that then
+  changes would erase the other transaction's records); relocatePage forgets clean BF state for
+  both numbers.
+- Results: before, ~7% of 4-thread release runs failed (bugs 1/2) and 3 of 200 debug runs
+  asserted (bug 3).  After: gate --full 55/55; mt 240 release + 160 SQLITE_DEBUG runs, 0 failed;
+  mconn 96/96; mwriter 384 runs.  Not yet run: ThreadSanitizer over mt_oracle (next).

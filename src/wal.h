@@ -54,6 +54,7 @@
 #  define sqlite3WalBfMxFrame(x)                 0
 #  define sqlite3WalBfPrune(x)
 #  define sqlite3WalBfPrunePending(x)            0
+#  define sqlite3WalBfSetCkptCap(x)
 #  define sqlite3WalBfStageTake(x,y,z)           (*(y)=0, *(z)=0)
 # endif
 # undef SQLITE_USE_SEH
@@ -120,6 +121,7 @@ void sqlite3WalBfStageClear(Wal *pWal);
 ** forward-declared so callers need not include bf_wal.h. */
 typedef struct BfWalIndex BfWalIndex;
 BfWalIndex *sqlite3WalBfIndex(Wal *pWal);
+void sqlite3WalBfSetCkptCap(Wal *pWal);
 int sqlite3WalBfCatchUp(Wal *pWal);
 void sqlite3WalBfSnapshot(Wal *pWal, u32 *aOut);
 int sqlite3WalBfTouched(Wal *pWal, const u32 *aOld, u32 **paPg, int *pnPg);

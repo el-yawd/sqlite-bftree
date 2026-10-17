@@ -4531,6 +4531,12 @@ int sqlite3PagerBfTouched(Pager *pPager, const u32 *aOld, u32 **paPg, int *pnPg)
   *pnPg = 0;
   return 0;
 }
+/* A checkpoint materialise just committed: cap the backfill at its frame. */
+void sqlite3PagerBfSetCkptCap(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) sqlite3WalBfSetCkptCap(pPager->pWal);
+#endif
+}
 /* C2a: pages spilled to the log so far (a spill leaves the dirty list). */
 u64 sqlite3PagerBfSpillCount(Pager *pPager){
   return pPager ? (u64)pPager->aStat[PAGER_STAT_SPILL] : 0;

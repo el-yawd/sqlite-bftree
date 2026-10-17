@@ -23,13 +23,15 @@ Tasks, per tier (quick = fewer seeds):
   ring        ring_repro.sh (full tier only: needs the harness dataset)
   stale_ckpt  stale_ckpt_repro.c: a stale-cache checkpoint must not erase another
               connection's committed record frames (2026-10-13)
+  mt          mt_sweep.sh (BEGIN CONCURRENT on real threads, invariant oracle):
+              quick = 1 seed, full = 4 seeds, 8 configurations each
   mwriter     mwriter_sweep.sh (BEGIN CONCURRENT, K writers, serialisability model):
               quick = 2 seeds x {plain, checkcommit}; full = 4 seeds x {plain,
               checkcommit, norange} + SQLITE_DEBUG 2 seeds
 
 Needs build/{sqlite3, sqlite3_buf, sqlite3_stock, sqlite3_dbg, sqlite3.c}; the
 power-loss driver is compiled into build/plvfs when sqlite3.c is newer than it.
-The stale_ckpt and mwriter drivers are compiled per run, inside their tasks, from
+The stale_ckpt, mwriter and mt drivers are compiled per run, inside their tasks, from
 a snapshot of sqlite3.c (so they overlap difftest and can never be stale).
 """
 import argparse, os, shutil, subprocess, sys, tempfile, time
@@ -151,6 +153,14 @@ def main():
     else:
         add("mwriter:release", f"{mw} && SEEDS=1 SEEDE=2 MODES='plain checkcommit' "
                                f"bash {BENCH}/mwriter_sweep.sh {work}/mw_bf")
+    # mt: REAL threads (bench/mt_oracle.c), the only check that runs commits,
+    # checkpoints and catch-ups at the same time.  Timing-dependent: a race
+    # shows in a few percent of runs, so it is a net, not a proof.
+    mt = ccdrv("mt_bf", "mt_oracle.c", "-O1 -g")
+    if full:
+        add("mt:release", f"{mt} && SEEDS=1 SEEDE=4 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
+    else:
+        add("mt:release", f"{mt} && SEEDS=1 SEEDE=1 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
 
     print(f"gate: {'FULL' if full else 'quick'} tier, {len(tasks)} tasks, "
           f"{a.jobs} workers, snapshot in {work}", flush=True)

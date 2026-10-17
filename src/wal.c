@@ -562,6 +562,17 @@ struct Wal {
   u64 nBfPageFrame;         /* Page-image frames written to the WAL */
   u64 nBfCommit;            /* Commit frames (transactions) written to the WAL */
   u8 bBfPrune;              /* pBfWal may hold ops past mxFrame (after undo) */
+  /* Checkpoint cap (2026-10-17): the frame of this connection's checkpoint
+  ** materialise commit, in the generation aBfCkptSalt.  Record frames are never
+  ** backfilled -- the checkpoint skips them -- so frames past the materialise
+  ** commit, which other connections may have committed after it released the
+  ** write lock, hold records that are in no page yet.  walCheckpoint must not
+  ** count them as backfilled, or the next log restart erases them
+  ** (bench/mt_oracle.c).  Set by sqlite3WalBfSetCkptCap, consumed by the next
+  ** sqlite3WalCheckpoint. */
+  u8 bBfCkptCap;
+  u32 iBfCkptCap;
+  u32 aBfCkptSalt[2];
   /* Cross-connection catch-up (2026-10-12).  pBfWal covers every frame <=
   ** iBfIngested of the WAL generation whose salt is aBfSalt.  A connection
   ** that did not run recovery, or that another connection's commits have
@@ -2350,6 +2361,15 @@ static int walCheckpoint(
     */
     mxSafeFrame = pWal->hdr.mxFrame;
     mxPage = pWal->hdr.nPage;
+#ifndef SQLITE_OMIT_BF_CACHE
+    if( pWal->bBfCkptCap ){
+      /* Only what the materialise commit covered (see Wal.bBfCkptCap).  A log
+      ** restart since then leaves nothing covered. */
+      u32 cap = memcmp(pWal->aBfCkptSalt, pWal->hdr.aSalt, 8)==0
+                  ? pWal->iBfCkptCap : 0;
+      if( mxSafeFrame>cap ) mxSafeFrame = cap;
+    }
+#endif
     for(i=1; i<WAL_NREADER; i++){
       u32 y = AtomicLoad(pInfo->aReadMark+i); SEH_INJECT_FAULT;
       if( mxSafeFrame>y ){
@@ -5001,6 +5021,14 @@ static void walBfTouch(Wal *pWal, u32 pgno){
   pWal->aBfTouch[pWal->nBfTouch++] = pgno;
 }
 
+/* The materialise commit just made frames <= mxFrame safe to backfill. */
+void sqlite3WalBfSetCkptCap(Wal *pWal){
+  if( pWal==0 ) return;
+  pWal->bBfCkptCap = 1;
+  pWal->iBfCkptCap = pWal->hdr.mxFrame;
+  memcpy(pWal->aBfCkptSalt, pWal->hdr.aSalt, 8);
+}
+
 int sqlite3WalBfCatchUp(Wal *pWal){
   u32 iFrame;
   u8 *aFrame;
@@ -5025,6 +5053,21 @@ int sqlite3WalBfCatchUp(Wal *pWal){
     pWal->bBfTouchOk = 0;    /* a gap: the list would not cover every change */
   }
   if( pWal->iBfIngested>=pWal->hdr.mxFrame ) return SQLITE_OK;
+  if( pWal->readLock==0 ){
+    /* A snapshot on read-mark 0 reads the database file only: every frame of
+    ** the log is backfilled, and a writer may restart the log -- overwrite
+    ** these very frames -- while we read them (2026-10-17, mt_oracle: the
+    ** salt test below then reported SQLITE_CORRUPT).  Nothing in them is
+    ** needed: a checkpoint backfills only frames its materialise covered
+    ** (Wal.bBfCkptCap), so every record op here is in a page already.  Forget
+    ** the index; the cache rebuild finds no buffered record, as it should. */
+    sqlite3BfWalIndexFree(pWal->pBfWal);
+    pWal->pBfWal = 0;
+    pWal->bBfPrune = 0;
+    pWal->bBfTouchOk = 0;
+    pWal->iBfIngested = pWal->hdr.mxFrame;
+    return SQLITE_OK;
+  }
   szPage = walPagesize(pWal);
   szFrame = szPage + WAL_FRAME_HDRSIZE;
   aFrame = (u8*)sqlite3_malloc64(szFrame);
@@ -5377,6 +5420,9 @@ int sqlite3WalCheckpoint(
   }
   SEH_EXCEPT( rc = walHandleException(pWal); )
 
+#ifndef SQLITE_OMIT_BF_CACHE
+  pWal->bBfCkptCap = 0;     /* one cap per materialise */
+#endif
   if( isChanged ){
     /* If a new wal-index header was loaded before the checkpoint was
     ** performed, then the pager-cache associated with pWal is now

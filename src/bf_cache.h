@@ -1020,7 +1020,7 @@ SQLITE_PRIVATE void sqlite3BfBtreeNoteShadowServe(BtCursor *pCur);
 #endif
 #ifdef SQLITE_DEBUG
 /* Debug-only: 1 if a BF mini-page is mapped under pgno (relocatePage assert). */
-SQLITE_PRIVATE int sqlite3BfBtreeDebugHasMiniPage(BtShared *pBt, Pgno pgno);
+SQLITE_PRIVATE int sqlite3BfBtreeDebugHasDirtyMiniPage(BtShared *pBt, Pgno pgno);
 #endif
 /* Flush all dirty mini-pages for a B-tree to base pages (called at commit). */
 SQLITE_PRIVATE int sqlite3BfBtreeFlushAllDirty(Btree *p);
@@ -1041,6 +1041,7 @@ SQLITE_PRIVATE void sqlite3BfRsBegin(BtShared *pBt);
 SQLITE_PRIVATE void sqlite3BfRsEnd(BtShared *pBt);
 SQLITE_PRIVATE void sqlite3BfRsNote(BtCursor *pCur, int eOp, i64 iKey, int rc);
 SQLITE_PRIVATE int sqlite3BfBtreeConcurrentValidate(Btree *p);
+SQLITE_PRIVATE int sqlite3BfBtreeFlushNewPages(Btree *p, u32 iFirst);
 SQLITE_PRIVATE void sqlite3BfBtreeConcurrentRebase(Btree *p);
 #define BF_RS_SEEK  1
 #define BF_RS_FIRST 2

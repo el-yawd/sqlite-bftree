@@ -4340,13 +4340,17 @@ static int relocatePage(
   assert( sqlite3_mutex_held(pBt->mutex) );
   assert( pDbPage->pBt==pBt );
   if( iDbPage<3 ) return SQLITE_CORRUPT_BKPT;
-#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_DEBUG)
-  /* Stage 1.5 page-lifecycle invariant: BF is disabled for auto-vacuum DBs
-  ** (btreeUsesBfCache), so relocation must never encounter a BF mini-page on
-  ** the page it moves or on the destination — otherwise the pgno-keyed cache
-  ** would be orphaned/corrupted. */
-  assert( !sqlite3BfBtreeDebugHasMiniPage(pBt, iDbPage) );
-  assert( !sqlite3BfBtreeDebugHasMiniPage(pBt, iFreePage) );
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* BF state is keyed by page number.  BF is off for auto-vacuum databases
+  ** (btreeUsesBfCache), but a BEGIN CONCURRENT commit renumbers the pages it
+  ** allocated (btreeFixUnlocked), and sqlite3BfBtreeFlushNewPages has merged
+  ** their buffered records into them first.  What is left for either number
+  ** is clean -- cached copies of the moved page, or of another transaction's
+  ** page now at iDbPage -- and is forgotten (2026-10-17, bench/mt_oracle.c). */
+  assert( !sqlite3BfBtreeDebugHasDirtyMiniPage(pBt, iDbPage) );
+  assert( !sqlite3BfBtreeDebugHasDirtyMiniPage(pBt, iFreePage) );
+  sqlite3BfBtreeForgetPage(pBt, iDbPage);
+  sqlite3BfBtreeForgetPage(pBt, iFreePage);
 #endif
 
   /* Move page iDbPage from its current location to page number iFreePage */
@@ -13886,6 +13890,7 @@ static int bfCheckpointMaterialize(Btree *p){
     rc = sqlite3BtreeCommitPhaseOne(p, 0);
     if( rc==SQLITE_OK ) rc = sqlite3BtreeCommitPhaseTwo(p, 0);
     else sqlite3BtreeRollback(p, SQLITE_ABORT_ROLLBACK, 0);
+    if( rc==SQLITE_OK ) sqlite3PagerBfSetCkptCap(pBt->pPager);
     return rc;
   }
 
@@ -13899,6 +13904,10 @@ static int bfCheckpointMaterialize(Btree *p){
   }else{
     sqlite3BtreeRollback(p, SQLITE_ABORT_ROLLBACK, 0);
   }
+  /* The checkpoint that follows may backfill only up to this commit: frames
+  ** another connection commits once the write lock is released may hold
+  ** records no page has (Wal.bBfCkptCap; found by bench/mt_oracle.c). */
+  if( rc==SQLITE_OK ) sqlite3PagerBfSetCkptCap(pBt->pPager);
   return rc;
 }
 #endif
@@ -14154,6 +14163,18 @@ int sqlite3BtreeExclusiveLock(Btree *p){
   BtShared *pBt = p->pBt;
   assert( p->inTrans==TRANS_WRITE && pBt->pPage1 );
   sqlite3BtreeEnter(p);
+#ifdef SQLITE_BF_CONCURRENT
+  /* Pages this transaction allocated may be renumbered at commit
+  ** (btreeFixUnlocked): merge their buffered records into them first. */
+  if( p->db->eConcurrent && pBt->bfRsActive && pBt->pMap
+   && btreePagecount(pBt)>=pBt->pMap->iFirst ){
+    rc = sqlite3BfBtreeFlushNewPages(p, pBt->pMap->iFirst);
+    if( rc ){
+      sqlite3BtreeLeave(p);
+      return rc;
+    }
+  }
+#endif
   rc = sqlite3PagerExclusiveLock(pBt->pPager, 
     (p->db->eConcurrent==CONCURRENT_SCHEMA) ? 0 : pBt->pPage1->pDbPage,
     &pgno
