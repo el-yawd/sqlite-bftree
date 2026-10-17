@@ -11628,8 +11628,23 @@ int sqlite3BtreeInsert(
         if( rc ) return rc;
       }
       if( pCur->bfOnMini ) return SQLITE_CORRUPT_BKPT;  /* nothing to write */
-    }else if( pCur->curIntKey && pCur->pgnoRoot>1 ){
-      /* The same rule for a row WITH a base cell (2026-10-12).  A write that
+    }else if( pCur->curIntKey && pCur->pgnoRoot>1
+           && pCur->eState==CURSOR_VALID
+           && (pCur->curFlags & BTCF_ValidNKey)!=0
+           && pX->nKey==pCur->info.nKey ){
+      /* Only when the cursor is ON the row being overwritten (2026-10-17):
+      ** that is the same-size overwrite fast path's own condition, the one
+      ** this guard exists for.  It used to test only curIntKey, so every
+      ** INSERT of a new key into a table holding buffered records flushed the
+      ** whole table here, before the insert-buffering block below could take
+      ** it: two single-row INSERTs in one transaction merged every dirty leaf
+      ** (bf_cache_stats merges), and under BEGIN CONCURRENT those page writes
+      ** were most of the false conflicts (mwriter_oracle: 2009 of 2012 page
+      ** flushes came from here).  A new key needs nothing: a buffered INSERT
+      ** supersedes any tombstone, and a refused one reaches the pre-mutation
+      ** flush further down before it touches the base.
+      **
+      ** The same rule for a row WITH a base cell (2026-10-12).  A write that
       ** declined buffering -- an UpdateCell refusal (mini-page at its cap, ring
       ** stalled), SAVEPOSITION, PREFORMAT -- reaches the same-size overwrite
       ** fast path below, which patches the base cell BEFORE the pre-mutation
@@ -12205,6 +12220,26 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
       return SQLITE_OK;
     }
     if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+    /* Merge-on-full, as for inserts and updates (2026-10-17): merge just this
+    ** leaf, re-seek, and buffer the tombstone into its now-clean mini-page.
+    ** Before, a full mini-page sent the delete to the base, which first
+    ** flushed the whole table -- page writes on every dirty leaf, each one a
+    ** page-level conflict for every concurrent transaction that read it. */
+    if( sqlite3BfBtreeMergeFullLeaf(pCur, 0) ){
+      int loc = 0;
+      rc = sqlite3BtreeTableMoveto(pCur, rid, 0, &loc);
+      if( rc ) return rc;
+      if( pCur->eState!=CURSOR_VALID || loc!=0 ) return SQLITE_OK; /* row gone */
+      if( !pCur->bfOnMini ){
+        bfrc = sqlite3BfBtreeBufferDelete(pCur, &rid, sizeof(rid));
+        if( bfrc==SQLITE_OK ){
+          pCur->eState = CURSOR_INVALID;
+          pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+          return SQLITE_OK;
+        }
+        if( bfrc==SQLITE_NOMEM ) return SQLITE_NOMEM;
+      }
+    }
     /* BF refused (mini-page full at max size class): fall through to a base
     ** delete.  We skipped the mutation flush above, so run it now and re-seek
     ** to the row (the flush may have moved its leaf). */

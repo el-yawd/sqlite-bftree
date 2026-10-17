@@ -4557,9 +4557,18 @@ int sqlite3PagerBfReplayPages(Pager *pPager, BfCache *pBf,
 int sqlite3PagerBfPageWasRead(Pager *pPager, Pgno pgno){
   return pPager->pAllRead!=0 && sqlite3BitvecTestNotNull(pPager->pAllRead, pgno);
 }
+/* C1: would leaf pgno's replay fit one mini-page (sqlite3BfCacheLeafFits)? */
+int sqlite3PagerBfLeafFits(Pager *pPager, BfCache *pBf, Pgno pgno,
+    const BfFitOp *aExtra, int nExtra, BfMiniPage *pOurs){
+  if( pPager && pBf && pagerUseWal(pPager) ){
+    return sqlite3BfCacheLeafFits(pBf, sqlite3WalBfIndex(pPager->pWal), pgno,
+               sqlite3WalBfMxFrame(pPager->pWal), aExtra, nExtra, pOurs);
+  }
+  return 1;
+}
 /* C1: record-level validation of a BEGIN CONCURRENT commit (wal.c). */
 int sqlite3PagerBfConcurrentScan(Pager *pPager,
-    int (*xOp)(void*, u32, u32, const u8*, int, int), void *pCtx, int *pbOther){
+    int (*xOp)(void*, u32, u32, const u8*, int, int, int), void *pCtx, int *pbOther){
   *pbOther = 0;
   if( pPager && pagerUseWal(pPager) ){
     return sqlite3WalBfConcurrentScan(pPager->pWal, xOp, pCtx, pbOther);

@@ -73,6 +73,11 @@ static int bCheckCommit;
 static int bNoRange;    /* MW_NORANGE=1: no range reads (point reads instead) */ /* MW_CHECKCOMMIT=1: after each successful commit, check the committer's whole view */  /* MW_CHECKSNAP=1: full-table check at every snapshot (debug; changes conflicts) */   /* MW_TRACE=1: log every statement and commit to stderr */
 #define TRACE(...) do{ if( bTrace ) fprintf(stderr, __VA_ARGS__); }while(0)
 
+/* MW_LOG=1: print sqlite3_log() messages (upstream names the conflict page). */
+static void logCb(void *pArg, int iErr, const char *zMsg){
+  (void)pArg; fprintf(stderr, "LOG %d op=%ld: %s\n", iErr, iOp, zMsg);
+}
+
 static void die(const char *z){
   fprintf(stderr, "FAIL op=%ld: %s\n", iOp, z);
   exit(1);
@@ -359,6 +364,7 @@ int main(int argc, char **argv){
   bCheckSnap = getenv("MW_CHECKSNAP")!=0;
   bCheckCommit = getenv("MW_CHECKCOMMIT")!=0;
   bNoRange = getenv("MW_NORANGE")!=0;
+  if( getenv("MW_LOG") ) sqlite3_config(SQLITE_CONFIG_LOG, logCb, (void*)0);
   { char b[600];
     snprintf(b, sizeof(b), "%s", zDbPath); remove(b);
     snprintf(b, sizeof(b), "%s-wal", zDbPath); remove(b);

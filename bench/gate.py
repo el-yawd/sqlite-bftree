@@ -60,6 +60,11 @@ def main():
         src = os.path.join(BUILD, name)
         if not os.access(src, os.X_OK):
             sys.exit(f"MISSING: {src} (see CLAUDE.md 'Build & test')")
+        # A binary older than the amalgamation tests old code: refuse
+        # (2026-10-17: sqlite3_buf was four days stale under a green gate).
+        if os.path.getmtime(src) < os.path.getmtime(os.path.join(BUILD, "sqlite3.c")):
+            sys.exit(f"STALE: {src} is older than build/sqlite3.c -- rebuild it "
+                     "(bench/stress_buf.sh has the sqlite3_buf command)")
         dst = os.path.join(work, name)
         shutil.copy2(src, dst)
         bins[name] = dst

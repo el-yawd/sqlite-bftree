@@ -306,7 +306,10 @@ void sqlite3PagerBfTouchReset(Pager*);
 int sqlite3PagerBfReplayPages(Pager*, BfCache*, const u32 *aPg, int nPg);
 #ifdef SQLITE_BF_CONCURRENT
 int sqlite3PagerBfPageWasRead(Pager*, Pgno);
-int sqlite3PagerBfConcurrentScan(Pager*, int(*)(void*,u32,u32,const u8*,int,int), void*, int*);
+struct BfFitOp; struct BfMiniPage;
+int sqlite3PagerBfLeafFits(Pager*, BfCache*, Pgno, const struct BfFitOp*, int,
+                           struct BfMiniPage*);
+int sqlite3PagerBfConcurrentScan(Pager*, int(*)(void*,u32,u32,const u8*,int,int,int), void*, int*);
 #endif
 void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage);
 int sqlite3PagerBfHasDirty(Pager *pPager);

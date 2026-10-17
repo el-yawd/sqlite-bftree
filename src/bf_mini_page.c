@@ -265,7 +265,8 @@ u32 sqlite3BfMiniPageSizeClassFor(
   BfMiniPage *pMini,
   int nKey,
   int nVal,
-  u32 *aSizeClass
+  u32 *aSizeClass,
+  u32 maxGrow                 /* BF_MAX_MINI_GROW, or more for a replay */
 ){
   BfKVMeta *aMeta = bfMiniPageMeta(pMini);
   u32 used = (u32)sizeof(BfMiniPage);
@@ -282,7 +283,7 @@ u32 sqlite3BfMiniPageSizeClassFor(
     /* M5: never past the mini-page cap -- 0 sends a clean page to the
     ** full-page trigger and a dirty one to compaction / merge, as the
     ** reference's new_size_if_upgrade returning None does. */
-    if( aSizeClass[i] > BF_MAX_MINI_GROW ) break;
+    if( aSizeClass[i] > maxGrow ) break;
     if( aSizeClass[i] > pMini->nodeSize && aSizeClass[i] >= needed ){
       return aSizeClass[i];
     }
@@ -554,6 +555,23 @@ int sqlite3BfMiniPageDirtyCount(BfMiniPage *pMini){
     }
   }
   return count;
+}
+
+/*
+** True iff the data area holds dead bytes: values overwritten by a larger one
+** leave their old key+value behind (sqlite3BfMiniPageInsert), and only a copy
+** reclaims them.  2026-10-17: lets a full mini-page of ONLY dirty records
+** compact (sqlite3BfRecordWrite), which a replay depends on -- it has no
+** merge to fall back to (sqlite3BfCacheLeafFits).
+*/
+int sqlite3BfMiniPageHasHoles(BfMiniPage *pMini){
+  BfKVMeta *aMeta = bfMiniPageMeta(pMini);
+  u32 live = 0;
+  int i;
+  for(i = 0; i < pMini->metaCount; i++){
+    live += bfRecordSpace(BF_KV_KEY_LEN(&aMeta[i]), BF_KV_VALUE_LEN(&aMeta[i]));
+  }
+  return (u32)pMini->nodeSize - (u32)sizeof(BfMiniPage) - pMini->freeSpace > live;
 }
 
 /*

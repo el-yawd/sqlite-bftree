@@ -5109,8 +5109,9 @@ void sqlite3WalBfTouchReset(Wal *pWal){
 ** check and before this transaction writes any frame.  pWal->hdr is still the
 ** transaction's snapshot; the wal-index header is the head of the log.
 **
-** Pass 1 calls xOp(pCtx, leaf, root, key, nKey, op) for every record op in a frame
-** committed after the snapshot; non-zero = conflict -> SQLITE_BUSY_SNAPSHOT,
+** Pass 1 calls xOp(pCtx, leaf, root, key, nKey, nVal, op) for every record op in a frame
+** committed after the snapshot (op -1: a page frame, pgno in leaf; op -2 once
+** at the end); non-zero = conflict -> SQLITE_BUSY_SNAPSHOT,
 ** nothing ingested.  Pass 2 ingests those frames into the record index and
 ** extends the touch list, so the index has no gap when our own frames follow
 ** and the cache can be rebased incrementally after the commit.  *pbOther is
@@ -5119,7 +5120,7 @@ void sqlite3WalBfTouchReset(Wal *pWal){
 */
 static int walBfConcurrentScan(
   Wal *pWal,
-  int (*xOp)(void*, u32, u32, const u8*, int, int),
+  int (*xOp)(void*, u32, u32, const u8*, int, int, int),
   void *pCtx,
   int *pbOther
 ){
@@ -5156,7 +5157,7 @@ static int walBfConcurrentScan(
       if( pgno!=WAL_BF_RECORD_PGNO ){
         if( pass==2 ) walBfTouch(pWal, pgno);
         /* A page another transaction wrote: offered as op -1 (pgno in leaf). */
-        if( pass==1 && xOp(pCtx, pgno, 0, 0, 0, -1) ) rc = SQLITE_BUSY_SNAPSHOT;
+        if( pass==1 && xOp(pCtx, pgno, 0, 0, 0, 0, -1) ) rc = SQLITE_BUSY_SNAPSHOT;
         continue;
       }
       rc = sqlite3OsRead(pWal->pWalFd, &aFrame[WAL_FRAME_HDRSIZE], szPage,
@@ -5172,7 +5173,7 @@ static int walBfConcurrentScan(
         }
         while( rc==SQLITE_OK && sqlite3BfWalIterNext(&it, &r)==BFWAL_OK ){
           if( pass==1 ){
-            if( xOp(pCtx, r.pgno, r.rootPgno, r.pKey, (int)r.nKey, r.op) ){
+            if( xOp(pCtx, r.pgno, r.rootPgno, r.pKey, (int)r.nKey, (int)r.nVal, r.op) ){
               rc = SQLITE_BUSY_SNAPSHOT;
             }
           }else{
@@ -5183,6 +5184,12 @@ static int walBfConcurrentScan(
       if( pass==2 && rc==SQLITE_OK ){
         rc = walBfIngestRecordFrame(pWal, &aFrame[WAL_FRAME_HDRSIZE], iFrame);
       }
+    }
+    /* End of pass 1: op -2 lets the caller judge what it saw as a whole
+    ** (the per-leaf capacity check, sqlite3BfCacheLeafFits) before anything
+    ** is ingested. */
+    if( pass==1 && rc==SQLITE_OK && xOp(pCtx, 0, 0, 0, 0, 0, -2) ){
+      rc = SQLITE_BUSY_SNAPSHOT;
     }
   }
   if( rc==SQLITE_OK ){
@@ -5198,7 +5205,7 @@ static int walBfConcurrentScan(
 ** sqlite3WalLockForCommit does. */
 int sqlite3WalBfConcurrentScan(
   Wal *pWal,
-  int (*xOp)(void*, u32, u32, const u8*, int, int),
+  int (*xOp)(void*, u32, u32, const u8*, int, int, int),
   void *pCtx,
   int *pbOther
 ){

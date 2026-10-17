@@ -3020,3 +3020,50 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - Gate (owner: yes): + repro:stale_ckpt and mwriter (quick: 32 runs; full: 96 release + 32
   debug), drivers compiled per run from a snapshot of sqlite3.c inside their tasks.  Quick
   15/15 in 27 s; full 54/54 in 107 s (no wall-time change: they overlap difftest).
+
+### 2026-10-17 — Claude Opus 5.5 — C1 false conflicts: an insert regression, and two replay-capacity bugs it was hiding
+
+- **Where BF's false conflicts came from (measured, gdb on `bfFlushOneMiniPage`):** 2009 of 2012
+  page flushes in a 3,000-op mwriter run came from ONE line, the "declined update" guard added in
+  `61602bf` (2026-10-12) to `sqlite3BtreeInsert`.  It tested only `curIntKey`, so **every INSERT
+  of a new key into a table holding buffered records flushed the whole table**, before the
+  insert-buffering block could take it -- not a concurrency issue: two single-row INSERTs in a
+  plain transaction merged every dirty leaf (`merges` 0 -> 1 per extra insert).  Every write
+  number taken since `61602bf` on an insert arm carries this.  Fix: the guard now requires the
+  cursor to be ON the row being overwritten (the same-size overwrite fast path's own condition,
+  the case it was written for).
+- Removing it exposed two **replay-capacity** bugs (committed-record loss: `replay_dropped`, then
+  SQLITE_FULL on the next read or reopen):
+  1. *Concurrent writers overfill a leaf.*  Each BEGIN CONCURRENT writer fills a leaf's mini-page
+     from its own snapshot; the union of what they commit can exceed one mini-page, and replay
+     has no fallback.  New `sqlite3BfCacheLeafFits` replays SIZES only, in replay order (index ops
+     after the last CLEAR, then the other commits' ops on that leaf, then our unlogged records,
+     key order) against the largest class <= `BF_MAX_MINI_GROW`; called at the end of the commit
+     scan (new op -2 of `walBfConcurrentScan`'s callback, which also gained `nVal`) for each leaf
+     both we and another commit wrote since our snapshot.  No fit -> SQLITE_BUSY_SNAPSHOT; the
+     retry sees the full mini-page and merges it first.  Counter `conc_nofit`.
+  2. *Replay order is not mutation order* (single-writer too, mwriter seed 12): a commit's records
+     replay in KEY order; the writer applied them in mutation order.  Writer at the cap: grew key A
+     into the room a dropped clean record left, then inserted key B; replay inserted B (fits),
+     then could not grow A.  Fix: a replay may grow a mini-page to the page-sized last class
+     (`BfCache.bReplayGrow`, `sqlite3BfMiniPageSizeClassFor` gained `maxGrow`) -- every writer
+     state fits the cap and a mid-commit replay state holds each key at its before-or-after value,
+     so it needs at most 2x the cap; `bfReplayShrink` puts the page back under the cap after the
+     leaf's replay; a live dirty write refuses a page still over the cap (merge-on-full), else the
+     bound is gone (seed 16, 8 writers).  Not covered under `SQLITE_BF_NO_MINI_CAP` (cap = page).
+  Also: a full mini-page of only dirty records now compacts when it has dead bytes
+  (`sqlite3BfMiniPageHasHoles`), and a write-back DELETE refused by a full mini-page merges that
+  leaf (merge-on-full) instead of flushing the table.
+- **Tooling:** `gate.py` now refuses a binary older than `build/sqlite3.c` -- `sqlite3_buf` had
+  been 4 days stale, so the differential suite under every gate since 2026-10-13 tested old code.
+  `mwriter_oracle` `MW_LOG=1` prints `sqlite3_log` (upstream names the conflict page).
+- **Results (mwriter, 20k ops, NOT a benchmark -- conflict counts only):**
+  4 writers, seeds 1-3: BF false conflicts 1499/1459/1505 -> 110/127/109 (stock+BC 1459/1468/1463);
+  commits 2090 -> 3452 (stock 2133).  8 writers: BF 2273-2877 commits, 689-1314 false conflicts
+  vs stock 1632-1661 / ~1910.  What is left at 8 writers is merge-on-full that splits a leaf and
+  escalates to a table flush (`bfEscalateIfMisplaced`, the dirty-sibling rule): physical work,
+  which the design moves into system transactions with logical keys (C2/C3, P1/P4).
+- Correctness: gate --full GREEN 54/54 (fresh binaries); mwriter 768 release runs (seeds 1-32 x 3
+  modes x 8 configs) + 128 SQLITE_DEBUG runs clean; mconn sweep 96/96 clean.
+- **C1 status: done for the current format.**  Next: C2 (private write sets + durable group
+  commit), per docs/design/concurrent-engine.md.

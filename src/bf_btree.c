@@ -1029,6 +1029,7 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[14] = pBf ? pBf->nConcValidate : 0;
   aOut[15] = pBf ? pBf->nConcConflict : 0;
   aOut[16] = pBf ? pBf->nConcOps : 0;
+  aOut[17] = pBf ? pBf->nConcNoFit : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -3374,13 +3375,73 @@ static int bfRsHit(BfCache *pBf, u32 root, i64 key){
 /* sqlite3PagerBfConcurrentScan callback: one record op another transaction
 ** committed after our snapshot.  Non-zero = conflict. */
 typedef struct BfRsCtx BfRsCtx;
-struct BfRsCtx { BfCache *pBf; Pager *pPager; };
+struct BfRsCtx {
+  BfCache *pBf; Pager *pPager;
+  /* Other commits' ops on leaves this transaction also buffered records on:
+  ** checked for fit at the end of the scan (op -2). */
+  BfFitOp *aFit; int nFit, nFitAlloc;
+  int bFitOom;
+};
+
+/* The mini-page of leaf, if this transaction buffered records there. */
+static BfMiniPage *bfRsOurUnlogged(BfCache *pBf, u32 leaf){
+  BfMapEntry *pE = sqlite3BfMapLookup(pBf, leaf);
+  BfMiniPage *pMini;
+  if( pE==0 || pE->locType!=BF_LOC_MINI || pE->pPage==0 ) return 0;
+  pMini = (BfMiniPage*)pE->pPage;
+  return (pMini->flags & BF_MINI_F_UNLOGGED)!=0 ? pMini : 0;
+}
+
+/*
+** End of the commit scan.  Each leaf that another commit AND this transaction
+** wrote records to since the snapshot: the union is what every later replay
+** of that leaf applies, and it must fit one mini-page (sqlite3BfCacheLeafFits
+** says why).  If it would not, refuse; the retry starts from a snapshot that
+** has the other commit's records, sees the mini-page full and merges the leaf
+** first (merge-on-full), as a single writer would have.
+*/
+static int bfRsFitCheck(BfRsCtx *ctx){
+  int i, j;
+  if( ctx->bFitOom ) return 1;
+  for(i=0; i<ctx->nFit; i++){
+    u32 leaf = ctx->aFit[i].leaf;
+    for(j=0; j<i && ctx->aFit[j].leaf!=leaf; j++){}
+    if( j<i ) continue;                      /* leaf already checked */
+    if( !sqlite3PagerBfLeafFits(ctx->pPager, ctx->pBf, leaf, ctx->aFit,
+                                ctx->nFit, bfRsOurUnlogged(ctx->pBf, leaf)) ){
+      ctx->pBf->nConcNoFit++;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void bfRsFitAdd(BfRsCtx *ctx, u32 leaf, const u8 *pKey, int nKey,
+                       int nVal, int op){
+  BfFitOp *f;
+  if( ctx->nFit>=ctx->nFitAlloc ){
+    int nNew = ctx->nFitAlloc ? ctx->nFitAlloc*2 : 32;
+    BfFitOp *aNew = (BfFitOp*)sqlite3_realloc64(ctx->aFit, (u64)nNew*sizeof(BfFitOp));
+    if( aNew==0 ){ ctx->bFitOom = 1; return; }
+    ctx->aFit = aNew;
+    ctx->nFitAlloc = nNew;
+  }
+  if( nKey>16 || nVal>0xffff ){ ctx->bFitOom = 1; return; }  /* conservative */
+  f = &ctx->aFit[ctx->nFit++];
+  f->leaf = leaf;
+  f->op = (u8)op;
+  f->nKey = (u8)nKey;
+  f->nVal = (u16)nVal;
+  if( nKey>0 ) memcpy(f->aKey, pKey, nKey);
+}
+
 static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
-                          const u8 *pKey, int nKey, int op){
+                          const u8 *pKey, int nKey, int nVal, int op){
   BfCache *pBf = ((BfRsCtx*)pCtx)->pBf;
   Pager *pPager = ((BfRsCtx*)pCtx)->pPager;
   DbPage *pPg;
   int i;
+  if( op==-2 ) return bfRsFitCheck((BfRsCtx*)pCtx);
   if( op<0 ){
     /* A page frame another transaction committed.  Upstream's page check
     ** must already have refused a commit that also WROTE this page (writing
@@ -3443,7 +3504,11 @@ static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
     if( pBf->aFlushed[i]==leaf ) return 1;
   }
   if( nKey!=8 ) return 1;              /* not a rowid key: be conservative */
-  return bfRsHit(pBf, root, bfDecodeRowid(pKey));
+  if( bfRsHit(pBf, root, bfDecodeRowid(pKey)) ) return 1;
+  if( bfRsOurUnlogged(pBf, leaf) ){
+    bfRsFitAdd((BfRsCtx*)pCtx, leaf, pKey, nKey, nVal, op);
+  }
+  return 0;
 }
 
 /*
@@ -3460,9 +3525,11 @@ int sqlite3BfBtreeConcurrentValidate(Btree *p){
   int rc, bOther = 0;
   if( pBf==0 || !pBf->bRsActive ) return SQLITE_OK;
   pBf->nConcValidate++;
+  memset(&ctx, 0, sizeof(ctx));
   ctx.pBf = pBf;
   ctx.pPager = p->pBt->pPager;
   rc = sqlite3PagerBfConcurrentScan(p->pBt->pPager, bfRsOpCallback, &ctx, &bOther);
+  sqlite3_free(ctx.aFit);
   if( rc==SQLITE_BUSY_SNAPSHOT ) pBf->nConcConflict++;
   if( rc==SQLITE_OK && bOther ) pBf->bConcRebase = 1;
   return rc;

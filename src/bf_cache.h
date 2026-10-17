@@ -583,6 +583,9 @@ struct BfCache {
   u64 nConcValidate;        /* concurrent commits validated row-level */
   u64 nConcConflict;        /* ... refused for a row-level conflict */
   u64 nConcOps;             /* record ops from other commits tested */
+  u64 nConcNoFit;           /* ... refused: a leaf's records would not fit */
+  u8 bReplayGrow;           /* a replay is writing: mini-pages may grow past
+                            ** BF_MAX_MINI_GROW (bfReplayOnePage) */
   u32 pgnoFlushOwner;       /* leaf bfFlushOneMiniPage is replaying, else 0 */
   u8 bSweepAll;             /* sqlite3BfBtreeFlushAllDirty is running */
   u64 nEvictBytes;          /* Bytes the eviction sweeps reclaimed (was misnamed
@@ -786,7 +789,7 @@ SQLITE_PRIVATE void sqlite3BfInitSizeClasses(u32 *aSizeClass, u32 nMinRecord);
 SQLITE_PRIVATE int sqlite3BfCacheMinRecord(void);
 SQLITE_PRIVATE double sqlite3BfCacheCopyOnAccessRatio(void);
 SQLITE_PRIVATE u32 sqlite3BfMiniPageSizeClassFor(BfMiniPage *pMini, int nKey,
-                                                 int nVal, u32 *aSizeClass);
+    int nVal, u32 *aSizeClass, u32 maxGrow);
 
 /*
 ** Mapping table operations.
@@ -831,6 +834,7 @@ SQLITE_PRIVATE void sqlite3BfCircularBufferStats(BfCircularBuffer *pCb,
 ** Additional mini-page operations.
 */
 SQLITE_PRIVATE int sqlite3BfMiniPageDirtyCount(BfMiniPage *pMini);
+SQLITE_PRIVATE int sqlite3BfMiniPageHasHoles(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfKvIsColdCache(const BfKVMeta *pMeta);
@@ -1044,6 +1048,13 @@ SQLITE_PRIVATE void sqlite3BfBtreeClearCache(Btree *p);
 ** state from the log (consumes apStage).  See bf_btree.c. */
 SQLITE_PRIVATE int sqlite3BfBtreeSnapshotRehydrate(Btree *p);
 SQLITE_PRIVATE u64 sqlite3BfCacheReplayBound(BfCache*, BfWalIndex*, u32, int);
+/* C1 (2026-10-17): would a replay of leaf pgno -- the committed ops after its
+** last CLEAR (<= mxFrame), then aExtra, then pOurs' unlogged records -- fit
+** in one mini-page?  See the definition. */
+typedef struct BfFitOp BfFitOp;
+struct BfFitOp { u32 leaf; u8 op; u8 nKey; u16 nVal; u8 aKey[16]; };
+SQLITE_PRIVATE int sqlite3BfCacheLeafFits(BfCache*, BfWalIndex*, u32 pgno,
+    u32 mxFrame, const BfFitOp *aExtra, int nExtra, BfMiniPage *pOurs);
 SQLITE_PRIVATE int sqlite3BfCacheReplayPages(BfCache*, BfWalIndex*, u32,
                                              const u32*, int);
 SQLITE_PRIVATE int sqlite3BfBtreeSnapshotAdvance(Btree *p);
