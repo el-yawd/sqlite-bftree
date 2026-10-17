@@ -3207,3 +3207,17 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   Validated: the unfixed build with the repro's own heap-dirtying disabled passes plainly and
   fails under `MALLOC_PERTURB_=165`.  The whole full gate (`--perturb all`) is green, 301 s; the
   default full tier takes 149 s (was 131 s).
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — power-loss oracle with concurrent writers
+
+- `mt_oracle.c` crash mode gains `MT_POWER=all|subset|torn`: plvfs's undo-log shim made
+  thread-safe (one undo stack per file PATH -- an fsync on any handle makes the file durable --
+  and all writes/truncates/syncs serialised under one mutex, so the cut is exact).  The child
+  cuts its own power at its first file event after a random delay.  Checks: integrity,
+  invariant, atomicity always; `MT_FULL=1` (with `synchronous=FULL`): every acknowledged commit
+  survives; otherwise the survivors are a per-thread prefix.  Gate task `mt:power` (all + torn,
+  NORMAL + FULL).
+- Results: stock and BF pass all 12 mode x sync combinations (8 cuts each).  The oracle has
+  teeth: `synchronous=OFF` and `NORMAL` checked as FULL lose acknowledged commits at once.
+  Design section 10's crash and power-loss items for concurrent writers are now covered for the
+  current format (mid-group-flush awaits group commit).  Gate --full 58/58, 158 s.

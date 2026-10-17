@@ -34,6 +34,8 @@
 **   MT_KILL_MS=300 MT_ITERS=10 mt_bf DB SEED NTHREADS NTXN ["PRAGMAS"]
 **     crash mode (see crashMode): NTXN bounds each child's transfers per thread;
 **     MT_SAVE=dir keeps the post-kill files, MT_CHECKONLY=iter re-runs the check
+**   MT_POWER=all|subset|torn (+ crash mode): cut the power instead of a kill;
+**     MT_FULL=1 (with PRAGMA synchronous=FULL) = acknowledged commits must survive
 ** Validate on the stock build first.
 */
 #include "sqlite3.h"
@@ -291,6 +293,211 @@ static sqlite3 *openConn(void){
   return db;
 }
 
+
+/* -------------------------------------------------------------------------
+** Power-cut mode (MT_POWER=all|subset|torn, with crash mode), 2026-10-17.
+** bench/powerloss/plvfs.c's undo-log shim, made safe for threads: ONE undo
+** stack per file PATH (an fsync on any handle makes the whole file durable),
+** and every write/truncate/sync runs under one mutex, so the cut sees exactly
+** what reached the "device".  At the first file event after MT_KILL_MS the
+** unsynced writes are reverted -- all, a random subset, or torn at 512-byte
+** sectors -- and the child _exit()s.  The parent then checks as for a kill,
+** except that with synchronous!=FULL an acknowledged commit may be lost: what
+** survives must then be, per thread, a prefix of what it committed.
+*/
+typedef struct PlUndo PlUndo;
+struct PlUndo {
+  sqlite3_int64 iOff, szBefore;
+  int n, nOld, isTrunc;
+  unsigned char *aOld;
+  PlUndo *pNext;
+};
+typedef struct PlPath PlPath;
+struct PlPath { char zName[512]; sqlite3_file *pAny; PlUndo *pUndo; PlPath *pNext; };
+typedef struct PlFile PlFile;
+struct PlFile { sqlite3_file base; sqlite3_file *pReal; PlPath *pPath; };
+
+static sqlite3_vfs *plReal;
+static sqlite3_vfs plVfs;
+static PlPath *plPaths;
+static pthread_mutex_t plMutex = PTHREAD_MUTEX_INITIALIZER;
+static int plMode;                    /* 0 all, 1 subset, 2 torn */
+static unsigned plRandState = 1;
+static struct timespec plStart;
+static long plCutMs;
+
+static unsigned plRand(void){
+  plRandState = plRandState*1103515245u + 12345u;
+  return (plRandState>>16) & 0x7fff;
+}
+static long plElapsedMs(void){
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (t.tv_sec - plStart.tv_sec)*1000 + (t.tv_nsec - plStart.tv_nsec)/1000000;
+}
+/* With plMutex held: revert the unsynced writes, newest first, and die. */
+static void plCutNow(void){
+  PlPath *pp;
+  for(pp=plPaths; pp; pp=pp->pNext){
+    PlUndo *r;
+    sqlite3_file *f = pp->pAny;
+    if( f==0 ) continue;
+    for(r=pp->pUndo; r; r=r->pNext){
+      if( r->isTrunc ){
+        if( r->nOld>0 ) f->pMethods->xWrite(f, r->aOld, r->nOld, r->iOff);
+        continue;
+      }
+      if( plMode==1 && (plRand()&1) ) continue;
+      if( plMode==2 ){
+        int nSec = (r->n+511)/512, keep = (int)(plRand() % (unsigned)(nSec+1));
+        int from = keep*512;
+        if( from < r->nOld ) f->pMethods->xWrite(f, r->aOld+from, r->nOld-from, r->iOff+from);
+        if( from < r->n && r->iOff + r->n > r->szBefore ){
+          sqlite3_int64 cut = r->iOff+from > r->szBefore ? r->iOff+from : r->szBefore;
+          f->pMethods->xTruncate(f, cut);
+        }
+        continue;
+      }
+      if( r->nOld>0 ) f->pMethods->xWrite(f, r->aOld, r->nOld, r->iOff);
+      if( r->iOff + r->n > r->szBefore ) f->pMethods->xTruncate(f, r->szBefore);
+    }
+  }
+  _exit(0);
+}
+static void plEvent(void){ if( plElapsedMs()>=plCutMs ) plCutNow(); }
+static PlUndo *plSave(PlFile *p, sqlite3_int64 o, int n){
+  sqlite3_int64 sz = 0;
+  PlUndo *r = (PlUndo*)calloc(1, sizeof(*r));
+  if( !r ) return 0;
+  p->pReal->pMethods->xFileSize(p->pReal, &sz);
+  r->iOff = o; r->n = n; r->szBefore = sz;
+  if( o < sz ){
+    r->nOld = (int)((o+n <= sz) ? n : sz-o);
+    r->aOld = (unsigned char*)malloc(r->nOld);
+    if( r->aOld==0 ){ free(r); return 0; }
+    if( p->pReal->pMethods->xRead(p->pReal, r->aOld, r->nOld, o)!=SQLITE_OK ){
+      memset(r->aOld, 0, r->nOld);
+    }
+  }
+  r->pNext = p->pPath->pUndo; p->pPath->pUndo = r;
+  return r;
+}
+static int plClose(sqlite3_file *f){
+  PlFile *p = (PlFile*)f;
+  int rc;
+  pthread_mutex_lock(&plMutex);
+  if( p->pPath && p->pPath->pAny==p->pReal ) p->pPath->pAny = 0;
+  rc = p->pReal->pMethods->xClose(p->pReal);
+  pthread_mutex_unlock(&plMutex);
+  return rc;
+}
+static int plRead(sqlite3_file *f, void *z, int n, sqlite3_int64 o){
+  PlFile *p = (PlFile*)f; return p->pReal->pMethods->xRead(p->pReal, z, n, o);
+}
+static int plWrite(sqlite3_file *f, const void *z, int n, sqlite3_int64 o){
+  PlFile *p = (PlFile*)f;
+  int rc;
+  if( p->pPath==0 ) return p->pReal->pMethods->xWrite(p->pReal, z, n, o);
+  pthread_mutex_lock(&plMutex);
+  p->pPath->pAny = p->pReal;
+  plEvent();                          /* the cut may land BEFORE this write */
+  if( plSave(p, o, n)==0 ){ pthread_mutex_unlock(&plMutex); return SQLITE_NOMEM; }
+  rc = p->pReal->pMethods->xWrite(p->pReal, z, n, o);
+  pthread_mutex_unlock(&plMutex);
+  return rc;
+}
+static int plTruncate(sqlite3_file *f, sqlite3_int64 size){
+  PlFile *p = (PlFile*)f;
+  int rc;
+  if( p->pPath==0 ) return p->pReal->pMethods->xTruncate(p->pReal, size);
+  pthread_mutex_lock(&plMutex);
+  p->pPath->pAny = p->pReal;
+  plEvent();
+  {
+    sqlite3_int64 sz = 0;
+    p->pReal->pMethods->xFileSize(p->pReal, &sz);
+    if( size < sz ){
+      PlUndo *r = (PlUndo*)calloc(1, sizeof(*r));
+      if( r ){
+        r->isTrunc = 1; r->iOff = size; r->szBefore = sz; r->nOld = (int)(sz-size);
+        r->aOld = (unsigned char*)malloc(r->nOld);
+        if( r->aOld ) p->pReal->pMethods->xRead(p->pReal, r->aOld, r->nOld, size);
+        else r->nOld = 0;
+        r->pNext = p->pPath->pUndo; p->pPath->pUndo = r;
+      }
+    }
+  }
+  rc = p->pReal->pMethods->xTruncate(p->pReal, size);
+  pthread_mutex_unlock(&plMutex);
+  return rc;
+}
+static int plSync(sqlite3_file *f, int flags){
+  PlFile *p = (PlFile*)f;
+  int rc;
+  if( p->pPath==0 ) return p->pReal->pMethods->xSync(p->pReal, flags);
+  pthread_mutex_lock(&plMutex);
+  p->pPath->pAny = p->pReal;
+  plEvent();                          /* a cut here: this sync never happened */
+  rc = p->pReal->pMethods->xSync(p->pReal, flags);
+  if( rc==SQLITE_OK ){
+    PlUndo *r = p->pPath->pUndo;      /* the whole FILE is durable now */
+    while( r ){ PlUndo *nx = r->pNext; free(r->aOld); free(r); r = nx; }
+    p->pPath->pUndo = 0;
+  }
+  pthread_mutex_unlock(&plMutex);
+  return rc;
+}
+static int plFileSize(sqlite3_file *f, sqlite3_int64 *s){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xFileSize(p->pReal, s); }
+static int plLock(sqlite3_file *f, int l){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xLock(p->pReal, l); }
+static int plUnlock(sqlite3_file *f, int l){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xUnlock(p->pReal, l); }
+static int plCheck(sqlite3_file *f, int *r){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xCheckReservedLock(p->pReal, r); }
+static int plFcntl(sqlite3_file *f, int op, void *a){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xFileControl(p->pReal, op, a); }
+static int plSector(sqlite3_file *f){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xSectorSize(p->pReal); }
+static int plDevChar(sqlite3_file *f){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xDeviceCharacteristics(p->pReal); }
+static int plShmMap(sqlite3_file *f, int i, int sz, int w, void volatile **pp){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xShmMap(p->pReal, i, sz, w, pp); }
+static int plShmLock(sqlite3_file *f, int o, int n, int fl){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xShmLock(p->pReal, o, n, fl); }
+static void plShmBarrier(sqlite3_file *f){ PlFile *p=(PlFile*)f; p->pReal->pMethods->xShmBarrier(p->pReal); }
+static int plShmUnmap(sqlite3_file *f, int d){ PlFile *p=(PlFile*)f; return p->pReal->pMethods->xShmUnmap(p->pReal, d); }
+static const sqlite3_io_methods plMethods = {
+  2, plClose, plRead, plWrite, plTruncate, plSync, plFileSize, plLock, plUnlock,
+  plCheck, plFcntl, plSector, plDevChar, plShmMap, plShmLock, plShmBarrier,
+  plShmUnmap, 0, 0
+};
+static int plOpen(sqlite3_vfs *v, const char *zName, sqlite3_file *f, int flags, int *pOut){
+  PlFile *p = (PlFile*)f;
+  int rc;
+  (void)v;
+  memset(p, 0, sizeof(*p));
+  p->pReal = (sqlite3_file*)&p[1];
+  rc = plReal->xOpen(plReal, zName, p->pReal, flags, pOut);
+  if( rc!=SQLITE_OK ){ p->base.pMethods = 0; return rc; }
+  if( zName && (flags & (SQLITE_OPEN_MAIN_DB|SQLITE_OPEN_WAL))!=0 ){
+    PlPath *pp;
+    pthread_mutex_lock(&plMutex);
+    for(pp=plPaths; pp && strcmp(pp->zName, zName); pp=pp->pNext){}
+    if( pp==0 && (pp = (PlPath*)calloc(1, sizeof(*pp)))!=0 ){
+      snprintf(pp->zName, sizeof(pp->zName), "%s", zName);
+      pp->pNext = plPaths; plPaths = pp;
+    }
+    p->pPath = pp;
+    if( pp ) pp->pAny = p->pReal;
+    pthread_mutex_unlock(&plMutex);
+  }
+  p->base.pMethods = &plMethods;
+  return SQLITE_OK;
+}
+static void plInstall(const char *zMode, long cutMs, unsigned seed){
+  plMode = !strcmp(zMode, "subset") ? 1 : !strcmp(zMode, "torn") ? 2 : 0;
+  plCutMs = cutMs;
+  plRandState = seed ? seed : 1;
+  clock_gettime(CLOCK_MONOTONIC, &plStart);
+  plReal = sqlite3_vfs_find(0);
+  plVfs = *plReal;
+  plVfs.zName = "mtpower";
+  plVfs.szOsFile = (int)sizeof(PlFile) + plReal->szOsFile;
+  plVfs.xOpen = plOpen;
+  sqlite3_vfs_register(&plVfs, 1);
+}
 /*
 ** Crash mode (MT_KILL_MS=max milliseconds, MT_ITERS=n): each iteration forks a
 ** child that runs the threaded workload with unbounded transfers, SIGKILLs it
@@ -341,8 +548,31 @@ static int crashCheck(const char *zAck){
   }else{
     bad++;
   }
-  f = fopen(zAck, "r");
-  if( f ){
+  if( getenv("MT_POWER") && !getenv("MT_FULL") ){
+    /* synchronous!=FULL: acknowledged commits may be lost to a power cut, but
+    ** what survives is a prefix of the log, so per thread a prefix 0..k of
+    ** this iteration's transfers. */
+    sqlite3_stmt *q;
+    int ti;
+    sqlite3_prepare_v2(db, "SELECT count(*), coalesce(max(id),-1) FROM hist WHERE id>=? AND id<?",
+                       -1, &q, 0);
+    for(ti=0; ti<nThr; ti++){
+      long long lo = (long long)(gIter*MAXTHR + ti)*HIST_BASE;
+      sqlite3_bind_int64(q, 1, lo);
+      sqlite3_bind_int64(q, 2, lo + HIST_BASE);
+      if( sqlite3_step(q)==SQLITE_ROW ){
+        long long nr = sqlite3_column_int64(q, 0), mx = sqlite3_column_int64(q, 1);
+        if( nr>0 && mx-lo+1!=nr ){
+          if( bad++<5 ) fprintf(stderr, "FAIL iter %d: thread %d kept %lld transfers "
+                                "but its last is seq %lld (not a prefix)\n",
+                                gIter, ti, nr, mx-lo);
+        }
+      }
+      sqlite3_reset(q);
+    }
+    sqlite3_finalize(q);
+  }else
+  if( (f = fopen(zAck, "r"))!=0 ){
     int ti, sq;
     sqlite3_stmt *q;
     sqlite3_prepare_v2(db, "SELECT 1 FROM hist WHERE id=?", -1, &q, 0);
@@ -383,6 +613,7 @@ static int crashMode(int killMs, int nIter){
     pid = fork();
     if( pid==0 ){
       pthread_t aTid[MAXTHR];
+      if( getenv("MT_POWER") ) plInstall(getenv("MT_POWER"), ms, (unsigned)(r>>9));
       ackFd = open(zAck, O_WRONLY|O_CREAT|O_APPEND, 0644);
       for(i=0; i<nThr; i++){
         Thr *t = &aThr[i];
@@ -396,10 +627,22 @@ static int crashMode(int killMs, int nIter){
       for(i=0; i<nThr; i++) if( aThr[i].zErr[0] ) fprintf(stderr, "FAIL %s\n", aThr[i].zErr);
       _exit(bFail ? 3 : 0);
     }
-    { struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (ms%1000)*1000000L;
-      nanosleep(&ts, 0); }
-    kill(pid, SIGKILL);
-    waitpid(pid, &status, 0);
+    if( getenv("MT_POWER") ){
+      /* The child cuts its own power at its first file event after ms; the
+      ** kill below only bounds a child that stopped doing I/O. */
+      long waited = 0;
+      while( waitpid(pid, &status, WNOHANG)==0 ){
+        struct timespec ts = {0, 20000000L};
+        nanosleep(&ts, 0);
+        waited += 20;
+        if( waited > ms + 30000 ){ kill(pid, SIGKILL); waitpid(pid, &status, 0); break; }
+      }
+    }else{
+      struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (ms%1000)*1000000L;
+      nanosleep(&ts, 0);
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+    }
     if( WIFEXITED(status) && WEXITSTATUS(status)!=0 ){
       fprintf(stderr, "FAIL iter %d: the child failed before the kill\n", gIter);
       return 1;

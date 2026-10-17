@@ -28,6 +28,8 @@ Tasks, per tier (quick = fewer seeds):
               block start, in a process with a used heap (2026-10-17)
   mt:crash    mt_oracle.c crash mode: SIGKILL a threaded workload 10x, recover,
               check atomicity + acknowledged-commit durability (quick 1, full 4 seeds)
+  mt:power    the same with power cuts (unsynced writes reverted: all / torn),
+              NORMAL (survivors = per-thread prefix) and FULL (acked survive)
   mt          mt_sweep.sh (BEGIN CONCURRENT on real threads, invariant oracle):
               quick = 1 seed, full = 4 seeds, 9 configurations each
   mwriter     mwriter_sweep.sh (BEGIN CONCURRENT, K writers, serialisability model):
@@ -180,6 +182,15 @@ def main():
     add("mt:crash", f"{mtc} && for s in $(seq 1 {nk}); do "
                     f"MT_KILL_MS=300 MT_ITERS=10 {work}/mt_crash {work}/mtc$s.db $s 4 1000000 "
                     f"|| exit 1; done")
+    # Power cuts (same driver, MT_POWER): unsynced writes reverted -- all, or
+    # torn at sectors.  FULL: every acknowledged commit survives; NORMAL: the
+    # survivors are a per-thread prefix.  Atomicity and the invariant always.
+    add("mt:power", f"{mtc} && for s in $(seq 1 {nk}); do for m in all torn; do "
+                    f"MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
+                    f"{work}/mtp$s$m.db $s 4 1000000 || exit 1; "
+                    f"MT_FULL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
+                    f"{work}/mtpf$s$m.db $s 4 1000000 'PRAGMA synchronous=FULL;' || exit 1; "
+                    f"done; done")
 
     print(f"gate: {'FULL' if full else 'quick'} tier, {len(tasks)} tasks, "
           f"{a.jobs} workers, snapshot in {work}", flush=True)
