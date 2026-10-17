@@ -157,8 +157,9 @@ int sqlite3BfCacheAdaptiveFull(void){
 ** Implementation of PRAGMA bf_cache
 **
 ** PRAGMA bf_cache;           -- Returns current enable state
-** PRAGMA bf_cache = ON;      -- Enable for this connection
-** PRAGMA bf_cache = OFF;     -- Disable for this connection
+** PRAGMA bf_cache = ON;      -- Enable (process-wide: swaps the pcache methods)
+** PRAGMA bf_cache = OFF;     -- Disable (process-wide); an ERROR in a
+**                               write-buffering build, see below
 */
 void sqlite3PragmaBfCache(
   Parse *pParse,
@@ -182,11 +183,26 @@ void sqlite3PragmaBfCache(
       bfConfig.bEnabled = 1;
       sqlite3BfCacheSetMethods();
     }else{
+#if defined(SQLITE_BF_INSERT_BUFFERING)
+      /* Refused in a write-buffering build (2026-10-17).  The setting is
+      ** PROCESS-wide (it swaps the global pcache methods, despite the comment
+      ** above), and a WAL here can hold rows that exist only as record frames,
+      ** which only the record cache reads.  Turned off beside a writer, the
+      ** writer stopped seeing its own buffered rows, and a checkpoint then
+      ** backfilled past their frames and the log restart erased them: a
+      ** committed row lost.  The stock comparison is a separate build
+      ** (-DSQLITE_OMIT_BF_CACHE), never this switch. */
+      UNUSED_PARAMETER(db);
+      sqlite3ErrorMsg(pParse, "bf_cache cannot be disabled in a write-buffering "
+                      "build: the log may hold rows only the record cache can read");
+      return;
+#else
       bfConfig.bEnabled = 0;
       /* No global cache to tear down: caches are per pager.  The call that
       ** used to be here operated on bfGlobalCache, which nothing ever
       ** assigned, so it was a mutex acquire and nothing else. */
       sqlite3PCacheSetDefault();
+#endif
     }
   }
 }

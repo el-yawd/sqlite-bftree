@@ -1,0 +1,81 @@
+{
+ "name": "d4",
+ "_comment": [
+  "D4: is the 64 B write-amplification regression (results/fixes 2026-09-08: pg frames/commit",
+  "1.00 -> 3.74 at v64, 182 -> 924 MiB written, when the derived size classes landed) still there?",
+  "Never re-measured after 31d2a33 (honest size classes) and the MiniPageCopy re-logging fix.",
+  "Same arm as fixes.json record_size: insert=100, autocheckpoint 0 (WAL emission itself),",
+  "group_commit 1 (durable mode), v32/v64/v100/v200, bf vs stock.  Read pg frames/commit,",
+  "rec frames/commit, buffered%, insert_fallbacks, merges and evictions per insert.  If v64",
+  "sits at ~1 page frame/commit the item is closed; if not, the counters separate the two",
+  "candidate causes (evict-sooner vs merge-into-base)."
+ ],
+ "datasets": {
+  "v32": {
+   "records": 4000000,
+   "value_len": 32,
+   "key_spacing": 16
+  },
+  "v64": {
+   "records": 4000000,
+   "value_len": 64,
+   "key_spacing": 16
+  },
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  },
+  "v200": {
+   "records": 4000000,
+   "value_len": 200,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "repeats": 2,
+  "seconds": 60,
+  "warmup_seconds": 10,
+  "dist": "zipf",
+  "theta": 0.9,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "bf_page_cache_floor": "16M",
+  "autocheckpoint": 0,
+  "group_commit": 1
+ },
+ "experiments": [
+  {
+   "name": "insert",
+   "workload": "insert=100",
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "axes": {
+    "record_size": [
+     {
+      "label": "v32",
+      "dataset": "v32"
+     },
+     {
+      "label": "v64",
+      "dataset": "v64"
+     },
+     {
+      "label": "v100",
+      "dataset": "v100"
+     },
+     {
+      "label": "v200",
+      "dataset": "v200"
+     }
+    ]
+   }
+  }
+ ]
+}

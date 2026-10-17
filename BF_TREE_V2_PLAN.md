@@ -3244,3 +3244,32 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - Results: stock and BF clean -- sweep 54 release + 27 debug runs, 40 kills, 48 power cuts (all /
   torn / subset x NORMAL / FULL).  BF retries 65-151 per 6,000 transfers vs stock 710-745 (not a
   benchmark).  Gate --full 58/58 in 154 s.
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — soak: an UPSTREAM BEGIN CONCURRENT bug; bf_cache=OFF refused
+
+- **Soak** (`mt_sweep` over fresh seeds + kill/power loops, 30 min, machine saturated): BF failed
+  18 times -- "database disk image is malformed" in a transfer, or SIGSEGV/SIGABRT.  Every core is
+  in BEGIN CONCURRENT's commit-time relocation (`btreeFixUnlocked` -> `btreeRelocateRange` ->
+  `allocateBtreePage`): after the snapshot upgrade, page 1 said the file had ~280 pages while it
+  had 1,742, and the free-list walk then followed garbage (page 19,713; NULL page deref).
+- **Not BF:** the same soak against stock+BC (`-DSQLITE_OMIT_BF_CACHE`, this tree): 11 failures in
+  15 min; against PRISTINE upstream begin-concurrent (`8a1edc2f3`, built in a scratch worktree,
+  untouched): 17 failures in 15 min, same signatures.  It needs heavy CPU contention (60+ runs at
+  normal load stay clean) and appeared once the oracle's churn table started freeing pages
+  (deletes of page-sized values -> free-list reuse during relocation).  Recorded as an upstream
+  defect affecting the stock_bc baseline too; not fixed (owner rule: stock is not modified).
+  A first hypothesis -- stale BF full-page copies read after the snapshot upgrade -- led to a
+  defensive change that stays (the commit scan drops this connection's full-page copy and leaf
+  bit of every page another commit wrote, before anything reads at the new snapshot) but did not
+  change the soak (22 failures).
+- **`PRAGMA bf_cache=OFF` is now an error in write-buffering builds.**  The switch is
+  process-wide (it swaps the global pcache methods); turned off beside a writer, the writer
+  stopped seeing its own buffered rows, and a TRUNCATE checkpoint then erased them (101 -> 100
+  rows, reproduced).  Stock comparisons use the separate OMIT build.
+- **Trigger isolated:** upstream with the pre-churn oracle -- 0 failures in 15 min; upstream with
+  churn but no page-sized values (`MT_SMALL=1`) -- 0.  So overflow/free-list churn under load
+  trips it.  **BF with `MT_SMALL=1`: 0 failures in a 30-min saturated soak (seeds 100-290)**:
+  every soak failure so far is the upstream defect.  The gate's threaded tasks now set
+  `MT_SMALL=1`; run without it only to study the upstream bug.  For the owner: the stock+BC
+  baseline is not crash-safe under this workload, which matters for any concurrent comparison.
+- Gate --full 58/58.

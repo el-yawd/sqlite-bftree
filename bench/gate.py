@@ -165,14 +165,16 @@ def main():
     else:
         add("mwriter:release", f"{mw} && SEEDS=1 SEEDE=2 MODES='plain checkcommit' "
                                f"bash {BENCH}/mwriter_sweep.sh {work}/mw_bf")
+    # MT_SMALL=1 everywhere: no page-sized values, which trip an UPSTREAM
+    # begin-concurrent free-list bug under load (plan 2026-10-17).
     # mt: REAL threads (bench/mt_oracle.c), the only check that runs commits,
     # checkpoints and catch-ups at the same time.  Timing-dependent: a race
     # shows in a few percent of runs, so it is a net, not a proof.
     mt = ccdrv("mt_bf", "mt_oracle.c", "-O1 -g")
     if full:
-        add("mt:release", f"{mt} && SEEDS=1 SEEDE=4 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
+        add("mt:release", f"{mt} && MT_SMALL=1 SEEDS=1 SEEDE=4 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
     else:
-        add("mt:release", f"{mt} && SEEDS=1 SEEDE=1 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
+        add("mt:release", f"{mt} && MT_SMALL=1 SEEDS=1 SEEDE=1 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
     # mt crash mode: SIGKILL the threaded workload, recover IN the long-lived
     # parent (a used heap: recover_heap_repro's bug), check atomicity and that
     # every acknowledged commit survived.  Its own driver build: the sweep task
@@ -180,15 +182,15 @@ def main():
     mtc = ccdrv("mt_crash", "mt_oracle.c", "-O1 -g")
     nk = 4 if full else 1
     add("mt:crash", f"{mtc} && for s in $(seq 1 {nk}); do "
-                    f"MT_KILL_MS=300 MT_ITERS=10 {work}/mt_crash {work}/mtc$s.db $s 4 1000000 "
+                    f"MT_SMALL=1 MT_KILL_MS=300 MT_ITERS=10 {work}/mt_crash {work}/mtc$s.db $s 4 1000000 "
                     f"|| exit 1; done")
     # Power cuts (same driver, MT_POWER): unsynced writes reverted -- all, or
     # torn at sectors.  FULL: every acknowledged commit survives; NORMAL: the
     # survivors are a per-thread prefix.  Atomicity and the invariant always.
     add("mt:power", f"{mtc} && for s in $(seq 1 {nk}); do for m in all torn; do "
-                    f"MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
+                    f"MT_SMALL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
                     f"{work}/mtp$s$m.db $s 4 1000000 || exit 1; "
-                    f"MT_FULL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
+                    f"MT_SMALL=1 MT_FULL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
                     f"{work}/mtpf$s$m.db $s 4 1000000 'PRAGMA synchronous=FULL;' || exit 1; "
                     f"done; done")
 

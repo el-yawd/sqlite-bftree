@@ -69,7 +69,8 @@ static int gIter = 0;       /* crash mode: iteration, part of every hist id */
 #define SCR_KEYS   300
 #define SCR_SPAN   1000000LL
 #define MAXPEND    16
-static int intentFd = -1;   /* crash mode: churn ops of each attempt, pre-COMMIT */
+static int intentFd = -1;
+static int bSmall = 0;      /* MT_SMALL=1: see scrMkVal */   /* crash mode: churn ops of each attempt, pre-COMMIT */
 
 typedef struct Thr {
   int id;
@@ -180,7 +181,10 @@ static const char *scrView(Thr *t, int j){
   return t->aScr[j];
 }
 static char *scrMkVal(Thr *t, int seq, int big){
-  int n = big ? 2000 + (int)(rnd(t)%1500) : 8 + (int)(rnd(t)%50);
+  /* MT_SMALL=1: no page-sized values.  Pristine upstream begin-concurrent
+  ** (8a1edc2f3) corrupts its free list under heavy load with them (plan,
+  ** 2026-10-17); the gate runs with this set so it stays deterministic. */
+  int n = (big && !bSmall) ? 2000 + (int)(rnd(t)%1500) : 8 + (int)(rnd(t)%50);
   char *z = (char*)malloc(n+1);
   int k = snprintf(z, n+1, "t%d.%d.%u.", t->id, seq, rnd(t)%100000);
   if( k>n ) k = n;
@@ -1002,6 +1006,7 @@ int main(int argc, char **argv){
   if( argc>5 ) zPragmas = argv[5];
   if( nThr<1 || nThr>MAXTHR || nTxnPer<1 ){ fprintf(stderr, "bad args\n"); return 2; }
   if( getenv("MT_LOG") ) sqlite3_config(SQLITE_CONFIG_LOG, logCb, (void*)0);
+  bSmall = getenv("MT_SMALL")!=0;
   if( !getenv("MT_CHECKONLY") ){ char b[600];
     snprintf(b, sizeof(b), "%s", zDb); remove(b);
     snprintf(b, sizeof(b), "%s-wal", zDb); remove(b);

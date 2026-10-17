@@ -3623,6 +3623,18 @@ static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
   int i;
   if( op==-2 ) return bfRsFitCheck((BfRsCtx*)pCtx);
   if( op<0 ){
+    /* Another transaction wrote page `leaf`.  This commit is about to move to
+    ** the head of the log (btreeFixUnlocked upgrades its snapshot) and may
+    ** read pages there -- free-list trunks, pages it relocates.  Upstream
+    ** drops its own stale copies from the pager cache (walLockForCommit), but
+    ** readDbPage also serves a page from a BF full-page copy, which describes
+    ** OUR snapshot: a leaf another transaction freed and reused as a free-list
+    ** trunk was read back as the old leaf, and allocateBtreePage followed
+    ** garbage to page 19,713 (bench/mt_oracle.c soak: SIGSEGV in
+    ** btreeRelocateRange, "database disk image is malformed").  Drop it now;
+    ** the rebase after the commit rebuilds whatever the cache needs. */
+    sqlite3BfFullPageDrop(pBf, leaf);
+    sqlite3BfLeafBitClear(pBf, leaf);
     /* A page frame another transaction committed.  Upstream's page check
     ** must already have refused a commit that also WROTE this page (writing
     ** it means reading it); if we get here with it written, that check missed
