@@ -61,10 +61,25 @@ static volatile int bFail;
 static int ackFd = -1;      /* crash mode: "thread seq" per acknowledged commit */
 static int gIter = 0;       /* crash mode: iteration, part of every hist id */
 
+/* Churn (2026-10-17): every thread also owns SCR_KEYS rows of table scr --
+** id (thread+1)*SCR_SPAN + j -- and inserts, updates (small or page-sized
+** values), deletes and range-reads them inside its transfers, with savepoint
+** rollbacks; an exact per-thread model checks every read and the end state.
+** scr has a secondary index on thr, which is written through (page-level). */
+#define SCR_KEYS   300
+#define SCR_SPAN   1000000LL
+#define MAXPEND    16
+static int intentFd = -1;   /* crash mode: churn ops of each attempt, pre-COMMIT */
+
 typedef struct Thr {
   int id;
   sqlite3 *db;
   unsigned long long rng;
+  char *aScr[SCR_KEYS];     /* committed scr values (NULL: absent) */
+  int nP;                   /* this attempt's pending churn ops */
+  int aPj[MAXPEND];
+  char *aPv[MAXPEND];
+  long nChurnOps, nSavepoint, nRangeCheck;
   char *aDone;              /* aDone[seq]: transfer seq committed */
   int *aFrom, *aTo, *aAmt;  /* what transfer seq did */
   long nCommit, nRetry, nReadCheck, nCkpt;
@@ -156,6 +171,180 @@ static int isRetry(int rc){
   return (rc&0xff)==SQLITE_BUSY || (rc&0xff)==SQLITE_LOCKED;
 }
 
+static long long scrKey(int t, int j){ return (long long)(t+1)*SCR_SPAN + j; }
+
+/* The value this attempt sees for key j: its own pending ops, else committed. */
+static const char *scrView(Thr *t, int j){
+  int i;
+  for(i=t->nP-1; i>=0; i--) if( t->aPj[i]==j ) return t->aPv[i];
+  return t->aScr[j];
+}
+static char *scrMkVal(Thr *t, int seq, int big){
+  int n = big ? 2000 + (int)(rnd(t)%1500) : 8 + (int)(rnd(t)%50);
+  char *z = (char*)malloc(n+1);
+  int k = snprintf(z, n+1, "t%d.%d.%u.", t->id, seq, rnd(t)%100000);
+  if( k>n ) k = n;
+  memset(z+k, 'a' + (int)(rnd(t)%26), n-k);
+  z[n] = 0;
+  return z;
+}
+static void scrDropPending(Thr *t){
+  int i;
+  for(i=0; i<t->nP; i++) free(t->aPv[i]);
+  t->nP = 0;
+}
+/* Run one statement on scr; returns rc, *pnChange = rows changed. */
+static int scrExec(sqlite3 *db, const char *zSql, long long id, int thr,
+                   const char *zVal, int *pnChange){
+  sqlite3_stmt *p;
+  int rc = sqlite3_prepare_v2(db, zSql, -1, &p, 0);
+  if( rc ) return rc;
+  /* ?1 id; INSERT: ?2 thr, ?3 val; UPDATE: ?2 val; DELETE: nothing more. */
+  sqlite3_bind_int64(p, 1, id);
+  if( sqlite3_bind_parameter_count(p)==3 ){
+    sqlite3_bind_int(p, 2, thr);
+    sqlite3_bind_text(p, 3, zVal, -1, SQLITE_STATIC);
+  }else if( sqlite3_bind_parameter_count(p)==2 ){
+    sqlite3_bind_text(p, 2, zVal, -1, SQLITE_STATIC);
+  }
+  rc = sqlite3_step(p);
+  sqlite3_finalize(p);
+  *pnChange = sqlite3_changes(db);
+  return rc==SQLITE_DONE ? SQLITE_OK : rc;
+}
+/* One insert / update / delete of key j, as the view dictates. */
+static int scrOp(Thr *t, int seq, int j, char **pzNew){
+  const char *zOld = scrView(t, j);
+  int rc, nCh = 0;
+  *pzNew = 0;
+  if( zOld==0 ){
+    *pzNew = scrMkVal(t, seq, rnd(t)%4==0);
+    rc = scrExec(t->db, "INSERT INTO scr(id, thr, val) VALUES(?1, ?2, ?3)",
+                 scrKey(t->id, j), t->id, *pzNew, &nCh);
+  }else if( rnd(t)%3==0 ){
+    rc = scrExec(t->db, "DELETE FROM scr WHERE id=?1", scrKey(t->id, j), 0, 0, &nCh);
+  }else{
+    *pzNew = scrMkVal(t, seq, rnd(t)%4==0);
+    rc = scrExec(t->db, "UPDATE scr SET val=?2 WHERE id=?1", scrKey(t->id, j), 0,
+                 *pzNew, &nCh);
+  }
+  if( rc==SQLITE_OK && nCh!=1 ){
+    char z[120];
+    snprintf(z, sizeof(z), "scr op on key %d changed %d rows (view says %s)",
+             j, nCh, zOld ? "present" : "absent");
+    snprintf(t->zErr, sizeof(t->zErr), "thread %d: %s", t->id, z);
+    bFail = 1;
+    rc = SQLITE_ERROR;
+  }
+  if( rc!=SQLITE_OK ){ free(*pzNew); *pzNew = 0; }
+  return rc;
+}
+/* Compare scr keys [lo,hi] with the view. */
+static int scrRangeCheck(Thr *t, int lo, int hi){
+  sqlite3_stmt *p;
+  int rc, want = lo, j;
+  rc = sqlite3_prepare_v2(t->db, "SELECT id, val FROM scr WHERE id BETWEEN ? AND ? ORDER BY id",
+                          -1, &p, 0);
+  if( rc ) return rc;
+  sqlite3_bind_int64(p, 1, scrKey(t->id, lo));
+  sqlite3_bind_int64(p, 2, scrKey(t->id, hi));
+  while( (rc = sqlite3_step(p))==SQLITE_ROW ){
+    int gj = (int)(sqlite3_column_int64(p, 0) - scrKey(t->id, 0));
+    const char *gv = (const char*)sqlite3_column_text(p, 1);
+    for(j=want; j<gj; j++) if( scrView(t, j) ) break;
+    if( j<gj || !scrView(t, gj) || strcmp(scrView(t, gj), gv) ){
+      snprintf(t->zErr, sizeof(t->zErr), "thread %d: scr range [%d,%d] wrong at key %d",
+               t->id, lo, hi, j<gj ? j : gj);
+      bFail = 1;
+      sqlite3_finalize(p);
+      return SQLITE_ERROR;
+    }
+    want = gj+1;
+  }
+  sqlite3_finalize(p);
+  if( rc!=SQLITE_DONE ) return rc;
+  for(j=want; j<=hi; j++) if( scrView(t, j) ){
+    snprintf(t->zErr, sizeof(t->zErr), "thread %d: scr range [%d,%d] misses key %d",
+             t->id, lo, hi, j);
+    bFail = 1;
+    return SQLITE_ERROR;
+  }
+  t->nRangeCheck++;
+  return SQLITE_OK;
+}
+/* The churn part of one attempt.  Pending ops are kept in t->aP*. */
+static int scrChurn(Thr *t, int seq){
+  int nOp = 1 + (int)(rnd(t)%4), i, rc = SQLITE_OK;
+  for(i=0; i<nOp && rc==SQLITE_OK && t->nP<MAXPEND; i++){
+    int j = (int)(rnd(t)%SCR_KEYS);
+    char *zNew = 0;
+    if( rnd(t)%5==0 ){
+      /* An op inside a savepoint that is rolled back: it must leave no trace. */
+      rc = execStep(t->db, "SAVEPOINT sp");
+      if( rc==SQLITE_OK ) rc = scrOp(t, seq, j, &zNew);
+      free(zNew);
+      if( rc==SQLITE_OK ) rc = execStep(t->db, "ROLLBACK TO sp");
+      if( rc==SQLITE_OK ) rc = execStep(t->db, "RELEASE sp");
+      if( rc==SQLITE_OK ) rc = scrRangeCheck(t, j, j);
+      t->nSavepoint++;
+      continue;
+    }
+    rc = scrOp(t, seq, j, &zNew);
+    if( rc==SQLITE_OK ){
+      t->aPj[t->nP] = j;
+      t->aPv[t->nP] = zNew;
+      t->nP++;
+      t->nChurnOps++;
+    }
+  }
+  if( rc==SQLITE_OK && rnd(t)%3==0 ){
+    int lo = (int)(rnd(t)%SCR_KEYS), hi = lo + (int)(rnd(t)%40);
+    if( hi>=SCR_KEYS ) hi = SCR_KEYS-1;
+    rc = scrRangeCheck(t, lo, hi);
+  }
+  if( rc==SQLITE_OK && rnd(t)%4==0 ){
+    /* through the secondary index */
+    sqlite3_stmt *p;
+    int nWant = 0, j;
+    for(j=0; j<SCR_KEYS; j++) if( scrView(t, j) ) nWant++;
+    rc = sqlite3_prepare_v2(t->db, "SELECT count(*) FROM scr WHERE thr=?", -1, &p, 0);
+    if( rc==SQLITE_OK ){
+      sqlite3_bind_int(p, 1, t->id);
+      rc = sqlite3_step(p);
+      if( rc==SQLITE_ROW ){
+        if( sqlite3_column_int(p, 0)!=nWant ){
+          snprintf(t->zErr, sizeof(t->zErr), "thread %d: index count %d, view %d",
+                   t->id, sqlite3_column_int(p, 0), nWant);
+          bFail = 1;
+          rc = SQLITE_ERROR;
+        }else{
+          rc = SQLITE_OK;
+        }
+      }
+      sqlite3_finalize(p);
+    }
+  }
+  return rc;
+}
+/* Crash mode: record this attempt's churn ops BEFORE its COMMIT, so the
+** parent can rebuild scr for whichever attempts survived (the last attempt of
+** a seq is the one that committed, if any did). */
+static int scrIntent(Thr *t, int seq){
+  int i, n = 0, cap = 64;
+  char *z;
+  for(i=0; i<t->nP; i++) cap += 40 + (t->aPv[i] ? (int)strlen(t->aPv[i]) : 0);
+  z = (char*)malloc(cap);
+  if( z==0 ) return SQLITE_NOMEM;
+  n += snprintf(z+n, cap-n, "I %d %d %d\n", t->id, seq, t->nP);
+  for(i=0; i<t->nP; i++){
+    n += snprintf(z+n, cap-n, "%d %d %s\n", t->aPj[i],
+                  t->aPv[i] ? (int)strlen(t->aPv[i]) : -1, t->aPv[i] ? t->aPv[i] : "");
+  }
+  if( write(intentFd, z, n)!=n ){ free(z); return SQLITE_IOERR; }
+  free(z);
+  return SQLITE_OK;
+}
+
 static void *thrMain(void *pArg){
   Thr *t = (Thr*)pArg;
   int seq, rc;
@@ -194,11 +383,20 @@ static void *thrMain(void *pArg){
       if( rc==SQLITE_OK ) rc = getBal(t->db, to, &bb);
       if( rc==SQLITE_OK ) rc = setBal(t->db, from, ba - amt);
       if( rc==SQLITE_OK ) rc = setBal(t->db, to, bb + amt);
+      t->nP = 0;
+      if( rc==SQLITE_OK && rnd(t)%100<40 ) rc = scrChurn(t, seq);
       if( rc==SQLITE_OK ) rc = addHist(t->db,
                                        (long long)(gIter*MAXTHR + t->id)*HIST_BASE + seq,
                                        from, to, amt);
+      if( rc==SQLITE_OK && intentFd>=0 ) rc = scrIntent(t, seq);
       if( rc==SQLITE_OK ) rc = execStep(t->db, "COMMIT");
       if( rc==SQLITE_OK ){
+        int i;
+        for(i=0; i<t->nP; i++){          /* committed: into the model */
+          free(t->aScr[t->aPj[i]]);
+          t->aScr[t->aPj[i]] = t->aPv[i];
+        }
+        t->nP = 0;
         t->aDone[seq] = 1;
         t->nCommit++;
         if( ackFd>=0 ){
@@ -209,13 +407,42 @@ static void *thrMain(void *pArg){
         }
         break;
       }
+      scrDropPending(t);
       if( sqlite3_get_autocommit(t->db)==0 ) execStep(t->db, "ROLLBACK");
+      if( bFail ) break;
       if( isRetry(rc) ){ t->nRetry++; continue; }
       fail(t, "transfer", t->db);
       break;
     }
   }
   return 0;
+}
+
+/* scr rows of thread ti must equal aWant (NULL = absent). */
+static int scrCompare(sqlite3 *db, int ti, char **aWant, const char *zWhen){
+  sqlite3_stmt *p;
+  int want = 0, j, bad = 0;
+  if( sqlite3_prepare_v2(db, "SELECT id, val, thr FROM scr WHERE id BETWEEN ? AND ? ORDER BY id",
+                         -1, &p, 0) ) return 1;
+  sqlite3_bind_int64(p, 1, scrKey(ti, 0));
+  sqlite3_bind_int64(p, 2, scrKey(ti, SCR_KEYS-1));
+  while( sqlite3_step(p)==SQLITE_ROW ){
+    int gj = (int)(sqlite3_column_int64(p, 0) - scrKey(ti, 0));
+    const char *gv = (const char*)sqlite3_column_text(p, 1);
+    for(j=want; j<gj; j++) if( aWant[j] && bad++<5 ){
+      fprintf(stderr, "FAIL %s: thread %d scr key %d missing\n", zWhen, ti, j);
+    }
+    if( (!aWant[gj] || strcmp(aWant[gj], gv) || sqlite3_column_int(p, 2)!=ti) && bad++<5 ){
+      fprintf(stderr, "FAIL %s: thread %d scr key %d = %.30s, want %.30s\n", zWhen, ti, gj,
+              gv, aWant[gj] ? aWant[gj] : "(absent)");
+    }
+    want = gj+1;
+  }
+  sqlite3_finalize(p);
+  for(j=want; j<SCR_KEYS; j++) if( aWant[j] && bad++<5 ){
+    fprintf(stderr, "FAIL %s: thread %d scr key %d missing (tail)\n", zWhen, ti, j);
+  }
+  return bad;
 }
 
 /* The end-state checks, on any connection. */
@@ -266,6 +493,7 @@ static int finalCheck(sqlite3 *db, const char *zWhen){
             zWhen, nHist, nWantHist);
     bad++;
   }
+  for(i=0; i<nThr; i++) bad += scrCompare(db, i, aThr[i].aScr, zWhen);
   rc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &p, 0);
   if( rc==SQLITE_OK && sqlite3_step(p)==SQLITE_ROW
    && strcmp((const char*)sqlite3_column_text(p, 0), "ok") ){
@@ -514,6 +742,60 @@ static void plInstall(const char *zMode, long cutMs, unsigned seed){
 ** Iterations accumulate on the same file, so each one also recovers from the
 ** previous crash and keeps working.
 */
+/* Crash mode: per thread, the last intent recorded for each seq. */
+typedef struct ScrIntent ScrIntent;
+struct ScrIntent { int n; int aj[MAXPEND]; char *av[MAXPEND]; };
+static ScrIntent **aIntent[MAXTHR];
+static int anIntent[MAXTHR];
+static void scrIntentsFree(void){
+  int t, q, i;
+  for(t=0; t<MAXTHR; t++){
+    for(q=0; q<anIntent[t]; q++){
+      ScrIntent *x = aIntent[t][q];
+      if( x ){ for(i=0; i<x->n; i++) free(x->av[i]); free(x); }
+    }
+    free(aIntent[t]); aIntent[t] = 0; anIntent[t] = 0;
+  }
+}
+static void scrIntentsLoad(const char *zFile){
+  FILE *f = fopen(zFile, "r");
+  int t, seq, n, i;
+  scrIntentsFree();
+  if( f==0 ) return;
+  while( fscanf(f, " I %d %d %d", &t, &seq, &n)==3 ){
+    ScrIntent *x;
+    if( t<0 || t>=MAXTHR || seq<0 || n<0 || n>MAXPEND ) break;
+    x = (ScrIntent*)calloc(1, sizeof(*x));
+    for(i=0; i<n; i++){
+      int j, len, c;
+      if( fscanf(f, "%d %d", &j, &len)!=2 ) break;
+      c = fgetc(f);                         /* the separating space */
+      (void)c;
+      x->aj[i] = j;
+      if( len>=0 ){
+        x->av[i] = (char*)malloc(len+1);
+        if( (int)fread(x->av[i], 1, len, f)!=len ){ free(x->av[i]); x->av[i] = 0; break; }
+        x->av[i][len] = 0;
+      }
+      x->n = i+1;
+    }
+    if( i<n ){ for(i=0; i<x->n; i++) free(x->av[i]); free(x); break; }  /* torn tail */
+    if( seq>=anIntent[t] ){
+      int nNew = seq+1024;
+      aIntent[t] = (ScrIntent**)realloc(aIntent[t], sizeof(ScrIntent*)*nNew);
+      memset(&aIntent[t][anIntent[t]], 0, sizeof(ScrIntent*)*(nNew-anIntent[t]));
+      anIntent[t] = nNew;
+    }
+    if( aIntent[t][seq] ){                  /* a later attempt of the same seq */
+      ScrIntent *o = aIntent[t][seq];
+      for(i=0; i<o->n; i++) free(o->av[i]);
+      free(o);
+    }
+    aIntent[t][seq] = x;
+  }
+  fclose(f);
+}
+
 static int crashCheck(const char *zAck){
   sqlite3 *db = openConn();
   sqlite3_stmt *p;
@@ -587,6 +869,44 @@ static int crashCheck(const char *zAck){
     sqlite3_finalize(q);
     fclose(f);
   }
+  {
+    /* scr: rebuild each thread's expected rows from the surviving prefix of
+    ** its transfers (the hist rows of this iteration, which must be seqs
+    ** 0..k: a thread commits in order) and the last intent of each seq. */
+    char zIntent[600];
+    sqlite3_stmt *q;
+    int ti;
+    snprintf(zIntent, sizeof(zIntent), "%s-intent", zDb);
+    scrIntentsLoad(zIntent);
+    sqlite3_prepare_v2(db, "SELECT count(*), coalesce(max(id),-1) FROM hist WHERE id>=? AND id<?",
+                       -1, &q, 0);
+    for(ti=0; ti<nThr; ti++){
+      long long lo = (long long)(gIter*MAXTHR + ti)*HIST_BASE, nr = 0, mx = -1;
+      int sq, i;
+      sqlite3_bind_int64(q, 1, lo);
+      sqlite3_bind_int64(q, 2, lo + HIST_BASE);
+      if( sqlite3_step(q)==SQLITE_ROW ){
+        nr = sqlite3_column_int64(q, 0);
+        mx = sqlite3_column_int64(q, 1);
+      }
+      sqlite3_reset(q);
+      if( nr>0 && mx-lo+1!=nr ){
+        if( bad++<5 ) fprintf(stderr, "FAIL iter %d: thread %d kept %lld transfers but its "
+                              "last is seq %lld (not a prefix)\n", gIter, ti, nr, mx-lo);
+        continue;
+      }
+      for(sq=0; sq<nr; sq++){
+        ScrIntent *x = sq<anIntent[ti] ? aIntent[ti][sq] : 0;
+        if( x==0 ) continue;                /* a transfer without churn */
+        for(i=0; i<x->n; i++){
+          free(aThr[ti].aScr[x->aj[i]]);
+          aThr[ti].aScr[x->aj[i]] = x->av[i] ? strdup(x->av[i]) : 0;
+        }
+      }
+      bad += scrCompare(db, ti, aThr[ti].aScr, "after crash");
+    }
+    sqlite3_finalize(q);
+  }
   rc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &p, 0);
   if( rc==SQLITE_OK && sqlite3_step(p)==SQLITE_ROW
    && strcmp((const char*)sqlite3_column_text(p, 0), "ok") ){
@@ -610,11 +930,14 @@ static int crashMode(int killMs, int nIter){
     unsigned long long r = (seed0+7)*0x9E3779B97F4A7C15ull + (unsigned)gIter*7919u;
     long ms = killMs/4 + (long)((r>>17) % (unsigned long long)(killMs - killMs/4 + 1));
     remove(zAck);
+    { char zI[600]; snprintf(zI, sizeof(zI), "%s-intent", zDb); remove(zI); }
     pid = fork();
     if( pid==0 ){
       pthread_t aTid[MAXTHR];
       if( getenv("MT_POWER") ) plInstall(getenv("MT_POWER"), ms, (unsigned)(r>>9));
       ackFd = open(zAck, O_WRONLY|O_CREAT|O_APPEND, 0644);
+      { char zI[600]; snprintf(zI, sizeof(zI), "%s-intent", zDb);
+        intentFd = open(zI, O_WRONLY|O_CREAT|O_APPEND, 0644); }
       for(i=0; i<nThr; i++){
         Thr *t = &aThr[i];
         t->id = i;
@@ -652,8 +975,8 @@ static int crashMode(int killMs, int nIter){
     if( getenv("MT_SAVE") ){
       /* Keep the files exactly as the kill left them, to replay the check. */
       char zCmd[2000];
-      snprintf(zCmd, sizeof(zCmd), "mkdir -p '%s' && cp '%s' '%s-wal' '%s-shm' '%s' '%s'/ 2>/dev/null",
-               getenv("MT_SAVE"), zDb, zDb, zDb, zAck, getenv("MT_SAVE"));
+      snprintf(zCmd, sizeof(zCmd), "mkdir -p '%s' && cp '%s' '%s-wal' '%s-shm' '%s' '%s-intent' '%s'/ 2>/dev/null",
+               getenv("MT_SAVE"), zDb, zDb, zDb, zAck, zDb, getenv("MT_SAVE"));
       if( system(zCmd) ){ /* best effort */ }
     }
     if( crashCheck(zAck) ) return 1;
@@ -688,6 +1011,8 @@ int main(int argc, char **argv){
   if( !getenv("MT_CHECKONLY") && sqlite3_exec(db,
         "CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER);"
         "CREATE TABLE hist(id INTEGER PRIMARY KEY, a INT, b INT, amt INT);"
+        "CREATE TABLE scr(id INTEGER PRIMARY KEY, thr INT, val TEXT);"
+        "CREATE INDEX scr_thr ON scr(thr);"
         "BEGIN;"
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<400)"
         "  INSERT INTO acct SELECT x, 1000 FROM c;"
@@ -739,7 +1064,10 @@ int main(int argc, char **argv){
   bad += finalCheck(db, "after reopen");
   sqlite3_close(db);
   if( bad ) return 1;
-  printf("OK %d threads x %d transfers: %ld committed, %ld retries, %ld snapshot "
-         "checks, %ld checkpoints\n", nThr, nTxnPer, nCommit, nRetry, nRead, nCkpt);
+  { long nCh = 0, nSp = 0, nRg = 0;
+    for(i=0; i<nThr; i++){ nCh += aThr[i].nChurnOps; nSp += aThr[i].nSavepoint; nRg += aThr[i].nRangeCheck; }
+    printf("OK %d threads x %d transfers: %ld committed, %ld retries, %ld snapshot "
+           "checks, %ld checkpoints; scr: %ld ops, %ld savepoints, %ld range checks\n",
+           nThr, nTxnPer, nCommit, nRetry, nRead, nCkpt, nCh, nSp, nRg); }
   return 0;
 }

@@ -3228,3 +3228,19 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   leaf-bit-reuse case matched stock with it removed); kept on the argument.  The seek-shortcut fix
   disables SQLite's consecutive-key shortcut whenever the cache holds buffered records (in steady
   state, always): a per-leaf test would restore it -- a perf follow-up, not measured.
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — threaded oracle: a non-commutative workload
+
+- `mt_oracle.c` transfers now also churn a second table, `scr(id, thr, val)` with a secondary
+  index on `thr` (write-through, page-level): each thread owns 300 keys and, in 40% of its
+  transactions, inserts / updates / deletes 1-4 of them (25% page-sized values, 2-3.5 KB), with
+  20% of those ops inside a SAVEPOINT that is rolled back, plus range reads and index counts --
+  every read checked against an exact per-thread model of committed state + the attempt's own
+  writes; the end state compared row by row.  Crash/power mode: the child appends each attempt's
+  churn ops to `<db>-intent` BEFORE its COMMIT; the parent rebuilds each thread's expected rows
+  from the surviving prefix (hist seqs 0..k, now also checked to be contiguous for kills) and
+  carries the result into the next iteration.  Mutation (drop the last surviving seq from the
+  rebuild): fails at once.
+- Results: stock and BF clean -- sweep 54 release + 27 debug runs, 40 kills, 48 power cuts (all /
+  torn / subset x NORMAL / FULL).  BF retries 65-151 per 6,000 transfers vs stock 710-745 (not a
+  benchmark).  Gate --full 58/58 in 154 s.
