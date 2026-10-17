@@ -767,7 +767,16 @@ int sqlite3BfBtreeLogAllDirty(Btree *p){
   ** spilled, so it is never deferred either. */
   nGroup = sqlite3BfGroupCommitTxns();
   g->nTxn++;
+  /* Never for a BEGIN CONCURRENT transaction (2026-10-17): a deferred commit
+  ** is acknowledged but in no log, so every other connection -- and every
+  ** concurrent transaction's validation -- reads the state before it.  With
+  ** bf_group_commit=8, bench/mt_oracle.c lost transfers at once (snapshot
+  ** totals off) and mwriter_oracle failed within 30 ops.  Deferral stays what
+  ** plan D2 says it is: single-writer, bounded deferred durability. */
   if( nGroup<=1 || g->nTxn>=nGroup || nClear>0
+#ifdef SQLITE_BF_CONCURRENT
+   || pBf->bRsActive
+#endif
    || sqlite3PagerBfHasDirty(ctx.pPager) ){
     bfGroupStage(g, ctx.pPager, &ctx.rc);
   }else{

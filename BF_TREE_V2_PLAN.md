@@ -3158,3 +3158,16 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   14 (options A-D; recommendation D: leave it to C4's own log, go to C3).
 - Correctness: gate --full 55/55 (difftest now includes gen_balance_stress); mt 120 release + 80
   debug runs; mconn 96/96; mwriter 576 release + 96 debug.
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — deferred commit never applies to BEGIN CONCURRENT
+
+- `bf_group_commit=8` (deferred commit) with several BEGIN CONCURRENT writers lost updates: a
+  deferred commit is acknowledged but in no log, so other connections and their validation read
+  the state before it (mt_oracle: snapshot totals off at once; mwriter: fails within 30 ops).  A
+  concurrent transaction's commit now always stages (`bfGroupStage`, open batch included).
+  Deferral stays single-writer, as D2 defines it.  Both multi-writer sweeps now carry a
+  `bf_group_commit=8` configuration.  Gate --full 55/55; mt 90; mconn 96; mwriter 432.
+- **C3 not started:** it retires CLEAR and "one SQLite WAL, page-sized frames", which CLAUDE.md
+  lists as locked decisions; docs/design/concurrent-engine.md section 13 asks the owner to
+  approve P1-P5 first.  Next, within the approved scope: a crash oracle with concurrent writers
+  (design section 10).

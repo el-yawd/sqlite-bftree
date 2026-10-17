@@ -1,7 +1,7 @@
 #!/bin/bash
 # Multi-WRITER oracle sweep (BEGIN CONCURRENT, bench/mwriter_oracle.c).
 #
-# Every seed in [SEEDS, SEEDE] under 7 configurations (4 writers) plus 8 writers,
+# Every seed in [SEEDS, SEEDE] under 8 configurations (4 writers) plus 8 writers,
 # in parallel per seed.  MODES picks the oracle checks (default: plain run and
 # MW_CHECKCOMMIT, which verifies each committer's whole view after its commit).
 #
@@ -20,7 +20,8 @@ CFGS=(""
 "PRAGMA bf_cache_size=262144; PRAGMA bf_promotion_rate=100; PRAGMA bf_scan_promotion=100;"
 "PRAGMA bf_promotion_rate=100; PRAGMA bf_read_record_cache=0;"
 "PRAGMA bf_cache_size=131072; PRAGMA wal_autocheckpoint=20;"
-"PRAGMA bf_promotion_rate=100; PRAGMA bf_adaptive_full=2;")
+"PRAGMA bf_promotion_rate=100; PRAGMA bf_adaptive_full=2;"
+"PRAGMA bf_group_commit=8;")
 run(){ # tag seed nconn cfg mode
   local d=$W/$1 out env=""
   case "$5" in checkcommit) env="MW_CHECKCOMMIT=1";; norange) env="MW_NORANGE=1";; esac

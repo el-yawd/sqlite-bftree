@@ -24,7 +24,7 @@ Tasks, per tier (quick = fewer seeds):
   stale_ckpt  stale_ckpt_repro.c: a stale-cache checkpoint must not erase another
               connection's committed record frames (2026-10-13)
   mt          mt_sweep.sh (BEGIN CONCURRENT on real threads, invariant oracle):
-              quick = 1 seed, full = 4 seeds, 8 configurations each
+              quick = 1 seed, full = 4 seeds, 9 configurations each
   mwriter     mwriter_sweep.sh (BEGIN CONCURRENT, K writers, serialisability model):
               quick = 2 seeds x {plain, checkcommit}; full = 4 seeds x {plain,
               checkcommit, norange} + SQLITE_DEBUG 2 seeds
