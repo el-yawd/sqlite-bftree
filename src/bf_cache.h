@@ -584,6 +584,15 @@ struct BfCache {
   u64 nConcConflict;        /* ... refused for a row-level conflict */
   u64 nConcOps;             /* record ops from other commits tested */
   u64 nConcNoFit;           /* ... refused: a leaf's records would not fit */
+  /* C2a (2026-10-17): every leaf sqlite3BfRecordWrite wrote to in the current
+  ** write transaction, so a ROLLBACK can replay just those
+  ** (sqlite3BfBtreeRollbackIncremental).  Not deduplicated beyond the last
+  ** entry; past BF_TXN_PG_MAX it overflows and the rollback rebuilds in full. */
+  u32 *aTxnPg;
+  int nTxnPg, nTxnPgAlloc;
+  u8 bTxnTrack, bTxnOverflow;
+  u64 nTxnSpill0;           /* pager spill count when the write txn began */
+  u64 nRollbackIncr;        /* rollbacks done incrementally */
   u8 bReplayGrow;           /* a replay is writing: mini-pages may grow past
                             ** BF_MAX_MINI_GROW (bfReplayOnePage) */
   u32 pgnoFlushOwner;       /* leaf bfFlushOneMiniPage is replaying, else 0 */
@@ -1058,6 +1067,12 @@ SQLITE_PRIVATE int sqlite3BfCacheLeafFits(BfCache*, BfWalIndex*, u32 pgno,
 SQLITE_PRIVATE int sqlite3BfCacheReplayPages(BfCache*, BfWalIndex*, u32,
                                              const u32*, int);
 SQLITE_PRIVATE int sqlite3BfBtreeSnapshotAdvance(Btree *p);
+SQLITE_PRIVATE int sqlite3BfBtreeRollbackCanIncr(Btree*, int);
+SQLITE_PRIVATE int sqlite3BfBtreeRollbackIncremental(Btree*, const u32*, int,
+                                                    int, int*);
+SQLITE_PRIVATE void sqlite3BfTxnBegin(BtShared*);
+SQLITE_PRIVATE void sqlite3BfTxnEnd(BtShared*);
+#define BF_TXN_PG_MAX 16384
 SQLITE_PRIVATE int sqlite3BfBtreeRollbackRehydrate(Btree *p, u8 **apStage,
                                                    int nStage);
 /* Checkpoint's forced-flush commit: log the CLEARs its flush produced. */

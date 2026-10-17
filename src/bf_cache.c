@@ -747,6 +747,13 @@ static void bfCacheDestroy(sqlite3_pcache *p){
   pCache->base.bUnlogOverflow = 0;
   sqlite3_free(pCache->base.aFlushed);
   pCache->base.aFlushed = 0;
+  sqlite3_free(pCache->base.aTxnPg);     /* C2a */
+  pCache->base.aTxnPg = 0;
+  pCache->base.nTxnPg = pCache->base.nTxnPgAlloc = 0;
+  pCache->base.bTxnTrack = 0;
+  sqlite3_free(pCache->base.aRs);        /* C1 read set (was never freed) */
+  pCache->base.aRs = 0;
+  pCache->base.nRs = pCache->base.nRsAlloc = 0;
   sqlite3_free(pCache->base.aLeafBit);
   pCache->base.aLeafBit = 0;
   sqlite3_free(pCache->base.pSpareScratch);
@@ -1129,6 +1136,24 @@ int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
   u32 newSize;
 
   pCache->nInsertGen++;     /* H2 probe memo: a key may become present */
+  if( pCache->bTxnTrack && !pCache->bTxnOverflow
+   && (pCache->nTxnPg==0 || pCache->aTxnPg[pCache->nTxnPg-1]!=pgno) ){
+    /* C2a: remember the leaf for an incremental ROLLBACK. */
+    if( pCache->nTxnPg>=pCache->nTxnPgAlloc ){
+      int nNew = pCache->nTxnPgAlloc ? pCache->nTxnPgAlloc*2 : 64;
+      u32 *aNew = 0;
+      if( nNew<=BF_TXN_PG_MAX ){
+        aNew = (u32*)sqlite3_realloc64(pCache->aTxnPg, (u64)nNew*sizeof(u32));
+      }
+      if( aNew==0 ){
+        pCache->bTxnOverflow = 1;
+      }else{
+        pCache->aTxnPg = aNew;
+        pCache->nTxnPgAlloc = nNew;
+      }
+    }
+    if( !pCache->bTxnOverflow ) pCache->aTxnPg[pCache->nTxnPg++] = pgno;
+  }
   pEntry = sqlite3BfMapGetOrCreate(pCache, pgno);
   if( !pEntry ){
     BF_ALLOC_TRACE("map-getorcreate-nomem", pCache, (int)pgno);

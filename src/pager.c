@@ -4531,6 +4531,34 @@ int sqlite3PagerBfTouched(Pager *pPager, const u32 *aOld, u32 **paPg, int *pnPg)
   *pnPg = 0;
   return 0;
 }
+/* C2a: pages spilled to the log so far (a spill leaves the dirty list). */
+u64 sqlite3PagerBfSpillCount(Pager *pPager){
+  return pPager ? (u64)pPager->aStat[PAGER_STAT_SPILL] : 0;
+}
+/* C2a: true unless a rollback left record ops past the log end. */
+int sqlite3PagerBfPruneClean(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) return !sqlite3WalBfPrunePending(pPager->pWal);
+#endif
+  return 0;
+}
+/* C2a: the pgnos of the pages this write transaction dirtied, in a new
+** sqlite3_malloc'd array (*paPg==0 and *pnPg>0 on OOM). */
+void sqlite3PagerBfDirtyPgnos(Pager *pPager, u32 **paPg, int *pnPg){
+  PgHdr *pList, *q;
+  int n = 0;
+  *paPg = 0;
+  *pnPg = 0;
+  if( pPager==0 ) return;
+  pList = sqlite3PcacheDirtyList(pPager->pPCache);
+  for(q=pList; q; q=q->pDirty) n++;
+  if( n==0 ) return;
+  *pnPg = n;
+  *paPg = (u32*)sqlite3_malloc64(sizeof(u32)*(u64)n);
+  if( *paPg==0 ) return;
+  n = 0;
+  for(q=pList; q; q=q->pDirty) (*paPg)[n++] = q->pgno;
+}
 void sqlite3PagerBfTouchReset(Pager *pPager){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pagerUseWal(pPager) ) sqlite3WalBfTouchReset(pPager->pWal);

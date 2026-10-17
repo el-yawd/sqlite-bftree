@@ -129,7 +129,14 @@ def main():
         w("SELECT id, v FROM t WHERE id>=%d ORDER BY id LIMIT 6;" % lo)
         w("SELECT id, v FROM t WHERE id<=%d ORDER BY id DESC LIMIT 6;" % lo)
         w("SELECT group_concat(id||':'||v) FROM s;")
-        w("SELECT id, v FROM s WHERE id=%d;" % rng.randint(1, NS))
+        si = rng.randint(1, NS)
+        w("SELECT id, v FROM s WHERE id=%d;" % si)
+        # Consecutive keys on ONE cursor: SQLite's seek shortcut steps with
+        # Next instead of descending (2026-10-17: it served tombstoned and
+        # shadowed base cells).  No rng call, so the script is otherwise
+        # unchanged.
+        w("SELECT id, v FROM s WHERE id IN (%d,%d,%d);" % (si, si+1, si+2))
+        w("SELECT id, v FROM t WHERE id IN (%d,%d,%d,%d);" % (lo-1, lo, lo+1, lo+2))
         a = rng.randint(0, 60)
         w("SELECT id, a, b FROM u WHERE a=%d ORDER BY id;" % a)
         w("SELECT count(*), total(a) FROM u;")

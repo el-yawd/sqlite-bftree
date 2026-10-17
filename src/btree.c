@@ -4115,6 +4115,9 @@ static SQLITE_NOINLINE int btreeBeginTrans(
     }
     if( wrflag ){
       MemPage *pPage1 = pBt->pPage1;
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+      sqlite3BfTxnBegin(pBt);    /* C2a: track what an incremental rollback undoes */
+#endif
 #ifndef SQLITE_OMIT_SHARED_CACHE
       assert( !pBt->pWriter );
       pBt->pWriter = p;
@@ -4953,6 +4956,9 @@ static void btreeEndTransaction(Btree *p){
   BtShared *pBt = p->pBt;
   sqlite3 *db = p->db;
   assert( sqlite3BtreeHoldsMutex(p) );
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  if( p->inTrans==TRANS_WRITE ) sqlite3BfTxnEnd(pBt);
+#endif
 
 #ifndef SQLITE_OMIT_AUTOVACUUM
   pBt->bDoTruncate = 0;
@@ -5165,6 +5171,9 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
   int nBfStage = 0;
   int bBfRehydrate = 0;
 #endif
+#ifndef SQLITE_OMIT_BF_CACHE
+  int bBfIncr = 0;          /* C2a: rollback by replaying touched leaves only */
+#endif
 
   assert( writeOnly==1 || writeOnly==0 );
   assert( tripCode==SQLITE_ABORT_ROLLBACK || tripCode==SQLITE_OK );
@@ -5186,9 +5195,12 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
     if( sqlite3PagerIsWal(pBt->pPager) ){
       sqlite3PagerBfStageTake(pBt->pPager, &apBfStage, &nBfStage);
       bBfRehydrate = 1;
+      /* C2a: keep the cache when only what this transaction touched needs
+      ** replaying (sqlite3BfBtreeRollbackIncremental, below). */
+      bBfIncr = sqlite3BfBtreeRollbackCanIncr(p, nBfStage);
     }
 # endif
-    sqlite3BfBtreeClearCache(p);
+    if( !bBfIncr ) sqlite3BfBtreeClearCache(p);
   }
 #endif
   if( tripCode==SQLITE_OK ){
@@ -5206,6 +5218,11 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
 
   if( p->inTrans==TRANS_WRITE ){
     int rc2;
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+    u32 *aBfDirty = 0;         /* C2a: pages the rollback is about to revert */
+    int nBfDirty = 0;
+    if( bBfIncr ) sqlite3PagerBfDirtyPgnos(pBt->pPager, &aBfDirty, &nBfDirty);
+#endif
 
     assert( TRANS_WRITE==pBt->inTransaction );
     rc2 = sqlite3PagerRollback(pBt->pPager);
@@ -5221,12 +5238,20 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
       releasePageOne(pPage1);
     }
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
-    /* Still inside the read snapshot the rollback restored. */
+    /* Still inside the read snapshot the rollback restored.  C2a: replay just
+    ** what this transaction touched when that is provably enough, else
+    ** rebuild the whole cache from the log. */
     if( bBfRehydrate ){
-      rc2 = sqlite3BfBtreeRollbackRehydrate(p, apBfStage, nBfStage);
+      if( bBfIncr
+       && sqlite3BfBtreeRollbackIncremental(p, aBfDirty, nBfDirty, nBfStage, &rc2) ){
+        sqlite3_free(apBfStage);
+      }else{
+        rc2 = sqlite3BfBtreeRollbackRehydrate(p, apBfStage, nBfStage);
+      }
       apBfStage = 0;
       if( rc2!=SQLITE_OK && rc==SQLITE_OK ) rc = rc2;
     }
+    sqlite3_free(aBfDirty);
 #endif
     assert( countValidCursors(pBt, 1)==0 );
     pBt->inTransaction = TRANS_READ;
@@ -7173,6 +7198,17 @@ static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey,
 
 #endif
 
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+/* True if this cursor's table may have buffered records, so a base cell alone
+** does not answer a point seek (see sqlite3BtreeTableMoveto). */
+static int bfCursorMayHaveBuffered(BtCursor *pCur){
+  BfCache *pBf;
+  if( !pCur->curIntKey || pCur->pgnoRoot<=1 ) return 0;
+  pBf = btreeGetBfCache(pCur->pBt);
+  return pBf!=0 && pBf->bDirtyInserts;
+}
+#endif
+
 #ifdef SQLITE_BF_CONCURRENT
 static int btreeTableMovetoBody(BtCursor*, i64, int, int*);
 int sqlite3BtreeTableMoveto(BtCursor *pCur, i64 intKey, int biasRight, int *pRes){
@@ -7212,7 +7248,20 @@ BF_RS_BODY(sqlite3BtreeTableMoveto, btreeTableMovetoBody)(
       *pRes = 0;
       return SQLITE_OK;
     }
-    if( pCur->info.nKey<intKey ){
+    if( pCur->info.nKey<intKey
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+     /* Not while this cache holds buffered records (2026-10-17).  Both
+     ** shortcuts below answer from BASE cells: "at the last cell, so absent"
+     ** misses a buffered append past it, and "the next cell is the key" serves
+     ** a base cell that a buffered DELETE tombstones or a buffered UPDATE
+     ** shadows.  Found by hand: after DELETE FROM t WHERE k=101,
+     ** "SELECT k FROM t WHERE k IN (100,101)" returned 101 -- the IN loop seeks
+     ** 100 then 101 on one cursor -- and after an UPDATE of 201,
+     ** "... k IN (200,201)" returned 201's old value.  The full descent below
+     ** consults the mini-page.  Pre-existing since write-back delete / D3. */
+     && !bfCursorMayHaveBuffered(pCur)
+#endif
+    ){
       if( (pCur->curFlags & BTCF_AtLast)!=0 ){
         assert( cursorIsAtLastEntry(pCur) || CORRUPT_DB );
         *pRes = -1;

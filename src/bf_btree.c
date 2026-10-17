@@ -1030,6 +1030,7 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[15] = pBf ? pBf->nConcConflict : 0;
   aOut[16] = pBf ? pBf->nConcOps : 0;
   aOut[17] = pBf ? pBf->nConcNoFit : 0;
+  aOut[18] = pBf ? pBf->nRollbackIncr : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -1213,6 +1214,47 @@ static int bfSortPgno(const void *a, const void *b){
   u32 x = *(const u32*)a, y = *(const u32*)b;
   return x<y ? -1 : x>y;
 }
+/*
+** Drop the nPg leaves aPg (sorted, distinct) from the cache -- mini-page, full
+** page, leaf bit, X1 tallies -- and replay each one's committed ops after its
+** last CLEAR: exactly what the full rebuild produces for those leaves.  The
+** replayed records are all in the committed log, so they are marked logged and
+** the unlogged list is emptied.  SQLITE_FULL: the replay did not fit beside the
+** rest of the cache (the caller rebuilds in full, which can resize the ring).
+*/
+static int bfDropReplay(BfCache *pBf, Pager *pPager, const u32 *aPg, int nPg){
+  u64 nDropBefore;
+  int i, rc;
+  for(i=0; i<nPg; i++){
+    BfMapEntry *pEntry;
+    sqlite3BfLeafBitClear(pBf, aPg[i]);    /* a page frame may make it interior */
+    sqlite3BfFullPageDrop(pBf, aPg[i]);
+    pEntry = sqlite3BfMapLookup(pBf, aPg[i]);
+    if( pEntry ){
+      pEntry->nAdHit = 0;
+      pEntry->nAdMiss = 0;
+      if( pEntry->locType==BF_LOC_MINI ){
+        pEntry->locType = BF_LOC_NULL;     /* slab becomes an orphan */
+        pEntry->pPage = 0;
+      }
+    }
+  }
+  nDropBefore = pBf->nReplayDropped;
+  rc = sqlite3PagerBfReplayPages(pPager, pBf, aPg, nPg);
+  if( rc==SQLITE_OK && pBf->nReplayDropped!=nDropBefore ){
+    pBf->nReplayDropped = nDropBefore;
+    return SQLITE_FULL;
+  }
+  if( rc==SQLITE_OK ){
+    for(i=0; i<nPg; i++){
+      BfMapEntry *pEntry = sqlite3BfMapLookup(pBf, aPg[i]);
+      if( pEntry ) bfMarkLoggedCallback(0, aPg[i], pEntry);
+    }
+    sqlite3BfUnlogListReset(pBf);
+  }
+  return rc;
+}
+
 int sqlite3BfBtreeSnapshotAdvance(Btree *p){
 #ifndef SQLITE_BF_NO_INCR_INVALIDATE
   BfCache *pBf = 0;
@@ -1220,7 +1262,6 @@ int sqlite3BfBtreeSnapshotAdvance(Btree *p){
   BfGroup *g;
   u32 *aTouch = 0, *aPg;
   int nTouch = 0, nPg, i;
-  u64 nDropBefore;
   int rc;
   if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
   if( pBf==0 ) return SQLITE_OK;
@@ -1244,37 +1285,14 @@ int sqlite3BfBtreeSnapshotAdvance(Btree *p){
       if( nPg==0 || aPg[nPg-1]!=aPg[i] ) aPg[nPg++] = aPg[i];
     }
   }
-  for(i=0; i<nPg; i++){
-    BfMapEntry *pEntry;
-    sqlite3BfLeafBitClear(pBf, aPg[i]);    /* a page frame may make it interior */
-    sqlite3BfFullPageDrop(pBf, aPg[i]);
-    pEntry = sqlite3BfMapLookup(pBf, aPg[i]);
-    if( pEntry ){
-      pEntry->nAdHit = 0;
-      pEntry->nAdMiss = 0;
-      if( pEntry->locType==BF_LOC_MINI ){
-        pEntry->locType = BF_LOC_NULL;     /* slab becomes an orphan */
-        pEntry->pPage = 0;
-      }
-    }
-  }
-  nDropBefore = pBf->nReplayDropped;
-  rc = sqlite3PagerBfReplayPages(pPager, pBf, aPg, nPg);
-  if( rc==SQLITE_OK && pBf->nReplayDropped!=nDropBefore ){
+  rc = bfDropReplay(pBf, pPager, aPg, nPg);
+  if( rc==SQLITE_FULL ){
     /* Did not fit beside what the cache already holds: the full rebuild can
     ** resize the ring, and fails loudly if even that is not enough. */
-    pBf->nReplayDropped = nDropBefore;
     sqlite3_free(aPg);
     return sqlite3BfBtreeSnapshotRehydrate(p);
   }
   if( rc==SQLITE_OK ){
-    /* Every replayed op is in the committed log (no prune pending: checked by
-    ** sqlite3PagerBfTouched), so none of it is this connection's to log. */
-    for(i=0; i<nPg; i++){
-      BfMapEntry *pEntry = sqlite3BfMapLookup(pBf, aPg[i]);
-      if( pEntry ) bfMarkLoggedCallback(0, aPg[i], pEntry);
-    }
-    sqlite3BfUnlogListReset(pBf);
     pBf->nSnapshotIncr++;
     pBf->nSnapshotIncrPages += (u64)nPg;
   }
@@ -1283,6 +1301,107 @@ int sqlite3BfBtreeSnapshotAdvance(Btree *p){
 #else
   return sqlite3BfBtreeSnapshotRehydrate(p);
 #endif
+}
+
+/*
+** C2a (2026-10-17): a whole-transaction ROLLBACK by dropping and replaying only
+** what the transaction touched -- design P3 ("rollback = discard"), for a cache
+** that is already private to its connection.
+**
+** The full rebuild (bfRehydrateFromLog) empties the cache and replays every
+** committed op in the log, on every rollback; under BEGIN CONCURRENT every
+** refused commit pays it.  But a write transaction changes the cache only at:
+**   - leaves it wrote records to (sqlite3BfRecordWrite: buffered writes, and
+**     clean records cached from pages it was modifying) -- BfCache.aTxnPg;
+**   - pages it modified, whose cached copies (clean records, full pages) the
+**     pager rollback has just made stale -- aDirty, the pager's dirty pages;
+**   - leaves it merged into base (aFlushed), whose records it marked clean.
+** Every other leaf holds what the rebuild would rebuild: committed records of
+** this snapshot.  So drop and replay those leaves (bfDropReplay), exactly as
+** incremental invalidation does for another connection's commits.
+**
+** sqlite3BfBtreeRollbackCanIncr decides BEFORE the pager rollback, because
+** the full path empties the cache first.  Returns 1 when done (*pRc set), 0
+** when the equivalence is not established and the caller must rebuild in full: the touch list overflowed or could not
+** grow, a flush ran out of memory, the transaction spilled pages to the log
+** (they leave the dirty list), the rollback left record ops past the log end,
+** a group-commit carry, open batch or staged payload exists, or the replay did
+** not fit.  Ablation: SQLITE_BF_NO_INCR_ROLLBACK.
+*/
+int sqlite3BfBtreeRollbackCanIncr(Btree *p, int nStage){
+#if !defined(SQLITE_BF_NO_INCR_ROLLBACK) && !defined(SQLITE_BF_NO_INCR_INVALIDATE)
+  BfCache *pBf = 0;
+  BfGroup *g;
+  if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf==0 ) return 0;
+  g = (BfGroup*)pBf->pGroupCommit;
+  return pBf->bTxnTrack && !pBf->bTxnOverflow && !pBf->bFlushedOom
+      && !pBf->bUnlogOverflow
+      && nStage==0 && !(g && (g->nCarry>0 || g->nOpen>0))
+      && sqlite3PagerBfSpillCount(p->pBt->pPager)==pBf->nTxnSpill0;
+#else
+  UNUSED_PARAMETER(p); UNUSED_PARAMETER(nStage);
+  return 0;
+#endif
+}
+int sqlite3BfBtreeRollbackIncremental(Btree *p, const u32 *aDirty, int nDirty,
+                                      int nStage, int *pRc){
+#if !defined(SQLITE_BF_NO_INCR_ROLLBACK) && !defined(SQLITE_BF_NO_INCR_INVALIDATE)
+  BfCache *pBf = 0;
+  Pager *pPager;
+  u32 *aPg;
+  int nAll, nPg = 0, i, rc;
+  *pRc = SQLITE_OK;
+  if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf==0 ) return 0;
+  pPager = p->pBt->pPager;
+  /* The caller checked sqlite3BfBtreeRollbackCanIncr before the pager
+  ** rollback (and so kept the cache); what only the rollback can tell: */
+  if( (aDirty==0 && nDirty>0) || !sqlite3PagerBfPruneClean(pPager) ){
+    return 0;
+  }
+  nAll = pBf->nTxnPg + nDirty + pBf->nFlushed/2;
+  aPg = (u32*)sqlite3_malloc64(sizeof(u32)*(u64)(nAll+1));
+  if( aPg==0 ) return 0;
+  nAll = 0;
+  for(i=0; i<pBf->nTxnPg; i++) aPg[nAll++] = pBf->aTxnPg[i];
+  for(i=0; i<nDirty; i++) aPg[nAll++] = aDirty[i];
+  for(i=0; i+1<pBf->nFlushed; i+=2) aPg[nAll++] = pBf->aFlushed[i];
+  qsort(aPg, (size_t)nAll, sizeof(u32), bfSortPgno);
+  for(i=0; i<nAll; i++){
+    if( aPg[i]<=1 ) continue;
+    if( nPg==0 || aPg[nPg-1]!=aPg[i] ) aPg[nPg++] = aPg[i];
+  }
+  rc = bfDropReplay(pBf, pPager, aPg, nPg);
+  sqlite3_free(aPg);
+  if( rc==SQLITE_FULL ) return 0;
+  pBf->nFlushed = 0;         /* every flush of this txn was rolled back too */
+  pBf->bFlushedOom = 0;
+  if( rc==SQLITE_OK ) pBf->nRollbackIncr++;
+  *pRc = rc;
+  return 1;
+#else
+  UNUSED_PARAMETER(p); UNUSED_PARAMETER(aDirty); UNUSED_PARAMETER(nDirty);
+  UNUSED_PARAMETER(nStage);
+  *pRc = SQLITE_OK;
+  return 0;
+#endif
+}
+
+/* C2a: the write transaction's touch list (sqlite3BfBtreeRollbackIncremental). */
+void sqlite3BfTxnBegin(BtShared *pBt){
+  BfCache *pBf = sqlite3PagerGetBfCache(pBt->pPager);
+  if( pBf==0 ) return;
+  pBf->bTxnTrack = 1;
+  pBf->bTxnOverflow = 0;
+  pBf->nTxnPg = 0;
+  pBf->nTxnSpill0 = sqlite3PagerBfSpillCount(pBt->pPager);
+}
+void sqlite3BfTxnEnd(BtShared *pBt){
+  BfCache *pBf = sqlite3PagerGetBfCache(pBt->pPager);
+  if( pBf==0 ) return;
+  pBf->bTxnTrack = 0;
+  pBf->nTxnPg = 0;
 }
 
 static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){

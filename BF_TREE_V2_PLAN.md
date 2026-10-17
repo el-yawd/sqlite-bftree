@@ -3067,3 +3067,38 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   modes x 8 configs) + 128 SQLITE_DEBUG runs clean; mconn sweep 96/96 clean.
 - **C1 status: done for the current format.**  Next: C2 (private write sets + durable group
   commit), per docs/design/concurrent-engine.md.
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — C2a: incremental ROLLBACK (P3); a seek-shortcut read bug
+
+- **C2a, design P3 for per-connection caches.**  Each connection's cache is already private to
+  its transaction; what P3 actually retires is the FULL rebuild every ROLLBACK paid (empty the
+  cache, replay every committed op in the log) -- and under BEGIN CONCURRENT every refused
+  commit is a rollback.  `sqlite3BfBtreeRollbackIncremental` drops and replays only what the
+  transaction touched: leaves `sqlite3BfRecordWrite` wrote to (new per-txn touch list
+  `BfCache.aTxnPg`, armed by `sqlite3BfTxnBegin` when a write txn starts), the pager's dirty
+  pages captured before the pager rollback (`sqlite3PagerBfDirtyPgnos`; stale full-page copies
+  and leaf bits), and merged leaves (`aFlushed`).  Same drop+replay as incremental invalidation
+  (`bfDropReplay`, factored out of `sqlite3BfBtreeSnapshotAdvance`).  Falls back to the full
+  rebuild on: touch-list overflow (`BF_TXN_PG_MAX`), flush OOM, unlog overflow, any pager spill
+  during the txn (spilled pages leave the dirty list), group-commit carry/open batch/staged
+  payload, prune pending, replay not fitting.  `sqlite3BfBtreeRollbackCanIncr` decides BEFORE
+  the pager rollback, because the full path empties the cache first (the first version replayed
+  into an already-emptied cache: mwriter caught it at once).  Savepoint rollbacks keep the full
+  rebuild.  Counter `rollback_incremental`; ablation `SQLITE_BF_NO_INCR_ROLLBACK`.
+  Coverage: gen_rollback_stress takes the new path for ~80% of its rollbacks.
+  **Mutation test:** drop the record-write list -> mwriter fails 4/4 seeds; drop merged leaves ->
+  difftest 13 divergences; drop pager-dirty pages -> nothing caught (1080 difftest runs incl.
+  readfull/adaptive) -- kept on the argument (full-page copies and leaf bits of pages the txn
+  modified), recorded here as an oracle hole.
+- **Read bug, pre-existing since write-back delete / D3 (default config, single connection):**
+  SQLite's `sqlite3BtreeTableMoveto` shortcuts for an already-positioned cursor answer from base
+  cells: "next cell is key+1" (via Next) served a tombstoned or shadowed base cell, "cursor at
+  last cell" would miss a buffered append.  `DELETE FROM t WHERE k=101; SELECT k FROM t WHERE k
+  IN (100,101)` returned 101; after `UPDATE t SET v='new201' WHERE k=201`, `... k IN (200,201)`
+  returned the OLD value.  Both shortcuts are now skipped while the cache holds buffered records
+  (`bfCursorMayHaveBuffered`).  No generator ever sought consecutive keys on one cursor:
+  `gen_update_stress.py` now adds IN-list reads on consecutive keys (no extra rng call); the
+  pre-fix binary diverges on 52/54 of its runs, the fixed one is clean.
+- Correctness: gate --full GREEN 54/54; mconn 96/96; mwriter 576 release + 96 SQLITE_DEBUG runs.
+- Next: C2b, durable group commit across in-process BEGIN CONCURRENT writers (needs a threaded
+  driver; see docs/design/concurrent-engine.md section 3.2).
