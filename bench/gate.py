@@ -3,6 +3,7 @@
 
     python3 bench/gate.py            # quick tier: the per-change gate (~1-2 min)
     python3 bench/gate.py --full     # the pre-commit gate (a few minutes)
+    python3 bench/gate.py --full --perturb all   # + difftest under MALLOC_PERTURB_
 
 Every checker in bench/ runs as a task on a pool sized to the machine, against a
 SNAPSHOT of the build/ binaries copied into a private tmpfs work dir -- so
@@ -57,6 +58,9 @@ def main():
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--keep", action="store_true", help="keep the work dir")
+    ap.add_argument("--perturb", choices=["none", "most", "all"], default=None,
+                    help="run tasks under MALLOC_PERTURB_ (default: most on --full, "
+                         "none on quick; 'most' skips the long difftest)")
     a = ap.parse_args()
     full = a.full
 
@@ -183,8 +187,19 @@ def main():
     results = []
     # One slot per task class that matters: the tasks are processes, and the
     # short ones finish while difftest (which runs its own pool) is still going.
+    # MALLOC_PERTURB_ (2026-10-17): every allocation starts as junk, not zeros.
+    # Each oracle recovers / opens in a fresh process, whose heap is zeros, so a
+    # read of uninitialised memory passes there and fails in any long-lived
+    # process: walIndexRecover's scratch buffer did exactly that.
+    perturb = a.perturb or ("most" if full else "none")
+    penv = dict(os.environ, MALLOC_PERTURB_="165")
+    def env_for(name):
+        if perturb == "all" or (perturb == "most" and name != "difftest"):
+            return penv
+        return None
+    print(f"gate: MALLOC_PERTURB_ on {perturb} tasks", flush=True)
     with ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        futs = {ex.submit(sh, cmd): name for name, cmd in tasks}
+        futs = {ex.submit(sh, cmd, env_for(name)): name for name, cmd in tasks}
         for f in as_completed(futs):
             name = futs[f]
             rc, out, dt = f.result()

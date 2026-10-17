@@ -3201,3 +3201,9 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   threads, and 6 under SQLITE_DEBUG: all clean.
 - Correctness: gate --full GREEN 57/57 (now with repro:recover_heap and mt:crash); mt 72; mconn
   96/96; mwriter 324.
+- **Gate runs under `MALLOC_PERTURB_`** (full tier: every task but difftest; `--perturb all` adds
+  it; quick: off).  Every oracle opens/recovers in a fresh process whose heap is zeros, which is
+  why the recovery bug above survived them all; glibc's perturbation makes each allocation junk.
+  Validated: the unfixed build with the repro's own heap-dirtying disabled passes plainly and
+  fails under `MALLOC_PERTURB_=165`.  The whole full gate (`--perturb all`) is green, 301 s; the
+  default full tier takes 149 s (was 131 s).
