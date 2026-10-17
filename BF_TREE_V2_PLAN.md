@@ -3221,3 +3221,10 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   teeth: `synchronous=OFF` and `NORMAL` checked as FULL lose acknowledged commits at once.
   Design section 10's crash and power-loss items for concurrent writers are now covered for the
   current format (mid-group-flush awaits group commit).  Gate --full 58/58, 158 s.
+- libFuzzer (ASan+UBSan, SQLITE_DEBUG; `clang` on PATH is lean4's -- use /usr/bin/clang-22 and
+  /usr/bin/clang++, and build fuzz_sql.c as C++) over today's amalgamation, 5 min each:
+  fuzz_bfwal_recovery 88k, fuzz_sql 64k, fuzz_sql_mconn 94k executions, no findings.
+- Open, recorded: no oracle needs incremental rollback's pager-dirty page set (a directed
+  leaf-bit-reuse case matched stock with it removed); kept on the argument.  The seek-shortcut fix
+  disables SQLite's consecutive-key shortcut whenever the cache holds buffered records (in steady
+  state, always): a per-leaf test would restore it -- a perf follow-up, not measured.

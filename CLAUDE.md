@@ -141,7 +141,10 @@ cd .. && python3 bench/gate.py        # THE GATE, quick tier: ~1 min, every chec
 python3 bench/gate.py --full          # pre-commit tier: ~3-4 min (was ~2 h sequential)
 python3 bench/difftest.py --suite buf --variant ring --seeds 7 --keep   # one slice, keep files
 # gate.py snapshots build/ binaries into a tmpfs dir: rebuilding or editing bench/ while it
-# runs is safe.  The shell scripts below remain the reference definitions of each suite.
+# runs is safe.  It REFUSES binaries older than build/sqlite3.c (rebuild sqlite3_buf, _dbg,
+# _stock after every `make`), and runs the full tier under MALLOC_PERTURB_ (fresh-process
+# oracles cannot see uninitialised-memory bugs otherwise).
+# The shell scripts below remain the reference definitions of each suite.
 cd bench && sh stress.sh                                   # differential oracle -> ALL CLEAN
 sh stress_buf.sh                                           # same, vs ../build/sqlite3_buf
 BF_GROUP=8 sh stress_buf.sh                                # ... with group commit on
@@ -152,6 +155,12 @@ python3 crash_oracle.py 1 2 3 4 5 6                        # crash-differential 
 BF_GROUP=8 python3 crash_oracle.py 1 2 3                   # ... under group commit
 BF_PRAGMAS="PRAGMA bf_cache_size=262144;" python3 crash_oracle.py 1 2 3   # ... cycling ring
 sh torn_tail_repro.sh; sh recover_repro.sh; sh ckpt_repro.sh   # deterministic crash repros
+# BEGIN CONCURRENT (multi-writer), from the repo root -- all in the gate:
+SEEDS=1 SEEDE=8 bash bench/mwriter_sweep.sh build/mw_bf    # serialisability model, 1 thread
+SEEDS=1 SEEDE=4 bash bench/mt_sweep.sh build/mt_bf          # REAL threads, invariant oracle
+MT_KILL_MS=300 MT_ITERS=10 build/mt_bf /tmp/m.db 1 4 1000000             # kill -9 + recover
+MT_POWER=torn MT_FULL=1 MT_KILL_MS=300 build/mt_bf /tmp/m.db 1 4 1000000 \
+    'PRAGMA synchronous=FULL;'                              # power cut: acked commits survive
 
 # Benchmark campaign (bench/harness/README.md documents the methodology)
 sh bench/harness/build_suts.sh --all                       # every SUT, one amalgamation
