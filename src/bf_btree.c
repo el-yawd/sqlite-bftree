@@ -1031,6 +1031,7 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[16] = pBf ? pBf->nConcOps : 0;
   aOut[17] = pBf ? pBf->nConcNoFit : 0;
   aOut[18] = pBf ? pBf->nRollbackIncr : 0;
+  aOut[19] = pBf ? pBf->nEscalateTable : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
 }
 
@@ -2204,10 +2205,50 @@ int sqlite3BfBtreePrepareForScan(BtCursor *pCur){
 ** Measured rare (0 in a 30,000-commit run with a 256 KiB ring and 385 single-
 ** leaf merges), but it must be impossible, not rare.
 */
+/*
+** 2026-10-17: the sweep need not be the TABLE.  A misplaced record can only sit
+** on a sibling the balance reached, and ForgetPage lists those (aMisplaced):
+** merging each of them applies its records by rowid from the root, which is
+** all the sweep did for them; a leaf the balance did not reach has nothing
+** misplaced.  A sibling's own merge can balance again, so repeat until the list
+** stays empty.  Overflow, a foreign root, a protected slab or too many rounds
+** fall back to the table sweep.  Under BEGIN CONCURRENT every leaf the table
+** sweep wrote was a page-level conflict for every transaction that had read
+** it: with 8 writers, 149 of 220 page flushes in an mwriter run.
+*/
+static u64 bfMisplacedBegin(BfCache *pBf){
+  pBf->nMisplaced = 0;
+  pBf->bMisplacedOverflow = 0;
+  return pBf->nDirtyBalance;
+}
 static void bfEscalateIfMisplaced(BfCache *pBf, Btree *pBtree, Pgno root,
                                   u64 nBalBefore){
+  int iRound;
   if( pBf->nDirtyBalance==nBalBefore ) return;
   pBf->nLeafMergeEscalate++;
+  for(iRound=0; iRound<8 && !pBf->bMisplacedOverflow; iRound++){
+    u32 a[32];
+    int n = pBf->nMisplaced, i, bTable = 0;
+    if( n==0 ) return;                     /* every misplaced leaf merged */
+    memcpy(a, pBf->aMisplaced, sizeof(u32)*(size_t)n);
+    pBf->nMisplaced = 0;
+    for(i=0; i<n && !bTable; i++){
+      BfMapEntry *pEntry = sqlite3BfMapLookup(pBf, a[i]);
+      BfMiniPage *pMini;
+      if( pEntry==0 || pEntry->locType!=BF_LOC_MINI || pEntry->pPage==0 ) continue;
+      pMini = (BfMiniPage*)pEntry->pPage;
+      if( !sqlite3BfMiniPageIsDirty(pMini) ) continue;     /* merged meanwhile */
+      if( (Pgno)pMini->rootPgno!=root || (void*)pMini==pBf->pEvictProtect ){
+        bTable = 1;
+        break;
+      }
+      if( bfFlushOneMiniPage(pBf, pBtree, root, pMini)!=SQLITE_OK ) bTable = 1;
+    }
+    if( bTable ) break;
+  }
+  pBf->nMisplaced = 0;
+  pBf->bMisplacedOverflow = 0;
+  pBf->nEscalateTable++;
   bfFlushTableDirty(pBf, pBtree, root);
 }
 
@@ -2251,7 +2292,7 @@ int sqlite3BfBtreeMergeFullLeaf(BtCursor *pCur, int nData){
   if( !sqlite3BfMiniPageIsDirty(pMini) ) return 0;
   if( (void*)pMini==pBf->pEvictProtect ) return 0;
   if( pMini->rootPgno!=(u32)pCur->pgnoRoot ) return 0;
-  nBal = pBf->nDirtyBalance;
+  nBal = bfMisplacedBegin(pBf);
   if( bfFlushOneMiniPage(pBf, pCur->pBtree, pCur->pgnoRoot, pMini)!=SQLITE_OK ){
     return 0;
   }
@@ -2324,7 +2365,7 @@ int sqlite3BfBtreeRelieveEvictStall(BtCursor *pCur){
       break;
     }
     {
-      u64 nBal = pBf->nDirtyBalance;
+      u64 nBal = bfMisplacedBegin(pBf);
       Pgno root = (Pgno)pMini->rootPgno;
       if( bfFlushOneMiniPage(pBf, pCur->pBtree, root, pMini)!=SQLITE_OK ){
         pBf->nDirtyEvictRefused++;
@@ -3140,7 +3181,16 @@ void sqlite3BfBtreeForgetPage(BtShared *pBt, Pgno pgno){
       pEntry->pPage   = 0;
     }else{
       if( pgno!=pBf->pgnoFlushOwner && !pBf->bMergingActive && !pBf->bSweepAll ){
+        int k;
         pBf->nDirtyBalance++;
+        for(k=0; k<pBf->nMisplaced && pBf->aMisplaced[k]!=pgno; k++){}
+        if( k==pBf->nMisplaced ){
+          if( k<(int)(sizeof(pBf->aMisplaced)/sizeof(pBf->aMisplaced[0])) ){
+            pBf->aMisplaced[pBf->nMisplaced++] = pgno;
+          }else{
+            pBf->bMisplacedOverflow = 1;
+          }
+        }
       }
       /* Phase 2 makes the comment above only half true: records stay DIRTY
       ** across commits by design, so a mini-page here often IS dirty and used
@@ -3687,7 +3737,7 @@ int sqlite3BfBtreeFlushNewPages(Btree *p, u32 iFirst){
     pMini = (BfMiniPage*)pEntry->pPage;
     if( !sqlite3BfMiniPageIsDirty(pMini) || pMini->rootPgno<=1 ) continue;
     root = (Pgno)pMini->rootPgno;
-    nBal = pBf->nDirtyBalance;
+    nBal = bfMisplacedBegin(pBf);
     if( bfFlushOneMiniPage(pBf, p, root, pMini)!=SQLITE_OK ) break;
     bfEscalateIfMisplaced(pBf, p, root, nBal);
   }

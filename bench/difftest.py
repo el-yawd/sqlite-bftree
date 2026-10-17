@@ -39,7 +39,7 @@ QUICK_SEEDS = [1, 42, 31337]
 JOURNALS = ["delete", "wal", "memory"]
 BUF_GENS = ["gen_stress", "gen_stress_rand", "gen_merge_stress", "gen_rev_stress",
             "gen_rollback_stress", "gen_update_stress", "gen_blind_stress",
-            "gen_fullpage_stress"]
+            "gen_fullpage_stress", "gen_balance_stress"]
 # stress_buf.sh's knob variants: PRAGMAs inserted after the leading PRAGMA block
 VARIANTS = {
     "base": [],
@@ -81,6 +81,8 @@ def gen_sql(gen, seed, jm):
         return py("gen_blind_stress.py", seed, 250, jm)      # emits its own header
     if gen == "gen_fullpage_stress":
         return py("gen_fullpage_stress.py", seed, 60, jm)    # emits its own header
+    if gen == "gen_balance_stress":
+        return head + py("gen_balance_stress.py", seed, 3000)
     if gen == "gen_xtable":
         return py("gen_xtable.py", seed, jm, os.environ.get("NTAB", "12"),
                   os.environ.get("ROWS", "3000"))

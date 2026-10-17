@@ -569,6 +569,13 @@ struct BfCache {
   u64 nDirtyBalance;
   u64 nLeafMerge;           /* merge-on-full: one leaf merged to take a write */
   u64 nLeafMergeEscalate;   /* ... or merge-on-evict, escalated to a table sweep */
+  /* 2026-10-17: the dirty siblings a single-leaf merge's balance reached
+  ** (sqlite3BfBtreeForgetPage), so the escalation merges just those
+  ** (bfEscalateIfMisplaced) instead of every dirty leaf of the table. */
+  u32 aMisplaced[32];
+  int nMisplaced;
+  u8 bMisplacedOverflow;
+  u64 nEscalateTable;       /* escalations that still swept the whole table */
   /* C1 (2026-10-13): BEGIN CONCURRENT read set, row-level.  Every key range a
   ** concurrent transaction observed on a BF rowid table -- point seeks (found or
   ** absent: [k,k]), the span a scan covered, a whole table for count() -- so

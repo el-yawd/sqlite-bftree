@@ -252,3 +252,28 @@ commit).
    but unamortized.
 3. Caches per connection (fair) as the default, shared pool as a measured variant?
 4. Start C1?
+
+## 14. C2 status and the group-commit decision (2026-10-17)
+
+Done on the current format: C1 (row-level validation; false conflicts ~1,500 -> ~110 per
+mwriter run at 4 writers), C2a (rollback replays only what the transaction touched -- P3 for
+per-connection caches), a threaded oracle (`bench/mt_oracle.c`) and the three concurrency bugs
+it found (checkpoint backfill cap, catch-up at read-mark 0, page renumbering at commit).
+
+Not done: **durable group commit (section 3.2) over SQLite's WAL**, because it needs a decision
+the text above leaves open.  Under `synchronous=FULL` a WAL commit writes its frames, fsyncs,
+then publishes the wal-index header -- all under the WAL write lock.  Amortising the fsync across
+committers means one of:
+
+| option | visibility | durability of an acknowledged COMMIT | cost |
+|---|---|---|---|
+| A. fsync outside the lock: publish, release, then fsync (followers whose frames a finished fsync already covers skip theirs) | **before** durability: a reader can see a commit that a crash then loses (the committer never got OK) | kept | small: `walFrames` split; no format change |
+| B. pending header: publish to an in-process "writers' header" at once, to the shm header (readers) only after the covering fsync | after durability (section 3.3) | kept | an in-process per-file structure shared by connections; writers in OTHER processes must be excluded (or they read the stale shm header and overwrite frames) -- section 13.2's "in-process only" |
+| C. leader commits for followers (one lock, one write, one fsync, one publish) | after durability | kept | the leader must validate and write other connections' transactions: their pagers, read sets and BF caches, across threads -- the most invasive |
+| D. no group commit at C2; take it in C4's own log, where section 3.2 designs it from scratch | after durability | kept | none now |
+
+SQLite's own `synchronous=NORMAL` already behaves like A minus the fsync, and D2 settled the
+durable default mode as "records reach the OS before COMMIT returns" (no fsync, like the
+reference).  So group commit only changes `synchronous=FULL` numbers.  Recommendation: **D** for
+the thesis path (C3 next), and **A** behind a PRAGMA only if FULL-mode concurrent throughput is
+needed before C4, reported with its visibility caveat.  Owner decision.

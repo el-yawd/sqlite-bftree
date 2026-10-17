@@ -3139,3 +3139,22 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - Results: before, ~7% of 4-thread release runs failed (bugs 1/2) and 3 of 200 debug runs
   asserted (bug 3).  After: gate --full 55/55; mt 240 release + 160 SQLITE_DEBUG runs, 0 failed;
   mconn 96/96; mwriter 384 runs.  Not yet run: ThreadSanitizer over mt_oracle (next).
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — narrowed merge escalation; TSan clean; group commit to the owner
+
+- **ThreadSanitizer** (clang-22; note `clang` on PATH is a lean4 toolchain without libc headers --
+  use `/usr/bin/clang-22`) over `mt_oracle`, 4 and 8 threads, 5 configurations: 0 reports.
+- **Escalation narrowed.**  A single-leaf merge whose balance reached dirty siblings used to sweep
+  the whole table (`bfEscalateIfMisplaced`); now `sqlite3BfBtreeForgetPage` lists those siblings
+  (`aMisplaced`, 32 slots) and only they are merged, repeated while merges disturb further
+  siblings; overflow / foreign root / protected slab / 8 rounds fall back to the table sweep
+  (new counter `leaf_merge_escalate_table`).  mwriter 8 writers seed 16: commits 2273 -> 2760,
+  false conflicts 1314 -> 839 (seed 1: 2877 -> 2781, about flat).
+- **Oracle hole closed:** no generator ever produced a dirty-sibling balance (`dirty_balance` 0 in
+  every one).  New `bench/gen_balance_stress.py` (in difftest's buf suite): full base leaves +
+  full mini-pages on neighbours; 145-198 dirty balances and 7-11 escalations per run.
+  Mutation (escalation skipped): 72/216 divergences; the narrowed version: 216/216 clean.
+- **Group commit:** written up as an owner decision, `docs/design/concurrent-engine.md` section
+  14 (options A-D; recommendation D: leave it to C4's own log, go to C3).
+- Correctness: gate --full 55/55 (difftest now includes gen_balance_stress); mt 120 release + 80
+  debug runs; mconn 96/96; mwriter 576 release + 96 debug.
