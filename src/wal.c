@@ -1592,6 +1592,25 @@ static int walIndexRecover(Wal *pWal){
       if( aShare==0 ) break;
       SEH_SET_ON_ERROR(iPg, aShare);
       pWal->apWiData[iPg] = aPrivate;
+#ifndef SQLITE_OMIT_BF_CACHE
+      /* Zero this block's page-number array and hash table in the private
+      ** buffer first (2026-10-17).  Stock relies on walIndexAppend() doing it
+      ** for the block's FIRST frame (its idx==1 case); a BF record frame there
+      ** is never appended, so the buffer kept whatever it held -- zeros in a
+      ** fresh process (the crash oracle recovers in one, and never saw this),
+      ** the previous block or stale heap in a long-lived one.  The stale entries
+      ** then mapped pages to the wrong frames: torn transactions, btreeInitPage
+      ** errors, and SQLITE_CORRUPT from the collision check
+      ** (bench/mt_oracle.c crash mode, which recovers in the parent process).
+      ** walIndexZeroIfBlockStart() is the same rule for walFrames(). */
+      {
+        WalHashLoc sLoc;
+        rc = walHashGet(pWal, iPg, &sLoc);
+        if( rc!=SQLITE_OK ) break;
+        memset((void*)sLoc.aPgno, 0,
+               (size_t)((u8*)&sLoc.aHash[HASHTABLE_NSLOT] - (u8*)sLoc.aPgno));
+      }
+#endif
 
       for(iFrame=iFirst; iFrame<=iLast; iFrame++){
         i64 iOffset = walFrameOffset(iFrame, szPage);

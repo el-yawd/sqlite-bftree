@@ -3171,3 +3171,33 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   lists as locked decisions; docs/design/concurrent-engine.md section 13 asks the owner to
   approve P1-P5 first.  Next, within the approved scope: a crash oracle with concurrent writers
   (design section 10).
+
+### 2026-10-17 (cont.) — Claude Opus 5.5 — crash oracle with concurrent writers; a WAL recovery bug (any process with a used heap)
+
+- **New: `mt_oracle.c` crash mode** (`MT_KILL_MS`, `MT_ITERS`; gate task `mt:crash`): fork a child
+  running the threaded BEGIN CONCURRENT workload, SIGKILL it at a random moment, recover in the
+  parent, check integrity, the invariant total, ATOMICITY (every balance = 1000 + what surviving
+  hist rows moved) and DURABILITY of acknowledged commits (the child appends "thread seq" to an
+  ack file after each COMMIT returns; a process kill loses no OS buffers, so in the default
+  durable mode none may be missing).  Iterations accumulate on one file.  `MT_SAVE=dir` keeps the
+  post-kill files, `MT_CHECKONLY=iter` replays the check.  Stock+BC passes.
+- **Bug (pre-existing, not concurrency-specific): WAL recovery used a dirty scratch buffer.**
+  `walIndexRecover` builds each wal-index block in a reused private buffer and relied on
+  `walIndexAppend`'s idx==1 case to zero it.  When a block's first frame is a BF record frame
+  (never appended), the block kept the buffer's previous bytes.  Stock's dead-writer cleanup
+  (`walCleanupHash`) scrubs that incidentally -- but only when a commit precedes the block's first
+  page frame within the block (it returns at once for hdr.mxFrame==0, and cleans the block of
+  mxFrame, not the current one).  The stale entries mapped pages to wrong frames: torn
+  transactions (atomicity failures), btreeInitPage errors, SQLITE_CORRUPT from the collision
+  check.  Every crash oracle recovers in a FRESH process, whose scratch is zeros, so none saw it;
+  mt crash mode recovers in its long-lived parent and failed nearly every run (even a replay of
+  the saved files in a new process passed -- the clue).  Fix: zero the block's aPgno/aHash in the
+  private buffer before scanning it.  Deterministic repro `bench/recover_heap_repro.c` (gate
+  `repro:recover_heap`): first transaction after a TRUNCATE checkpoint writes a buffered row and a
+  page, process exits without closing, a process with a dirtied heap deletes the -shm and opens:
+  "database disk image is malformed" before, OK after.
+- Crash mode after the fix: 80 kills over 8 seeds, plus 10 kills each under a 256 KiB ring,
+  autocheckpoint 50, readfull, group commit 8, 128 KiB ring + autockpt 20, synchronous=FULL, 8
+  threads, and 6 under SQLITE_DEBUG: all clean.
+- Correctness: gate --full GREEN 57/57 (now with repro:recover_heap and mt:crash); mt 72; mconn
+  96/96; mwriter 324.

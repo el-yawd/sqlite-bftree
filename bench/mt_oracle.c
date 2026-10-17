@@ -31,6 +31,9 @@
 **      -o build/mt_stock bench/mt_oracle.c build/sqlite3.c -lm -lpthread
 ** Usage:
 **   mt_bf DB SEED NTHREADS NTXN_PER_THREAD ["PRAGMAS"]
+**   MT_KILL_MS=300 MT_ITERS=10 mt_bf DB SEED NTHREADS NTXN ["PRAGMAS"]
+**     crash mode (see crashMode): NTXN bounds each child's transfers per thread;
+**     MT_SAVE=dir keeps the post-kill files, MT_CHECKONLY=iter re-runs the check
 ** Validate on the stock build first.
 */
 #include "sqlite3.h"
@@ -38,6 +41,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 #define NACCT      400
 #define MAXTHR     16
@@ -48,6 +56,8 @@ static const char *zPragmas = "";
 static int nThr, nTxnPer;
 static unsigned long long seed0;
 static volatile int bFail;
+static int ackFd = -1;      /* crash mode: "thread seq" per acknowledged commit */
+static int gIter = 0;       /* crash mode: iteration, part of every hist id */
 
 typedef struct Thr {
   int id;
@@ -182,12 +192,19 @@ static void *thrMain(void *pArg){
       if( rc==SQLITE_OK ) rc = getBal(t->db, to, &bb);
       if( rc==SQLITE_OK ) rc = setBal(t->db, from, ba - amt);
       if( rc==SQLITE_OK ) rc = setBal(t->db, to, bb + amt);
-      if( rc==SQLITE_OK ) rc = addHist(t->db, (long long)t->id*HIST_BASE + seq,
+      if( rc==SQLITE_OK ) rc = addHist(t->db,
+                                       (long long)(gIter*MAXTHR + t->id)*HIST_BASE + seq,
                                        from, to, amt);
       if( rc==SQLITE_OK ) rc = execStep(t->db, "COMMIT");
       if( rc==SQLITE_OK ){
         t->aDone[seq] = 1;
         t->nCommit++;
+        if( ackFd>=0 ){
+          /* COMMIT returned: this transfer must survive a crash from now on. */
+          char zAck[48];
+          int nAck = snprintf(zAck, sizeof(zAck), "%d %d\n", t->id, seq);
+          if( write(ackFd, zAck, nAck)!=nAck ){ fail(t, "ack write", 0); break; }
+        }
         break;
       }
       if( sqlite3_get_autocommit(t->db)==0 ) execStep(t->db, "ROLLBACK");
@@ -274,6 +291,135 @@ static sqlite3 *openConn(void){
   return db;
 }
 
+/*
+** Crash mode (MT_KILL_MS=max milliseconds, MT_ITERS=n): each iteration forks a
+** child that runs the threaded workload with unbounded transfers, SIGKILLs it
+** at a random moment -- mid-commit, mid-checkpoint, mid-catch-up -- and then
+** checks the recovered file on a fresh connection:
+**   - integrity_check, and the invariant total;
+**   - ATOMICITY: every balance equals 1000 plus what the surviving hist rows
+**     moved into it, minus what they moved out (a transfer and its hist row
+**     commit together or not at all);
+**   - DURABILITY of acknowledged commits: every (thread, seq) the child wrote
+**     to the ack file after COMMIT returned has its hist row.  A process kill
+**     loses no OS buffers, so with the default durable mode (records reach the
+**     OS before COMMIT returns) nothing acknowledged may be missing.
+** Iterations accumulate on the same file, so each one also recovers from the
+** previous crash and keeps working.
+*/
+static int crashCheck(const char *zAck){
+  sqlite3 *db = openConn();
+  sqlite3_stmt *p;
+  long long sum = 0, n = 0;
+  int bad = 0, rc;
+  FILE *f;
+  if( sumBal(db, &sum, &n) ){
+    fprintf(stderr, "FAIL iter %d: sum: %s\n", gIter, sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return 1;
+  }
+  if( sum!=(long long)NACCT*1000 || n!=NACCT ){
+    fprintf(stderr, "FAIL iter %d: total %lld over %lld rows\n", gIter, sum, n);
+    bad++;
+  }
+  rc = sqlite3_prepare_v2(db,
+      "SELECT acct.id, acct.bal, 1000"
+      " + coalesce((SELECT sum(amt) FROM hist WHERE b=acct.id),0)"
+      " - coalesce((SELECT sum(amt) FROM hist WHERE a=acct.id),0)"
+      " FROM acct", -1, &p, 0);
+  if( rc==SQLITE_OK ){
+    while( sqlite3_step(p)==SQLITE_ROW ){
+      if( sqlite3_column_int64(p, 1)!=sqlite3_column_int64(p, 2) ){
+        if( bad++<5 ){
+          fprintf(stderr, "FAIL iter %d: acct %d = %lld, hist says %lld (atomicity)\n",
+                  gIter, sqlite3_column_int(p, 0), sqlite3_column_int64(p, 1),
+                  sqlite3_column_int64(p, 2));
+        }
+      }
+    }
+    sqlite3_finalize(p);
+  }else{
+    bad++;
+  }
+  f = fopen(zAck, "r");
+  if( f ){
+    int ti, sq;
+    sqlite3_stmt *q;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM hist WHERE id=?", -1, &q, 0);
+    while( fscanf(f, "%d %d", &ti, &sq)==2 ){
+      sqlite3_bind_int64(q, 1, (long long)(gIter*MAXTHR + ti)*HIST_BASE + sq);
+      if( sqlite3_step(q)!=SQLITE_ROW ){
+        if( bad++<5 ) fprintf(stderr, "FAIL iter %d: acknowledged transfer "
+                              "thread %d seq %d is gone (durability)\n", gIter, ti, sq);
+      }
+      sqlite3_reset(q);
+    }
+    sqlite3_finalize(q);
+    fclose(f);
+  }
+  rc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &p, 0);
+  if( rc==SQLITE_OK && sqlite3_step(p)==SQLITE_ROW
+   && strcmp((const char*)sqlite3_column_text(p, 0), "ok") ){
+    fprintf(stderr, "FAIL iter %d: integrity_check: %s\n", gIter,
+            (const char*)sqlite3_column_text(p, 0));
+    bad++;
+  }
+  sqlite3_finalize(p);
+  sqlite3_close(db);
+  return bad;
+}
+
+static int crashMode(int killMs, int nIter){
+  char zAck[600];
+  long nAcked = 0;
+  int i;
+  snprintf(zAck, sizeof(zAck), "%s-ack", zDb);
+  for(gIter=0; gIter<nIter; gIter++){
+    pid_t pid;
+    int status;
+    unsigned long long r = (seed0+7)*0x9E3779B97F4A7C15ull + (unsigned)gIter*7919u;
+    long ms = killMs/4 + (long)((r>>17) % (unsigned long long)(killMs - killMs/4 + 1));
+    remove(zAck);
+    pid = fork();
+    if( pid==0 ){
+      pthread_t aTid[MAXTHR];
+      ackFd = open(zAck, O_WRONLY|O_CREAT|O_APPEND, 0644);
+      for(i=0; i<nThr; i++){
+        Thr *t = &aThr[i];
+        t->id = i;
+        t->rng = (seed0+1+gIter)*0x9E3779B97F4A7C15ull
+               + (unsigned long long)(i+1)*0xBF58476D1CE4E5B9ull;
+        t->db = openConn();
+      }
+      for(i=0; i<nThr; i++) pthread_create(&aTid[i], 0, thrMain, &aThr[i]);
+      for(i=0; i<nThr; i++) pthread_join(aTid[i], 0);
+      for(i=0; i<nThr; i++) if( aThr[i].zErr[0] ) fprintf(stderr, "FAIL %s\n", aThr[i].zErr);
+      _exit(bFail ? 3 : 0);
+    }
+    { struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (ms%1000)*1000000L;
+      nanosleep(&ts, 0); }
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    if( WIFEXITED(status) && WEXITSTATUS(status)!=0 ){
+      fprintf(stderr, "FAIL iter %d: the child failed before the kill\n", gIter);
+      return 1;
+    }
+    { FILE *f = fopen(zAck, "r"); int c;
+      if( f ){ while( (c=fgetc(f))!=EOF ) if( c=='\n' ) nAcked++; fclose(f); } }
+    if( getenv("MT_SAVE") ){
+      /* Keep the files exactly as the kill left them, to replay the check. */
+      char zCmd[2000];
+      snprintf(zCmd, sizeof(zCmd), "mkdir -p '%s' && cp '%s' '%s-wal' '%s-shm' '%s' '%s'/ 2>/dev/null",
+               getenv("MT_SAVE"), zDb, zDb, zDb, zAck, getenv("MT_SAVE"));
+      if( system(zCmd) ){ /* best effort */ }
+    }
+    if( crashCheck(zAck) ) return 1;
+  }
+  printf("OK crash mode: %d threads, %d kills, %ld acknowledged transfers checked\n",
+         nThr, nIter, nAcked);
+  return 0;
+}
+
 int main(int argc, char **argv){
   pthread_t aTid[MAXTHR];
   sqlite3 *db;
@@ -290,13 +436,13 @@ int main(int argc, char **argv){
   if( argc>5 ) zPragmas = argv[5];
   if( nThr<1 || nThr>MAXTHR || nTxnPer<1 ){ fprintf(stderr, "bad args\n"); return 2; }
   if( getenv("MT_LOG") ) sqlite3_config(SQLITE_CONFIG_LOG, logCb, (void*)0);
-  { char b[600];
+  if( !getenv("MT_CHECKONLY") ){ char b[600];
     snprintf(b, sizeof(b), "%s", zDb); remove(b);
     snprintf(b, sizeof(b), "%s-wal", zDb); remove(b);
     snprintf(b, sizeof(b), "%s-shm", zDb); remove(b); }
 
-  db = openConn();
-  if( sqlite3_exec(db,
+  db = getenv("MT_CHECKONLY") ? 0 : openConn();
+  if( !getenv("MT_CHECKONLY") && sqlite3_exec(db,
         "CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER);"
         "CREATE TABLE hist(id INTEGER PRIMARY KEY, a INT, b INT, amt INT);"
         "BEGIN;"
@@ -315,8 +461,25 @@ int main(int argc, char **argv){
     t->aFrom = (int*)calloc(nTxnPer, sizeof(int));
     t->aTo = (int*)calloc(nTxnPer, sizeof(int));
     t->aAmt = (int*)calloc(nTxnPer, sizeof(int));
-    t->db = openConn();
   }
+  if( getenv("MT_CHECKONLY") ){
+    /* Replay crashCheck on saved files: DB must not be recreated (see above).
+    ** The connection opened above is closed first, so the check's own
+    ** connection runs WAL recovery, exactly as in crash mode. */
+    char zAck[600];
+    sqlite3_close(db);
+    gIter = atoi(getenv("MT_CHECKONLY"));
+    snprintf(zAck, sizeof(zAck), "%s-ack", zDb);
+    return crashCheck(zAck) ? 1 : (printf("OK check\n"), 0);
+  }
+  if( getenv("MT_KILL_MS") ){
+    int killMs = atoi(getenv("MT_KILL_MS"));
+    int nIter = getenv("MT_ITERS") ? atoi(getenv("MT_ITERS")) : 10;
+    if( sqlite3_close(db)!=SQLITE_OK ) fprintf(stderr, "setup close: %s\n", sqlite3_errmsg(db));
+    if( killMs<4 ) killMs = 4;
+    return crashMode(killMs, nIter);
+  }
+  for(i=0; i<nThr; i++) aThr[i].db = openConn();
   for(i=0; i<nThr; i++) pthread_create(&aTid[i], 0, thrMain, &aThr[i]);
   for(i=0; i<nThr; i++) pthread_join(aTid[i], 0);
   for(i=0; i<nThr; i++){

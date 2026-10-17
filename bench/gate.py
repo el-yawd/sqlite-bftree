@@ -23,6 +23,10 @@ Tasks, per tier (quick = fewer seeds):
   ring        ring_repro.sh (full tier only: needs the harness dataset)
   stale_ckpt  stale_ckpt_repro.c: a stale-cache checkpoint must not erase another
               connection's committed record frames (2026-10-13)
+  recover_heap  recover_heap_repro.c: recovery with a record frame at a wal-index
+              block start, in a process with a used heap (2026-10-17)
+  mt:crash    mt_oracle.c crash mode: SIGKILL a threaded workload 10x, recover,
+              check atomicity + acknowledged-commit durability (quick 1, full 4 seeds)
   mt          mt_sweep.sh (BEGIN CONCURRENT on real threads, invariant oracle):
               quick = 1 seed, full = 4 seeds, 9 configurations each
   mwriter     mwriter_sweep.sh (BEGIN CONCURRENT, K writers, serialisability model):
@@ -142,6 +146,8 @@ def main():
 
     add("repro:stale_ckpt", ccdrv("stale_ckpt", "stale_ckpt_repro.c", "-O1") +
         f" && {work}/stale_ckpt {work}/stale_ckpt.db")
+    add("repro:recover_heap", ccdrv("recover_heap", "recover_heap_repro.c", "-O1") +
+        f" && {work}/recover_heap {work}/recover_heap.db")
     # mwriter: each task builds its own driver, then runs one shard of the sweep.
     mw = ccdrv("mw_bf", "mwriter_oracle.c", "-O1 -g")
     if full:
@@ -161,6 +167,15 @@ def main():
         add("mt:release", f"{mt} && SEEDS=1 SEEDE=4 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
     else:
         add("mt:release", f"{mt} && SEEDS=1 SEEDE=1 bash {BENCH}/mt_sweep.sh {work}/mt_bf")
+    # mt crash mode: SIGKILL the threaded workload, recover IN the long-lived
+    # parent (a used heap: recover_heap_repro's bug), check atomicity and that
+    # every acknowledged commit survived.  Its own driver build: the sweep task
+    # above may still be running from the same binary path.
+    mtc = ccdrv("mt_crash", "mt_oracle.c", "-O1 -g")
+    nk = 4 if full else 1
+    add("mt:crash", f"{mtc} && for s in $(seq 1 {nk}); do "
+                    f"MT_KILL_MS=300 MT_ITERS=10 {work}/mt_crash {work}/mtc$s.db $s 4 1000000 "
+                    f"|| exit 1; done")
 
     print(f"gate: {'FULL' if full else 'quick'} tier, {len(tasks)} tasks, "
           f"{a.jobs} workers, snapshot in {work}", flush=True)
