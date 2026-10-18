@@ -1,6 +1,6 @@
 # Concurrent BF engine: row-level optimistic transactions, our own log, mini-pages on disk
 
-Status: **PROPOSAL** (2026-10-13). Branch `begin-concurrent-exp`. WAL mode only.
+Status: **ADOPTED** (owner, 2026-10-18: P1-P5 accepted, C3 approved; group commit waits for C4's own log, option D of section 14).  Proposed 2026-10-13. Branch `begin-concurrent-exp`. WAL mode only.
 Compatibility is not a constraint (owner). Durability must stay at SQLite's level.
 Supersedes `write-path.md` (owner: "I don't like it") and `persisted-mini-pages.md`.
 

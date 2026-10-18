@@ -25,6 +25,10 @@ the **read/scan** wins need no format change, just the buffer pool + a direct-I/
 larger-than-RAM benchmark. Don't expect wins on an OS-page-cache-dominated box.
 
 ## Locked design decisions
+- **2026-10-18 (owner): the concurrent engine's principles P1-P5 are adopted**
+  (`docs/design/concurrent-engine.md`, branch `begin-concurrent-exp`): logical, complete,
+  idempotent ops; CLEAR is being retired in C3; group commit waits for C4's own log.  Where
+  the bullets below conflict with P1-P5 on that branch, P1-P5 win.
 - **One** record-granular **physiological WAL** (extend SQLite's WAL frame format): BF
   rowid-table leaf mutations log as `[leafPgno, rootPgno, op, key, val]`; everything else stays page-image
   frames. No sidecar / two-log design.  Payload **v3** (2026-09-24) adds op `CLEAR`: the commit

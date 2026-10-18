@@ -3273,3 +3273,9 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
   `MT_SMALL=1`; run without it only to study the upstream bug.  For the owner: the stock+BC
   baseline is not crash-safe under this workload, which matters for any concurrent comparison.
 - Gate --full 58/58.
+
+### 2026-10-18 — owner decisions
+
+- Group commit: **wait for C4** (design section 14, option D).
+- **C3 approved**, and with it P1-P5 replace the locked "CLEAR" decision on this branch
+  (design doc status ADOPTED; CLAUDE.md locked-decisions note).
