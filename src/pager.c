@@ -4739,6 +4739,36 @@ int sqlite3PagerBfGroupWait(Pager *pPager){
 #endif
   return SQLITE_OK;
 }
+/* C4d: crossing a log restart without reseeding (wal.c Wal.bBfCross). */
+int sqlite3PagerBfCrossGen(Pager *pPager, BfCrossInfo *pX){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) return sqlite3WalBfCrossGen(pPager->pWal, pX);
+#endif
+  return 0;
+}
+int sqlite3PagerBfCrossGenDone(Pager *pPager, int bOk, const u32 *aSalt, u32 iMx){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    return sqlite3WalBfCrossGenDone(pPager->pWal, bOk, aSalt, iMx);
+  }
+#endif
+  return SQLITE_OK;
+}
+void sqlite3PagerBfSetLastSeg(Pager *pPager, int bKnown, const u32 *aSalt, u32 iMx){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) sqlite3WalBfSetLastSeg(pPager->pWal, bKnown, aSalt, iMx);
+#endif
+}
+int sqlite3PagerBfFramePages(Pager *pPager, u32 iFrom, u32 iTo, u32 **paPg, int *pnPg){
+  *paPg = 0;
+  *pnPg = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    return sqlite3WalBfFramePages(pPager->pWal, iFrom, iTo, paPg, pnPg);
+  }
+#endif
+  return SQLITE_OK;
+}
 int sqlite3PagerBfSyncPending(Pager *pPager){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pPager->pWal ) return sqlite3WalBfSyncPending(pPager->pWal);

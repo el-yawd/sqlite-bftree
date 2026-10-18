@@ -150,7 +150,7 @@ int sqlite3BfWalBatchAppend(BfWalBatch *p, const BfWalRec *pRec){
   if( pRec->op==BFWAL_OP_MERGED && (pRec->nKey!=16 || pRec->nVal!=8) ){
     return BFWAL_FULL;      /* would not decode: refuse to encode it */
   }
-  if( pRec->op==BFWAL_OP_CKPT && (pRec->nKey!=0 || pRec->nVal!=0) ){
+  if( pRec->op==BFWAL_OP_CKPT && (pRec->nKey!=0 || pRec->nVal!=4) ){
     return BFWAL_FULL;
   }
   if( pRec->op!=BFWAL_OP_INSERT && pRec->op!=BFWAL_OP_DELETE
@@ -255,7 +255,7 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   off += (int)nKey;
   if( nVal > (u32)(it->nUsed - off) ) return BFWAL_CORRUPT;
   if( op==BFWAL_OP_MERGED && (nKey!=16 || nVal!=8) ) return BFWAL_CORRUPT;
-  if( op==BFWAL_OP_CKPT && (nKey!=0 || nVal!=0) ) return BFWAL_CORRUPT;
+  if( op==BFWAL_OP_CKPT && (nKey!=0 || nVal!=4) ) return BFWAL_CORRUPT;
 
   pRec->pgno = pgno;
   pRec->rootPgno = rootPgno;
@@ -321,6 +321,7 @@ struct BfWalIndex {
   u32         iSeq;         /* next sequence number */
   u32         iCkpt;        /* C4b: frame of a CKPT op appended and not yet
                             ** taken (sqlite3BfWalIndexTakeCkpt), else 0 */
+  u32         iCkptSeg;     /* C4d: ... and the segment frame it carried */
 };
 
 #define BFWAL_IDX_INIT_BUCKETS 64
@@ -440,6 +441,7 @@ int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
   if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_CORRUPT;
   if( pRec->op==BFWAL_OP_CKPT ){
     p->iCkpt = iFrame;          /* the caller decides whether to fold */
+    p->iCkptSeg = bfGet32(pRec->pVal);
     return BFWAL_OK;
   }
   if( pRec->op==BFWAL_OP_MERGED ){
@@ -646,10 +648,28 @@ void sqlite3BfWalIndexRebase(BfWalIndex *p, u32 mxFrame, int bKeepFrames){
   p->nMark = 0;
   p->iCkpt = 0;
 }
-u32 sqlite3BfWalIndexTakeCkpt(BfWalIndex *p){
+u32 sqlite3BfWalIndexTakeCkpt(BfWalIndex *p, u32 *piSeg){
   u32 i = p ? p->iCkpt : 0;
+  if( piSeg ) *piSeg = p ? p->iCkptSeg : 0;
   if( p ) p->iCkpt = 0;
   return i;
+}
+/* C4d: drop the base op of every key in one of the (sorted, disjoint per
+** root) ranges -- a newer region segment's KILLs, applied to a folded index. */
+void sqlite3BfWalIndexDropBase(BfWalIndex *p,
+    int (*xIn)(void*, u32, const u8*), void *pCtx){
+  int i;
+  if( p==0 ) return;
+  for(i=0; i<p->nBucket; i++){
+    BfKeyNode *pN;
+    for(pN = p->apBucket[i]; pN; pN = pN->pNext){
+      if( pN->bBase && xIn(pCtx, pN->root, pN->aKey) ){
+        BFWAL_FREE(pN->base.pVal);
+        memset(&pN->base, 0, sizeof(pN->base));
+        pN->bBase = 0;
+      }
+    }
+  }
 }
 
 /*
@@ -659,6 +679,7 @@ u32 sqlite3BfWalIndexTakeCkpt(BfWalIndex *p){
 ** generation the segment header names (MERGED exemptions need it).
 */
 int sqlite3BfRegionEntrySize(u8 kind, u32 nVal){
+  if( kind==BFREG_PAGE ) return 1+4+8;
   if( kind==BFREG_KILL ) return 1+4+8+8;
   if( kind==BFWAL_OP_DELETE ) return 1+4+8+4;
   return 1+4+8+4+4+(int)nVal;
@@ -672,6 +693,7 @@ int sqlite3BfRegionEncode(u8 *a, u8 kind, u32 root, const u8 *pKey,
     memcpy(a+13, pVal, 8);           /* hi */
     return 21;
   }
+  if( kind==BFREG_PAGE ) return 13;  /* root = the page number, key unused */
   bfPut32(a+13, iFrame);
   if( kind==BFWAL_OP_DELETE ) return 17;
   bfPut32(a+17, nVal);
@@ -690,6 +712,7 @@ int sqlite3BfRegionDecode(const u8 *a, int nAvail, BfRegionEntry *pE){
     pE->pHi = a+13;
     return 21;
   }
+  if( pE->kind==BFREG_PAGE ) return 13;
   if( nAvail<17 ) return 0;
   pE->iFrame = bfGet32(a+13);
   if( pE->kind==BFWAL_OP_DELETE ) return 17;

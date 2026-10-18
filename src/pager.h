@@ -301,6 +301,14 @@ u64 sqlite3PagerBfLogBytes(Pager*);
 void sqlite3PagerBfGroupStats(Pager*, u64 *aOut);
 int sqlite3PagerBfGroupWait(Pager*);
 int sqlite3PagerBfSyncPending(Pager*);
+#ifndef BF_CROSSINFO_TYPEDEF
+#define BF_CROSSINFO_TYPEDEF
+typedef struct BfCrossInfo BfCrossInfo;
+#endif
+int sqlite3PagerBfCrossGen(Pager*, BfCrossInfo*);
+int sqlite3PagerBfCrossGenDone(Pager*, int bOk, const u32 *aSalt, u32 iMx);
+void sqlite3PagerBfSetLastSeg(Pager*, int bKnown, const u32 *aSalt, u32 iMx);
+int sqlite3PagerBfFramePages(Pager*, u32 iFrom, u32 iTo, u32 **paPg, int *pnPg);
 /* Phase 2 (WAL) rollback: rebuild the record cache from the committed log. */
 typedef u32 (*BfLeafFnP)(void*, u32, const unsigned char*);
 struct BfKeyRef;

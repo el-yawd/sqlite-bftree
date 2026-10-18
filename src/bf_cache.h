@@ -694,6 +694,7 @@ struct BfCache {
   u64 nRegionCompact;       /* C4b: ... of which rewrote the region in full */
   u64 nRegionPages;         /* C4b: region pages written */
   u64 nRegionSeed;          /* C4b: record-index seeds read from the region */
+  u64 nRegionCross;         /* C4d: log restarts crossed incrementally */
   u64 nSnapshotIncr;        /* ... handled by dropping only the leaves it changed */
   u64 nSnapshotIncrPages;   /* leaves those incremental advances dropped */
   u64 nRingGrow;            /* rebuilds that grew the ring to fit the replay */
@@ -1118,7 +1119,9 @@ SQLITE_PRIVATE int sqlite3BfCacheLeafFits(BfCache*, u32 pgno, const BfFitOp *aEx
 #define BFREG_HDRN        4
 
 SQLITE_PRIVATE u32 sqlite3BfLeafForKey(void *pBtShared, u32 root, const u8 *pKey);
-SQLITE_PRIVATE int sqlite3BfBtreeLogCkpt(Btree*);
+SQLITE_PRIVATE int sqlite3BfBtreeLogCkpt(Btree*, u32 iSegMx);
+SQLITE_PRIVATE int bfDropReplayPublic(BfCache*, Btree*, const u32*, int,
+                       const BfKeyRef*, int, const BfKeyRange*, int);
 SQLITE_PRIVATE int sqlite3BfBtreeGroupPending(Btree*);
 SQLITE_PRIVATE u32 sqlite3BfLeafForKeyCached(void *pBtShared, u32 root, const u8 *pKey);
 SQLITE_PRIVATE int sqlite3BfCacheReplayKeys(BfCache*, BfWalIndex*, u32 mxFrame,

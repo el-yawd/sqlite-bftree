@@ -746,7 +746,7 @@ int sqlite3BfBtreeLogFlushMarks(Btree *p){
 ** staged now so that it is this commit's last record before any further
 ** record the commit logs (those are newer than the region, and stay ops).
 */
-int sqlite3BfBtreeLogCkpt(Btree *p){
+int sqlite3BfBtreeLogCkpt(Btree *p, u32 iSegMx){
   BfCache *pBf;
   BfLogAllCtx ctx;
   BfGroup *g;
@@ -761,10 +761,17 @@ int sqlite3BfBtreeLogCkpt(Btree *p){
   ctx.pGroup = g;
   ctx.rc     = SQLITE_OK;
   memset(&rec, 0, sizeof(rec));
-  rec.pgno = 1;
-  rec.rootPgno = 2;
-  rec.op = BFWAL_OP_CKPT;
-  bfLogAppendRec(&ctx, &rec);
+  {
+    u8 aVal[4];
+    aVal[0] = (u8)(iSegMx>>24); aVal[1] = (u8)(iSegMx>>16);
+    aVal[2] = (u8)(iSegMx>>8);  aVal[3] = (u8)iSegMx;
+    rec.pgno = 1;
+    rec.rootPgno = 2;
+    rec.op = BFWAL_OP_CKPT;
+    rec.pVal = aVal;
+    rec.nVal = 4;
+    bfLogAppendRec(&ctx, &rec);
+  }
   bfGroupStage(g, ctx.pPager, &ctx.rc);
   return ctx.rc;
 }
@@ -1122,6 +1129,7 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[21] = pBf ? pBf->nRegionCompact : 0;
   aOut[22] = pBf ? pBf->nRegionPages : 0;
   aOut[23] = pBf ? pBf->nRegionSeed : 0;
+  aOut[24] = pBf ? pBf->nRegionCross : 0;
 }
 
 void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
@@ -1424,6 +1432,13 @@ static int bfDropReplay(BfCache *pBf, Btree *p, const u32 *aPg, int nPg,
     sqlite3BfUnlogListReset(pBf);
   }
   return rc;
+}
+
+/* C4d: the incremental drop-and-replay, for the cross-generation step. */
+int bfDropReplayPublic(BfCache *pBf, Btree *p, const u32 *aPg, int nPg,
+                       const BfKeyRef *aKey, int nKey,
+                       const BfKeyRange *aRange, int nRange){
+  return bfDropReplay(pBf, p, aPg, nPg, aKey, nKey, aRange, nRange);
 }
 
 int sqlite3BfBtreeSnapshotAdvance(Btree *p){

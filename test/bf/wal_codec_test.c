@@ -367,18 +367,22 @@ static void test_ckpt_op(void){
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
   memset(&r, 0, sizeof(r));
   r.pgno=1; r.rootPgno=2; r.op=BFWAL_OP_CKPT;
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_FULL );    /* v7: needs its frame */
+  r.nVal=4; r.pVal=(const u8*)"\x00\x00\x01\x2c";      /* segment frame 300 */
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
   r.nKey=8; r.pKey=k;
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_FULL );    /* CKPT with a key */
   sqlite3BfWalBatchFinish(&b);
   CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
   CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_OK && o.op==BFWAL_OP_INSERT );
-  CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_OK && o.op==BFWAL_OP_CKPT && o.nKey==0 );
+  CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_OK && o.op==BFWAL_OP_CKPT && o.nKey==0
+      && o.nVal==4 );
   CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_DONE );
   CHECK( sqlite3BfWalIndexAddFrame(ix, buf, sizeof(buf), 7)==BFWAL_OK );
   CHECK( sqlite3BfWalIndexKeyCount(ix)==1 );
-  CHECK( sqlite3BfWalIndexTakeCkpt(ix)==7 );
-  CHECK( sqlite3BfWalIndexTakeCkpt(ix)==0 );
+  { u32 iSeg = 0;
+    CHECK( sqlite3BfWalIndexTakeCkpt(ix, &iSeg)==7 && iSeg==300 );
+    CHECK( sqlite3BfWalIndexTakeCkpt(ix, &iSeg)==0 ); }
   /* A CKPT that claims a key does not decode. */
   buf[BFWAL_HDRSIZE + (4+4+1+1+1+8+1) + 9] = 8;           /* its keyLen varint */
   CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
@@ -409,6 +413,10 @@ static void test_region_codec(void){
   CHECK( n==n3 && e.kind==BFREG_KILL && e.root==8 && memcmp(e.pHi,hi,8)==0 );
   for(i=0;i<n1;i++) CHECK( sqlite3BfRegionDecode(a, i, &e)==0 );
   for(i=0;i<n3;i++) CHECK( sqlite3BfRegionDecode(a+n1+n2, i, &e)==0 );
+  { u8 pz[8]; memset(pz, 0, 8);
+    n = sqlite3BfRegionEncode(a+200, BFREG_PAGE, 4321, pz, 0, 0, 0);
+    CHECK( n==sqlite3BfRegionEntrySize(BFREG_PAGE, 0) );
+    CHECK( sqlite3BfRegionDecode(a+200, n, &e)==n && e.kind==BFREG_PAGE && e.root==4321 ); }
   a[0] = 9;  CHECK( sqlite3BfRegionDecode(a, n1, &e)==0 );            /* bad kind */
   a[0] = BFWAL_OP_INSERT; a[1]=a[2]=a[3]=0; a[4]=1;
   CHECK( sqlite3BfRegionDecode(a, n1, &e)==0 );                        /* root 1 */

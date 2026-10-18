@@ -1162,6 +1162,7 @@ static int btreeMoveto(
 */
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
 static int bfRegionSeed(BtShared *pBt);   /* C4b, near the checkpoint */
+static int bfRegionCrossGen(Btree*, const BfCrossInfo*, int*, u32*, u32*, int*);
 #endif
 static int btreeRestoreCursorPosition(BtCursor *pCur){
   int rc;
@@ -4044,7 +4045,23 @@ static SQLITE_NOINLINE int btreeBeginTrans(
     if( rc==SQLITE_OK && pBt->inTransaction==TRANS_NONE ){
       BfCache *pBfSnap = sqlite3PagerGetBfCache(pPager);
       u32 aSnap[3];
-      if( pBfSnap!=0 && sqlite3PagerBfNeedSeed(pPager) ){
+#ifndef SQLITE_BF_NO_CROSSGEN
+      if( pBfSnap!=0 ){
+        BfCrossInfo xi;
+        if( sqlite3PagerBfCrossGen(pPager, &xi) ){
+          int bOk = 0, bNewest = 0;
+          u32 aNS[2], iNM = 0;
+          rc = bfRegionCrossGen(p, &xi, &bOk, aNS, &iNM, &bNewest);
+          {
+            int rc2 = sqlite3PagerBfCrossGenDone(pPager, rc==SQLITE_OK && bOk,
+                                                 bNewest ? aNS : 0, iNM);
+            if( rc==SQLITE_OK ) rc = rc2;
+          }
+          if( rc==SQLITE_OK && !bOk ) pBfSnap->bSnapSeen = 0;
+        }
+      }
+#endif
+      if( rc==SQLITE_OK && pBfSnap!=0 && sqlite3PagerBfNeedSeed(pPager) ){
         /* C4b: the record index was rebuilt from the log alone; add the
         ** region's entries, and rebuild the cache from the result. */
         rc = bfRegionSeed(pBt);
@@ -14059,6 +14076,14 @@ static void bfRegPut(BfRegBuf *b, u8 kind, u32 root, const u8 *pKey,
                                      iFrame);
   b->nEntry++;
 }
+static int bfRegPgnoCmp(const void *a, const void *b){
+  u32 x = *(const u32*)a, y = *(const u32*)b;
+  return x<y ? -1 : x>y;
+}
+static void bfRegPutPage(BfRegBuf *b, u32 pgno){
+  static const u8 aZero[8] = {0,0,0,0,0,0,0,0};
+  bfRegPut(b, BFREG_PAGE, pgno, aZero, 0, 0, 0);
+}
 static int bfRegStateCb(void *pCtx, u32 root, const u8 *pKey,
                         const BfKeyState *st, int bNew){
   BfRegBuf *b = (BfRegBuf*)pCtx;
@@ -14250,6 +14275,7 @@ static int bfRegionLoad(BtShared *pBt, BfWalIndex *pIdx){
       int n = sqlite3BfRegionDecode(&aBuf[off], (int)(nBuf-off), &e);
       if( n==0 ){ rc = SQLITE_CORRUPT_BKPT; break; }
       off += (u32)n;
+      if( e.kind==BFREG_PAGE ) continue;      /* C4d: for crossing readers */
       if( e.kind==BFREG_KILL ){
         if( nKill>=nKillAlloc ){
           int nNew = nKillAlloc ? nKillAlloc*2 : 64;
@@ -14279,6 +14305,214 @@ static int bfRegionLoad(BtShared *pBt, BfWalIndex *pIdx){
   return rc;
 }
 
+/* A segment's header: its older segment, generation salt and state frame. */
+static int bfRegionSegHdr(BtShared *pBt, Pgno iSeg, Pgno *piOlder,
+                          u32 *aSalt, u32 *pMx){
+  DbPage *pDb;
+  u8 *a;
+  int rc = sqlite3PagerGet(pBt->pPager, iSeg, &pDb, 0);
+  if( rc ) return rc;
+  a = (u8*)sqlite3PagerGetData(pDb);
+  if( get4byte(&a[4])!=BFREG_MAGIC ){
+    rc = SQLITE_CORRUPT_BKPT;
+  }else{
+    if( piOlder ) *piOlder = get4byte(&a[8]);
+    aSalt[0] = get4byte(&a[24]);
+    aSalt[1] = get4byte(&a[28]);
+    *pMx = get4byte(&a[32]);
+  }
+  sqlite3PagerUnref(pDb);
+  return rc;
+}
+
+/* C4d: a growable list of pgnos / keys / ranges for the cross step. */
+typedef struct BfCross BfCross;
+struct BfCross {
+  BfWalIndex *pIdx;
+  u32 *aPg; int nPg, nPgAlloc;
+  BfKeyRef *aKey; int nKey, nKeyAlloc;
+  BfKeyRange *aRange; int nRange, nRangeAlloc;
+  BfKill *aKill; int nKill, nKillAlloc;   /* the current segment's KILLs */
+  int bOom;
+};
+static void *bfCrossGrow(void *a, int *pnAlloc, int n, int sz, int *pbOom){
+  if( n<*pnAlloc ) return a;
+  {
+    int nNew = *pnAlloc ? *pnAlloc*2 : 64;
+    void *aNew = sqlite3_realloc64(a, (u64)nNew*(u64)sz);
+    if( aNew==0 ){ *pbOom = 1; return a; }
+    *pnAlloc = nNew;
+    return aNew;
+  }
+}
+static int bfCrossKillHit(void *pCtx, u32 root, const u8 *pKey){
+  BfCross *x = (BfCross*)pCtx;
+  return bfKillHit(x->aKill, x->nKill, root, pKey);
+}
+
+/*
+** C4d: bring the record index and cache across a log restart from the region
+** segments written since the index's old point (pX), instead of reseeding
+** from the whole region and rebuilding the cache.
+**
+** The segments newer than that point are found walking the chain newest
+** first, skipping the current generation's own (its frames are in the log --
+** unless pX->bAll), and stopping at the newest segment the index already
+** reflects: one of the old generation at or before its frame, or the segment
+** its base was seeded or folded from.  Not finding it (compaction freed it,
+** or the base came from no segment) fails, and the caller reseeds.  Applied
+** oldest first, each segment's KILLs drop base ops in their ranges and its
+** states replace base ops; its keys, ranges and pages then drive the same
+** incremental drop-and-replay that catch-up within a generation uses.
+** Returns SQLITE_OK with *pbOk==0 when the caller must fall back.
+*/
+static int bfRegionCrossGen(Btree *p, const BfCrossInfo *pX, int *pbOk,
+                            u32 *aNewestSalt, u32 *piNewestMx, int *pbNewest){
+  BtShared *pBt = p->pBt;
+  Pager *pPager = pBt->pPager;
+  BfCache *pBf = sqlite3PagerGetBfCache(pPager);
+  Pgno iSeg = get4byte(&pBt->pPage1->aData[BFREG_META_HEAD]);
+  u32 nTotal = get4byte(&pBt->pPage1->aData[BFREG_META_PAGES]);
+  Pgno *aSeg = 0;
+  int nSeg = 0, nSegAlloc = 0, bFound = 0, i;
+  u32 nWalk = 0;
+  BfCross x;
+  int rc = SQLITE_OK;
+  *pbOk = 0;
+  *pbNewest = 0;
+  memset(&x, 0, sizeof(x));
+  x.pIdx = sqlite3PagerBfWalIndex(pPager);
+  if( pBf==0 || x.pIdx==0 || !pX->bSegKnown || iSeg==0 ) return SQLITE_OK;
+  if( btreePagecount(pBt)<pX->nOldPage ) return SQLITE_OK;   /* it shrank */
+  while( iSeg && rc==SQLITE_OK ){
+    Pgno iOlder = 0;
+    u32 aS[2], iMx;
+    if( ++nWalk>nTotal ) break;
+    rc = bfRegionSegHdr(pBt, iSeg, &iOlder, aS, &iMx);
+    if( rc ) break;
+    if( !pX->bAll && memcmp(aS, pX->aNewSalt, 8)==0 ){
+      iSeg = iOlder;                      /* in the log of this generation */
+      continue;
+    }
+    if( (memcmp(aS, pX->aSegSalt, 8)==0 && iMx==pX->iSegMx)
+     || (memcmp(aS, pX->aOldSalt, 8)==0 && iMx<=pX->iOldFrame) ){
+      bFound = 1;
+      break;
+    }
+    aSeg = (Pgno*)bfCrossGrow(aSeg, &nSegAlloc, nSeg, sizeof(Pgno), &x.bOom);
+    if( x.bOom ){ rc = SQLITE_NOMEM_BKPT; break; }
+    if( nSeg==0 ){
+      memcpy(aNewestSalt, aS, 8);
+      *piNewestMx = iMx;
+      *pbNewest = 1;
+    }
+    aSeg[nSeg++] = iSeg;
+    iSeg = iOlder;
+  }
+  if( rc!=SQLITE_OK || !bFound ){
+    sqlite3_free(aSeg);
+    return rc;
+  }
+  for(i=nSeg-1; rc==SQLITE_OK && i>=0; i--){
+    u8 *aBuf = 0;
+    u32 nBuf = 0, off;
+    Pgno iOlder;
+    u32 aSegSalt[2];
+    int pass, bSameGen;
+    rc = bfRegionReadSegment(pBt, aSeg[i], &aBuf, &nBuf, &iOlder, aSegSalt);
+    if( rc ) break;
+    bSameGen = memcmp(aSegSalt, pX->aNewSalt, 8)==0;
+    for(pass=0; pass<2 && rc==SQLITE_OK; pass++){
+      x.nKill = 0;
+      off = 0;
+      while( rc==SQLITE_OK && off<nBuf ){
+        BfRegionEntry e;
+        int n = sqlite3BfRegionDecode(&aBuf[off], (int)(nBuf-off), &e);
+        if( n==0 ){ rc = SQLITE_CORRUPT_BKPT; break; }
+        off += (u32)n;
+        if( pass==0 ){
+          /* KILLs first: they apply to what is older than this segment. */
+          if( e.kind!=BFREG_KILL ) continue;
+          x.aKill = (BfKill*)bfCrossGrow(x.aKill, &x.nKillAlloc, x.nKill,
+                                         sizeof(BfKill), &x.bOom);
+          if( x.bOom ){ rc = SQLITE_NOMEM_BKPT; break; }
+          x.aKill[x.nKill].root = e.root;
+          memcpy(x.aKill[x.nKill].lo, e.pKey, 8);
+          memcpy(x.aKill[x.nKill].hi, e.pHi, 8);
+          x.nKill++;
+          continue;
+        }
+        if( e.kind==BFREG_KILL ) continue;   /* applied in pass 0 */
+        if( e.kind==BFREG_PAGE ){
+          x.aPg = (u32*)bfCrossGrow(x.aPg, &x.nPgAlloc, x.nPg, sizeof(u32), &x.bOom);
+          if( x.bOom ){ rc = SQLITE_NOMEM_BKPT; break; }
+          x.aPg[x.nPg++] = e.root;
+          continue;
+        }
+        if( sqlite3BfWalIndexSetBase(x.pIdx, e.root, e.pKey, e.kind, e.pVal,
+                                     e.nVal, bSameGen ? e.iFrame : 0)!=BFWAL_OK ){
+          rc = SQLITE_NOMEM_BKPT;
+          break;
+        }
+        x.aKey = (BfKeyRef*)bfCrossGrow(x.aKey, &x.nKeyAlloc, x.nKey,
+                                        sizeof(BfKeyRef), &x.bOom);
+        if( x.bOom ){ rc = SQLITE_NOMEM_BKPT; break; }
+        x.aKey[x.nKey].root = e.root;
+        memcpy(x.aKey[x.nKey].aKey, e.pKey, 8);
+        x.nKey++;
+      }
+      if( pass==0 && rc==SQLITE_OK && x.nKill>0 ){
+        int k;
+        x.nKill = bfKillNormalize(x.aKill, x.nKill);
+        sqlite3BfWalIndexDropBase(x.pIdx, bfCrossKillHit, &x);
+        for(k=0; k<x.nKill; k++){
+          x.aRange = (BfKeyRange*)bfCrossGrow(x.aRange, &x.nRangeAlloc, x.nRange,
+                                              sizeof(BfKeyRange), &x.bOom);
+          if( x.bOom ){ rc = SQLITE_NOMEM_BKPT; break; }
+          x.aRange[x.nRange].root = x.aKill[k].root;
+          memcpy(x.aRange[x.nRange].lo, x.aKill[k].lo, 8);
+          memcpy(x.aRange[x.nRange].hi, x.aKill[k].hi, 8);
+          x.nRange++;
+        }
+      }
+    }
+    sqlite3_free(aBuf);
+  }
+  sqlite3_free(aSeg);
+  if( rc==SQLITE_OK ){
+    /* The cache must reflect the index's old point for the drop-and-replay
+    ** to be exact; otherwise only the cache is rebuilt (the index is good). */
+    if( pBf->bSnapSeen && pBf->aSnapSeen[0]==pX->iOldFrame
+     && pBf->aSnapSeen[1]==pX->aOldSalt[0] && pBf->aSnapSeen[2]==pX->aOldSalt[1] ){
+      if( x.nPg>1 ){
+        int k, n = 1;
+        qsort(x.aPg, (size_t)x.nPg, sizeof(u32), bfRegPgnoCmp);
+        for(k=1; k<x.nPg; k++) if( x.aPg[k]!=x.aPg[n-1] ) x.aPg[n++] = x.aPg[k];
+        x.nPg = n;
+      }
+      rc = bfDropReplayPublic(pBf, p, x.aPg, x.nPg, x.aKey, x.nKey,
+                              x.aRange, x.nRange);
+      if( rc==SQLITE_FULL ){
+        rc = SQLITE_OK;
+        pBf->bSnapSeen = 0;               /* rebuild the cache in full */
+      }else if( rc==SQLITE_OK ){
+        pBf->aSnapSeen[0] = pX->iTouchFrom;
+        pBf->aSnapSeen[1] = pX->aNewSalt[0];
+        pBf->aSnapSeen[2] = pX->aNewSalt[1];
+        pBf->nRegionCross++;
+      }
+    }else{
+      pBf->bSnapSeen = 0;
+    }
+    if( rc==SQLITE_OK ) *pbOk = 1;
+  }
+  sqlite3_free(x.aPg);
+  sqlite3_free(x.aKey);
+  sqlite3_free(x.aRange);
+  sqlite3_free(x.aKill);
+  return rc;
+}
+
 /* Seed the index if the WAL says it lacks the region (btreeBeginTrans). */
 static int bfRegionSeed(BtShared *pBt){
   Pager *pPager = pBt->pPager;
@@ -14287,10 +14521,19 @@ static int bfRegionSeed(BtShared *pBt){
   if( !sqlite3PagerBfNeedSeed(pPager) ) return SQLITE_OK;
   if( get4byte(&pBt->pPage1->aData[BFREG_META_HEAD])!=0 ){
     BfCache *pBfS = sqlite3PagerGetBfCache(pPager);
+    u32 aS[2], iMx;
     pIdx = sqlite3PagerBfSeedIndex(pPager);
     if( pIdx==0 ) return SQLITE_NOMEM_BKPT;
     rc = bfRegionLoad(pBt, pIdx);
     if( pBfS ) pBfS->nRegionSeed++;
+    /* C4d: the base now reflects the head segment. */
+    if( rc==SQLITE_OK
+     && bfRegionSegHdr(pBt, get4byte(&pBt->pPage1->aData[BFREG_META_HEAD]),
+                       0, aS, &iMx)==SQLITE_OK ){
+      sqlite3PagerBfSetLastSeg(pPager, 1, aS, iMx);
+    }
+  }else{
+    sqlite3PagerBfSetLastSeg(pPager, 0, 0, 0);
   }
   if( rc==SQLITE_OK ) sqlite3PagerBfSeedDone(pPager);
   return rc;
@@ -14316,6 +14559,8 @@ static int bfRegionCheckpoint(Btree *p){
   u32 nBytes = get4byte(&a1[BFREG_META_BYTES]);
   u32 nCompact = get4byte(&a1[BFREG_META_COMPACT]);
   u32 aSalt[2], mx, iAfter = 0;
+  u32 *aPages = 0;
+  int nPages2 = 0;
   BfRegBuf inc, full;
   int rc = SQLITE_OK;
   memset(&inc, 0, sizeof(inc));
@@ -14355,6 +14600,36 @@ static int bfRegionCheckpoint(Btree *p){
     rc = SQLITE_NOMEM_BKPT;
     goto region_out;
   }
+  /* C4d: and the pages written in the same span, so that a reader crossing
+  ** a later log restart can invalidate exactly those (bfRegionCrossGen). */
+  rc = sqlite3PagerBfFramePages(pPager, iAfter, mx, &aPages, &nPages2);
+  if( rc!=SQLITE_OK ) goto region_out;
+  if( nPages2>1 ) qsort(aPages, (size_t)nPages2, sizeof(u32), bfRegPgnoCmp);
+  {
+    /* Every page written, whatever it is now: a page that was a cached leaf
+    ** and has since been freed or become an interior page still has stale BF
+    ** state (its leaf bit, a full-page copy) in a crossing reader.  But only
+    ** pages that are b-tree pages now justify a segment of their own: the
+    ** region's own pages from the previous checkpoint's commit would
+    ** otherwise make every checkpoint write one. */
+    int k, j = 0, bTree = 0;
+    for(k=0; k<nPages2; k++){
+      if( k>0 && aPages[k]==aPages[k-1] ) continue;
+      aPages[j++] = aPages[k];
+      if( !bTree && aPages[k]<=btreePagecount(pBt) ){
+        DbPage *pDb;
+        if( sqlite3PagerGet(pPager, aPages[k], &pDb, 0)==SQLITE_OK ){
+          u8 f = ((u8*)sqlite3PagerGetData(pDb))[0];
+          if( f==0x02 || f==0x05 || f==0x0a || f==0x0d ) bTree = 1;
+          sqlite3PagerUnref(pDb);
+        }
+      }
+    }
+    nPages2 = j;
+    if( inc.nEntry>0 || bTree ){
+      for(k=0; k<nPages2; k++) bfRegPutPage(&inc, aPages[k]);
+    }
+  }
   if( inc.nEntry==0 ) goto region_out;          /* the region is current */
   { BfCache *pBfS = sqlite3PagerGetBfCache(pPager); if( pBfS ) pBfS->nRegionCkpt++; }
   if( iHead && (u64)nBytes + inc.n > 2*(u64)nCompact + 65536 ){
@@ -14366,6 +14641,10 @@ static int bfRegionCheckpoint(Btree *p){
     if( sqlite3BfWalIndexForEachState(pIdx, mx, 0, 1, bfRegStateCb, &full) ){
       rc = SQLITE_NOMEM_BKPT;
       goto region_out;
+    }
+    {
+      int k;
+      for(k=0; k<nPages2; k++) bfRegPutPage(&full, aPages[k]);
     }
     rc = bfRegionFreeAll(pBt, iHead, nPages);
     iHead = 0;
@@ -14390,7 +14669,7 @@ static int bfRegionCheckpoint(Btree *p){
     if( rc==SQLITE_OK ) rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
     /* The commit says so in the log: a CKPT op as its last record lets every
     ** connection that reads it fold its index (BFWAL_OP_CKPT). */
-    if( rc==SQLITE_OK ) rc = sqlite3BfBtreeLogCkpt(p);
+    if( rc==SQLITE_OK ) rc = sqlite3BfBtreeLogCkpt(p, mx);
     if( rc==SQLITE_OK ){
       put4byte(&a1[BFREG_META_HEAD], iHead);
       put4byte(&a1[BFREG_META_PAGES], nPages);
@@ -14403,6 +14682,7 @@ static int bfRegionCheckpoint(Btree *p){
     }
   }
 region_out:
+  sqlite3_free(aPages);
   sqlite3_free(inc.a);
   sqlite3_free(inc.aKill);
   sqlite3_free(full.a);

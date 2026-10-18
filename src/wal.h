@@ -57,6 +57,10 @@
 #  define sqlite3WalBfNoPersist(x)
 #  define sqlite3WalBfArmGroupSync(x,y)
 #  define sqlite3WalBfGroupWait(x)               0
+#  define sqlite3WalBfCrossGen(x,y)              0
+#  define sqlite3WalBfCrossGenDone(w,x,y,z)      0
+#  define sqlite3WalBfSetLastSeg(w,x,y,z)
+#  define sqlite3WalBfFramePages(v,w,x,y,z)      0
 #  define sqlite3WalBfSyncPending(x)             0
 #  define sqlite3WalBfGroupStats(x,y)
 #  define sqlite3WalBfGeneration(w,x,y)          (*(y)=0)
@@ -152,6 +156,15 @@ void sqlite3WalBfSeedDone(Wal *pWal);
 void sqlite3WalBfNoPersist(Wal *pWal);
 void sqlite3WalBfArmGroupSync(Wal *pWal, int bOn);
 int sqlite3WalBfGroupWait(Wal *pWal);
+/* C4d */
+#ifndef BF_CROSSINFO_TYPEDEF
+#define BF_CROSSINFO_TYPEDEF
+typedef struct BfCrossInfo BfCrossInfo;
+#endif
+int sqlite3WalBfCrossGen(Wal *pWal, BfCrossInfo *pX);
+int sqlite3WalBfCrossGenDone(Wal *pWal, int bOk, const u32 *aSegSalt, u32 iSegMx);
+void sqlite3WalBfSetLastSeg(Wal *pWal, int bKnown, const u32 *aSalt, u32 iMx);
+int sqlite3WalBfFramePages(Wal *pWal, u32 iFrom, u32 iTo, u32 **paPg, int *pnPg);
 int sqlite3WalBfSyncPending(Wal *pWal);
 void sqlite3WalBfGroupStats(Wal *pWal, u64 *aOut);
 void sqlite3WalBfGeneration(Wal *pWal, u32 *aSalt, u32 *pmxFrame);

@@ -3472,3 +3472,40 @@ Open items:
   connections closing mid-run, 4/8 threads under FULL now reach 690/391 commits/s (group sync
   off) and 1000/708 (group sync on), against 30-60 before.
 - **Verified:** gate --full 59/59; mt 54/54; mwriter 108/108.
+
+### 2026-10-18 (cont.) — Claude Opus 5.5 — C4d: crossing a log restart without reseeding
+
+Design doc section 16 (C4d) has the design.  In short:
+- A reader that finds a new log generation keeps its index.  It folds it at its old point and
+  applies only the region segments written since.
+- **Format changes:** segments now list the pages written in their span (BFREG_PAGE), and CKPT
+  carries its segment's frame (payload v7).
+- It then replays just the keys, ranges and pages those segments name.
+- It falls back to a full reseed when the boundary segment was compacted away.
+- **Switch and counter:** `SQLITE_BF_NO_CROSSGEN`; `region_crossings`.
+
+Bugs found while building it:
+1. **A failed crossing lost the new generation's ops.**  It dropped the index the catch-up had
+   just filled with the new generation's frames, and left iBfIngested past them.  A checkpoint
+   then wrote a compacted region without them: persistent loss (mwriter seed 12).  It now
+   re-reads them.
+2. **A CKPT fold during the crossing turned new-generation ops into base ops**, which the older
+   segments then overwrote.  This showed up in mt_oracle under load only, 22/36 gate runs.  It
+   was found with an in-memory event log, because fprintf tracing hid it.  There is no fold
+   while a crossing is pending.
+3. **A leaf-only page filter left stale state for freed leaves.**  Every page is listed again.
+   Only the choice to write a page-only segment looks at page types, so the region's own pages
+   do not force a segment at every checkpoint.
+
+Verified:
+- `gate --full` 60/60, including the new `repro:crossgen`.  It checks the crossing is
+  incremental and correct; mutants that skip segment states or page invalidation both fail it.
+- mt 3-10: 72/72.  mwriter 5-12, 3 modes: 216/216.
+- mt crash, 3 seeds: OK.  Power-cut torn/lost: OK.
+
+Also this round: the close-time checkpoint is PASSIVE (owner).
+
+C4 is complete: C4a-d.  Open:
+- The earlier mt range-read flake (C4c); not seen again.
+- Group-commit batching efficiency.
+- The C-letter campaign, which measures C1-C4 with their ablation switches.

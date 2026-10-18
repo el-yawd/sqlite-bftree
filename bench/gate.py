@@ -24,6 +24,7 @@ Tasks, per tier (quick = fewer seeds):
   ring        ring_repro.sh (full tier only: needs the harness dataset)
   stale_ckpt  stale_ckpt_repro.c: a stale-cache checkpoint must not erase another
               connection's committed record frames (2026-10-13)
+  crossgen    crossgen_repro.c: a reader crosses a log restart incrementally (C4d)
   recover_heap  recover_heap_repro.c: recovery with a record frame at a wal-index
               block start, in a process with a used heap (2026-10-17)
   mt:crash    mt_oracle.c crash mode: SIGKILL a threaded workload 10x, recover,
@@ -154,6 +155,8 @@ def main():
 
     add("repro:stale_ckpt", ccdrv("stale_ckpt", "stale_ckpt_repro.c", "-O1") +
         f" && {work}/stale_ckpt {work}/stale_ckpt.db")
+    add("repro:crossgen", ccdrv("crossgen", "crossgen_repro.c", "-O1") +
+        f" && {work}/crossgen {work}/crossgen.db")
     add("repro:recover_heap", ccdrv("recover_heap", "recover_heap_repro.c", "-O1") +
         f" && {work}/recover_heap {work}/recover_heap.db")
     # mwriter: each task builds its own driver, then runs one shard of the sweep.

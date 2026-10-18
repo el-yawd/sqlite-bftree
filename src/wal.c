@@ -580,6 +580,21 @@ struct Wal {
   u8 bBfNeedSeed;
   u8 bBfNoPersist;          /* C4b: leaving WAL mode -- delete the log at close */
   u8 bBfNoFold;             /* C4b: the frames being ingested follow a gap */
+  /* C4d (2026-10-18): crossing a log restart without reseeding.  The index
+  ** knows the newest region segment its base reflects (aBfSegSalt/iBfSegMx,
+  ** from the seed or the last CKPT fold).  A new generation found by catch-up
+  ** folds the index at the old point (aBfCrossSalt, iBfCrossF) and leaves the
+  ** btree to apply the region segments written since (bBfCross); bBfCrossAll
+  ** when the new generation's frames could not be read (read-mark 0), so its
+  ** segments count too.  nBfLastPage: database size at iBfIngested. */
+  u8 bBfSegKnown;
+  u32 aBfSegSalt[2];
+  u32 iBfSegMx;
+  u8 bBfCross, bBfCrossAll;
+  u32 aBfCrossSalt[2];
+  u32 iBfCrossF;
+  u32 nBfCrossPage;
+  u32 nBfLastPage;
   /* C4c (2026-10-18): durable group commit.  See walBfGroupWait. */
   u8 bBfGroupArm;           /* the commit being written may defer its fsync */
   u32 iBfWaitFrame;         /* a deferred commit's last frame (0: none) */
@@ -1442,9 +1457,20 @@ static int walBfIngestRecordFrame(Wal *pWal, const u8 *aData, int nData,
   /* C4b: a checkpoint's CKPT op.  Frames are ingested in log order, so the
   ** index holds every op before it; fold them into base ops -- unless the
   ** index lacks the region it would fold onto (it is seeded later instead). */
-  if( sqlite3BfWalIndexTakeCkpt(pWal->pBfWal) && !pWal->bBfNeedSeed
-   && !pWal->bBfPrune && !pWal->bBfNoFold ){
-    sqlite3BfWalIndexRebase(pWal->pBfWal, iFrame, 1);
+  {
+    u32 iSeg = 0;
+    /* Not while a log restart is being crossed (bBfCross): this fold would
+    ** turn the new generation's ops into base ops, and the older segments the
+    ** btree then applies as base ops would overwrite them (mt_oracle under
+    ** load: stale balances). */
+    if( sqlite3BfWalIndexTakeCkpt(pWal->pBfWal, &iSeg) && !pWal->bBfNeedSeed
+     && !pWal->bBfPrune && !pWal->bBfNoFold && !pWal->bBfCross ){
+      sqlite3BfWalIndexRebase(pWal->pBfWal, iFrame, 1);
+      /* C4d: the base now reflects that segment (of this generation). */
+      pWal->bBfSegKnown = 1;
+      memcpy(pWal->aBfSegSalt, pWal->aBfSalt, sizeof(pWal->aBfSegSalt));
+      pWal->iBfSegMx = iSeg;
+    }
   }
   return SQLITE_OK;
 }
@@ -1960,6 +1986,8 @@ static int walIndexRecover(Wal *pWal){
       sqlite3BfWalIndexFree(pWal->pBfWal);
       pWal->pBfWal = 0;
       pWal->bBfNeedSeed = 1;
+      pWal->bBfSegKnown = 0;
+      pWal->bBfCross = 0;
 
       for(iPg=0; !bEnd; iPg++){
         u32 *aShare;
@@ -2778,7 +2806,7 @@ static void walRestartHdr(Wal *pWal, u32 salt1){
   ** index covers that whole log (and had the region to begin with), it folds
   ** into base ops -- exactly what seeding from the region would give.
   ** Otherwise it is dropped and seeded at the next transaction. */
-  if( !pWal->bBfNeedSeed && !pWal->bBfPrune
+  if( !pWal->bBfNeedSeed && !pWal->bBfPrune && !pWal->bBfCross
    && pWal->iBfIngested==pWal->hdr.mxFrame
    && memcmp(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt))==0 ){
     sqlite3BfWalIndexRebase(pWal->pBfWal, pWal->hdr.mxFrame, 0);
@@ -2786,7 +2814,9 @@ static void walRestartHdr(Wal *pWal, u32 salt1){
     sqlite3BfWalIndexFree(pWal->pBfWal);
     pWal->pBfWal = 0;
     pWal->bBfNeedSeed = 1;
+    pWal->bBfSegKnown = 0;
   }
+  pWal->bBfCross = 0;
   pWal->bBfPrune = 0;
   pWal->bBfTouchOk = 0;
 #endif
@@ -5857,6 +5887,96 @@ void sqlite3WalBfSeedDone(Wal *pWal){
 void sqlite3WalBfNoPersist(Wal *pWal){
   if( pWal ) pWal->bBfNoPersist = 1;
 }
+/* C4d: crossing a log restart (see Wal.bBfCross). */
+int sqlite3WalBfCrossGen(Wal *pWal, BfCrossInfo *pX){
+  if( pWal==0 || !pWal->bBfCross ) return 0;
+  memcpy(pX->aOldSalt, pWal->aBfCrossSalt, 8);
+  pX->iOldFrame = pWal->iBfCrossF;
+  pX->nOldPage = pWal->nBfCrossPage;
+  pX->bSegKnown = pWal->bBfSegKnown;
+  memcpy(pX->aSegSalt, pWal->aBfSegSalt, 8);
+  pX->iSegMx = pWal->iBfSegMx;
+  memcpy(pX->aNewSalt, pWal->hdr.aSalt, 8);
+  pX->bAll = pWal->bBfCrossAll;
+  pX->iTouchFrom = pWal->iBfTouchFrom;
+  return 1;
+}
+/* bOk==0: the segments could not bridge the gap -- seed from the region.
+** The index is dropped, and with it the new generation's frames catch-up had
+** already ingested into it: they are read again at once (a first version
+** kept iBfIngested, so those ops were lost from the index -- and then from
+** the region the next checkpoint wrote from it: mwriter_oracle seed 12). */
+int sqlite3WalBfCrossGenDone(Wal *pWal, int bOk, const u32 *aSegSalt, u32 iSegMx){
+  if( pWal==0 ) return SQLITE_OK;
+  pWal->bBfCross = 0;
+  pWal->bBfCrossAll = 0;
+  if( bOk ){
+    if( aSegSalt ){
+      pWal->bBfSegKnown = 1;
+      memcpy(pWal->aBfSegSalt, aSegSalt, 8);
+      pWal->iBfSegMx = iSegMx;
+    }
+  }else{
+    sqlite3BfWalIndexFree(pWal->pBfWal);
+    pWal->pBfWal = 0;
+    pWal->bBfNeedSeed = 1;
+    pWal->bBfSegKnown = 0;
+    pWal->bBfTouchOk = 0;
+    pWal->bBfPrune = 0;
+    pWal->iBfIngested = 0;
+    memcpy(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt));
+    return sqlite3WalBfCatchUp(pWal);
+  }
+  return SQLITE_OK;
+}
+/* C4d: after a seed, the newest segment the index reflects (0: none known). */
+void sqlite3WalBfSetLastSeg(Wal *pWal, int bKnown, const u32 *aSalt, u32 iMx){
+  if( pWal==0 ) return;
+  pWal->bBfSegKnown = (u8)(bKnown!=0);
+  if( bKnown ){
+    memcpy(pWal->aBfSegSalt, aSalt, 8);
+    pWal->iBfSegMx = iMx;
+  }
+}
+/* C4d: the pages of the page frames in (iFrom, iTo] of this generation, into
+** a new sqlite3_malloc'd array (duplicates possible, page 1 and record frames
+** left out).  The caller holds the write lock (frames stable). */
+int sqlite3WalBfFramePages(Wal *pWal, u32 iFrom, u32 iTo, u32 **paPg, int *pnPg){
+  u32 *a = 0;
+  int n = 0, nAlloc = 0;
+  u32 i;
+  int rc = SQLITE_OK;
+  *paPg = 0;
+  *pnPg = 0;
+  if( pWal==0 || iTo<=iFrom ) return SQLITE_OK;
+  SEH_TRY {
+    for(i=iFrom+1; i<=iTo && rc==SQLITE_OK; i++){
+      u32 pg;
+      int iHash = walFramePage(i);
+      if( iHash>=pWal->nWiData || pWal->apWiData[iHash]==0 ){
+        volatile u32 *aBlk;
+        rc = walIndexPage(pWal, iHash, &aBlk);
+        if( rc!=SQLITE_OK || aBlk==0 ){ if( rc==SQLITE_OK ) rc = SQLITE_IOERR; break; }
+      }
+      pg = walFramePgno(pWal, i);
+      if( pg<=1 ) continue;
+      if( n>=nAlloc ){
+        int nNew = nAlloc ? nAlloc*2 : 64;
+        u32 *aNew = (u32*)sqlite3_realloc64(a, sizeof(u32)*(u64)nNew);
+        if( aNew==0 ){ rc = SQLITE_NOMEM_BKPT; break; }
+        a = aNew;
+        nAlloc = nNew;
+      }
+      a[n++] = pg;
+    }
+  }
+  SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  if( rc!=SQLITE_OK ){ sqlite3_free(a); return rc; }
+  *paPg = a;
+  *pnPg = n;
+  return SQLITE_OK;
+}
+
 /* C4c: the next commit's frames may defer their fsync (BEGIN CONCURRENT). */
 void sqlite3WalBfArmGroupSync(Wal *pWal, int bOn){
   if( pWal ) pWal->bBfGroupArm = (u8)(bOn!=0);
@@ -5992,9 +6112,39 @@ static int walBfCatchUp(Wal *pWal){
   int szPage, szFrame;
   int rc = SQLITE_OK;
   if( pWal==0 ) return SQLITE_OK;
+#ifndef SQLITE_BF_NO_CROSSGEN
+  if( memcmp(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt))!=0
+   && pWal->pBfWal && !pWal->bBfNeedSeed && !pWal->bBfPrune && !pWal->bBfCross
+   && pWal->bBfSegKnown ){
+    /* C4d: a new log generation.  The old one is gone, but every frame of it
+    ** past iBfIngested is described by region segments (a restart needs the
+    ** log backfilled, and backfill stops at a region commit): fold the index
+    ** at the old point and let the btree apply those segments
+    ** (sqlite3BfBtreeCrossGen), instead of reseeding from the whole region. */
+    sqlite3BfWalIndexRebase(pWal->pBfWal, pWal->iBfIngested, 0);
+    pWal->bBfCross = 1;
+    pWal->bBfCrossAll = 0;
+    memcpy(pWal->aBfCrossSalt, pWal->aBfSalt, sizeof(pWal->aBfCrossSalt));
+    pWal->iBfCrossF = pWal->iBfIngested;
+    pWal->nBfCrossPage = pWal->nBfLastPage;
+    pWal->iBfIngested = 0;
+    memcpy(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt));
+    /* The new generation's own frames are read below, with a fresh touch
+    ** list covering (0, mxFrame]. */
+    pWal->nBfTouch = 0;
+    pWal->nBfTouchKey = 0;
+    pWal->nBfTouchRange = 0;
+    pWal->iBfTouchFrom = pWal->iBfTouchTo = 0;
+    memcpy(pWal->aBfTouchSalt, pWal->hdr.aSalt, 8);
+    pWal->nBfTouchPage = 0;
+    pWal->bBfTouchOk = 1;
+  }else
+#endif
   if( memcmp(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt))!=0
    || pWal->iBfIngested>pWal->hdr.mxFrame ){
     pWal->bBfTouchOk = 0;    /* the frames between are gone: full rebuild */
+    pWal->bBfSegKnown = 0;
+    pWal->bBfCross = 0;
     sqlite3BfWalIndexFree(pWal->pBfWal);
     pWal->pBfWal = 0;
     pWal->bBfNeedSeed = 1;   /* C4b: and the region describes what they held */
@@ -6010,7 +6160,19 @@ static int walBfCatchUp(Wal *pWal){
     || memcmp(pWal->aBfTouchSalt, pWal->hdr.aSalt, 8)!=0) ){
     pWal->bBfTouchOk = 0;    /* a gap: the list would not cover every change */
   }
-  if( pWal->iBfIngested>=pWal->hdr.mxFrame ) return SQLITE_OK;
+  if( pWal->iBfIngested>=pWal->hdr.mxFrame ){
+    pWal->nBfLastPage = pWal->hdr.nPage;
+    return SQLITE_OK;
+  }
+  if( pWal->readLock==0 && pWal->bBfCross ){
+    /* C4d: the new generation is backfilled and may be overwritten while we
+    ** read it -- so read none of it: its region segments describe it. */
+    pWal->bBfCrossAll = 1;
+    pWal->iBfIngested = pWal->hdr.mxFrame;
+    pWal->iBfTouchFrom = pWal->iBfTouchTo = pWal->hdr.mxFrame;
+    pWal->nBfLastPage = pWal->hdr.nPage;
+    return SQLITE_OK;
+  }
   if( pWal->readLock==0 ){
     /* A snapshot on read-mark 0 reads the database file only: every frame of
     ** the log is backfilled, and a writer may restart the log -- overwrite
@@ -6022,6 +6184,7 @@ static int walBfCatchUp(Wal *pWal){
     sqlite3BfWalIndexFree(pWal->pBfWal);
     pWal->pBfWal = 0;
     pWal->bBfNeedSeed = 1;
+    pWal->bBfSegKnown = 0;
     pWal->bBfPrune = 0;
     pWal->bBfTouchOk = 0;
     pWal->iBfIngested = pWal->hdr.mxFrame;
@@ -6069,6 +6232,7 @@ static int walBfCatchUp(Wal *pWal){
   if( rc==SQLITE_OK ){
     pWal->iBfIngested = pWal->hdr.mxFrame;
     pWal->iBfTouchTo = pWal->hdr.mxFrame;
+    pWal->nBfLastPage = pWal->hdr.nPage;
   }else{
     pWal->bBfTouchOk = 0;
   }

@@ -334,8 +334,8 @@ substages, each gate-green on its own:
 |---|---|---|
 | C4a | variable-sized record entries: frame offsets in the wal-index (`aEnd`) | built |
 | C4b | the mini-page region + a checkpoint that persists records instead of merging them; CKPT entries | built |
-| C4c | durable group commit (section 3.2) | next |
-| C4d | LSNs stable across log restarts (catch-up without reseeding) | after C4c |
+| C4c | durable group commit (section 3.2) | built |
+| C4d | crossing a log restart without reseeding (in place of LSNs stable across restarts) | built |
 
 **C4a.**  A record frame is its 24-byte header plus the batch's used bytes (rounded to 8).  Each
 wal-index block (64 KB in BF builds) carries `aEnd[]`, the end offset of every frame.  The WAL
@@ -403,3 +403,24 @@ section 3.2 says (in-process batching, used by BEGIN CONCURRENT).
 - *Counters:* `group_sync_deferred`, `group_sync_fsyncs`, `group_sync_shared`.
 - *Non-CONCURRENT writers* (the region checkpoint) first flush pending commits as a leader
   would, so they are not refused with BUSY_SNAPSHOT.
+
+**C4d: crossing a log restart (built 2026-10-18).**  Instead of byte-offset LSNs (the WAL restarts
+in place, so it cannot have them), a restart is bridged with region segments.
+- *Page lists.*  Each segment also lists the pages written in its span.  It lists every page,
+  whatever it is now, because a freed or repurposed leaf still has stale BF state.
+- *Last segment.*  A CKPT op carries its segment's frame, so a connection knows the newest
+  segment its index base reflects (set by the seed or a CKPT fold).
+- *Crossing.*  A catch-up that finds a new generation folds a complete index at its old point.
+  The btree then walks the chain newest first, skipping the current generation's segments,
+  and stops at the boundary: a segment of the old generation at or before that point, or the
+  last known segment.  It applies the newer segments oldest first (KILLs drop base ops, states
+  replace them), then runs the incremental drop-and-replay over their keys, ranges and pages.
+- *Fallback.*  Reseed when the boundary is gone (compaction), when the base came from no
+  segment, or when the database shrank.
+- *Switches and tests:* `SQLITE_BF_NO_CROSSGEN`; counter `region_crossings`; gate repro
+  `repro:crossgen`.
+- *Two rules found the hard way:*
+  - A failed crossing must re-read the new generation's frames, which it had already ingested
+    into the index it drops.
+  - No CKPT fold or restart fold while a crossing is pending, or older segments overwrite newer
+    folded ops.

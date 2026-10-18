@@ -45,10 +45,11 @@
 /* Batch-payload header: magic(4) version(2) nRec(2) nUsed(4) = 12 bytes.  op
 ** values reuse the mini-page BFOP_* space; only the dirty ops are ever logged. */
 #define BFWAL_MAGIC     0x42465731u   /* "BFW1" */
-#define BFWAL_VERSION   6             /* v3: CLEAR (2026-09-24); v4: rowid keys sign-
+#define BFWAL_VERSION   7             /* v3: CLEAR (2026-09-24); v4: rowid keys sign-
                                       ** flipped (2026-10-01); v5: logical ops, CLEAR
                                       ** replaced by MERGED (2026-10-18, C3); v6: CKPT
-                                      ** (2026-10-18, C4b) */
+                                      ** (2026-10-18, C4b); v7: CKPT carries its
+                                      ** segment's frame (C4d) */
 #define BFWAL_HDRSIZE   12
 #define BFWAL_OP_INSERT 0             /* == BFOP_INSERT */
 #define BFWAL_OP_DELETE 1             /* == BFOP_DELETE (valLen==0) */
@@ -67,7 +68,9 @@
 ** connection whose index holds the whole log up to here (and the region it
 ** started from) folds it into base ops (sqlite3BfWalIndexRebase), which keeps
 ** the index -- and every scan of its markers -- bounded by the span since the
-** last checkpoint.  pgno 1, root 2, no key, no value (placeholders). */
+** last checkpoint.  pgno 1, root 2 (placeholders), no key; v7 (C4d): the
+** value is the 4-byte frame whose state the region's new segment holds (its
+** header's mxFrame), so a reader knows which segment its index now reflects. */
 #define BFWAL_OP_CKPT   4
 
 /* One logical record, as appended by the encoder or yielded by the iterator.
@@ -190,11 +193,34 @@ int         sqlite3BfWalIndexForEachMarker(BfWalIndex *p, u32 mxFrame, u32 iAfte
 ** are dropped (a log restart, when the region holds exactly that state). */
 void        sqlite3BfWalIndexRebase(BfWalIndex *p, u32 mxFrame, int bKeepFrames);
 /* The frame of a CKPT op appended since the last call (0 if none); clears it. */
-u32         sqlite3BfWalIndexTakeCkpt(BfWalIndex *p);
+u32         sqlite3BfWalIndexTakeCkpt(BfWalIndex *p, u32 *piSeg);
+/* C4d: drop the base op of every key for which xIn returns true. */
+void        sqlite3BfWalIndexDropBase(BfWalIndex *p,
+                int (*xIn)(void*, u32, const u8*), void *pCtx);
+
+/* C4d: a log restart crossed by catch-up (sqlite3WalBfCrossGen). */
+#ifndef BF_CROSSINFO_TYPEDEF
+#define BF_CROSSINFO_TYPEDEF
+typedef struct BfCrossInfo BfCrossInfo;
+#endif
+struct BfCrossInfo {
+  u32 aOldSalt[2];     /* the generation the index was folded at ... */
+  u32 iOldFrame;       /* ... and the frame */
+  u32 nOldPage;        /* database size there */
+  int bSegKnown;       /* the newest segment the base reflects, if known */
+  u32 aSegSalt[2];
+  u32 iSegMx;
+  u32 aNewSalt[2];     /* the current generation */
+  int bAll;            /* its frames were not read: its segments count too */
+  u32 iTouchFrom;      /* its touch list starts here */
+};
 
 /* C4b: region entry codec.  kind = BFWAL_OP_INSERT, BFWAL_OP_DELETE, or
 ** BFREG_KILL (every older entry on a key in [key, hi] is dead). */
 #define BFREG_KILL 3
+/* C4d: a page written in the segment's interval of the log (root = the page
+** number); readers that cross a log restart invalidate exactly these. */
+#define BFREG_PAGE 5
 typedef struct BfRegionEntry BfRegionEntry;
 struct BfRegionEntry {
   u8 kind;
