@@ -3352,3 +3352,61 @@ off.
 
 Correctness: gate --full 58/58 (crash, powerloss including PSOW=0 padding, torn tail, recovery
 with a dirty heap); mwriter seeds 1-4 OK.
+
+### 2026-10-18 (cont.) — Claude Opus 5.5 — C4b: the mini-page region (checkpoint write-back gone)
+
+Design doc section 16 has the design.  In short:
+- **The checkpoint writes the log's records into the database file, packed, and merges nothing.**
+  It does this as a system transaction that appends a region segment; nothing is merged into
+  leaves.  A CKPT op then lets every connection fold its record index.
+- **Readers seed their index from the region** whenever it was rebuilt from the log alone.
+- **Format:** payload v6 (CKPT).  Region entries carry the op's frame.  File read/write version 3
+  while a region exists, so stock SQLite refuses the file.
+- **Off switch:** `SQLITE_BF_NO_REGION` restores the merging checkpoint.  Auto-vacuum databases
+  always use the merging checkpoint.
+- **New counters:** `region_checkpoints`, `region_compactions`, `region_pages_written`,
+  `region_seeds`.
+
+Bugs found while building it (the oracles caught each one):
+1. **O(keys x markers) under the write lock.**  The first version scanned every key against
+   every MERGED marker at each checkpoint, and markers accumulate over a long generation.  The
+   mt oracle sat at 100% CPU with 7 threads in the busy handler.  Fixed with the CKPT fold and a
+   geometric compaction trigger.
+2. **Folding dropped keys.**  The rebase identified a state's source op by "frame == 0", which
+   was wrong once folds keep frames.  6 keys became 2.  It now identifies the op by pointer.
+3. **A KILL ignored BEGIN CONCURRENT exemptions.**  A MERGED marker does not cover ops other
+   transactions committed after the merger's snapshot, yet the region KILL erased an older
+   segment's entry for one such op; the next seed lost the row (mwriter, 6/6 seeds at
+   autocheckpoint 50).  Segments now restate every live key inside a killed range.
+4. **Leaving WAL mode lost buffered rows**, and the log survived (forced persistent WAL), so the
+   pager reopened it.  Now: merge all, empty the region, delete the log
+   (`sqlite3BfBtreeLeaveWal`).
+5. **integrity_check relied on the checkpoint merging everything.**  It reported "wrong # of
+   entries in index".  It now calls `sqlite3BfBtreeMergeAll`.
+6. **Deferred-commit batches were not in the log the region is built from.**  They are now
+   logged in a commit of their own first.
+7. **A full cache rebuild into a same-size ring hit BF_FULL.**  The previous contents' unlinked
+   blocks sat behind a live dirty block at the FIFO head.  Larger replays (C4b keeps more
+   buffered) made it fail (mwriter seed 1, small ring).  `sqlite3BfCircularBufferReset`.
+
+Sanity numbers (not a campaign): 20,000 random single-row upserts on 200k rows, default
+autocheckpoint.
+
+| | page frames | log bytes |
+|---|---|---|
+| region checkpoint | 2,973 | 14.5 MB |
+| merging checkpoint | 18,742 | 80 MB |
+
+- That is 6.3x fewer page frames and 5.5x fewer log bytes.
+- mwriter false conflicts at `wal_autocheckpoint=50`: about 700 per run before, about 170 now.
+  Checkpoints no longer merge, so they no longer conflict (P4).
+
+Correctness:
+- `gate --full` 59/59.  New gate task `repro:region` (`bench/region_repro.sh`, release and
+  debug), and new codec tests: base ops, rebase, CKPT, region codec.
+- mwriter seeds 5-16, 3 modes: 324/324.
+- mt sweep seeds 5-10: 54/54.
+- mt crash, 3 seeds under MALLOC_PERTURB_: OK.
+- mt power-cut, torn and lost, FULL: OK.
+
+Next: C4c, durable group commit (design section 3.2), then C4d.

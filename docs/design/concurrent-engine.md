@@ -321,3 +321,63 @@ by a BEGIN CONCURRENT oracle failure:
   a stale leaf that later served an old row (seed 3).  An uncached path falls back to the op's
   hint.  Replay's own descent (`sqlite3BfLeafForKey`) reads pages normally, at a consistent
   snapshot, and ignores BF's known-leaf bitmap (a page can have become interior).
+
+## 16. C4 implementation (2026-10-18)
+
+**Route.**  C4 evolves the `-wal` file into the log of sections 3-6 in place, rather than writing
+a separate `<db>-log` module.  This keeps SQLite's locking, recovery and checkpoint protocol and
+upstream BEGIN CONCURRENT's page-level validation, which all run over the wal-index.  In section
+3's terms: the frame number is the entry sequence, and the wal-index is the page index.  The
+substages, each gate-green on its own:
+
+| stage | content | status |
+|---|---|---|
+| C4a | variable-sized record entries: frame offsets in the wal-index (`aEnd`) | built |
+| C4b | the mini-page region + a checkpoint that persists records instead of merging them; CKPT entries | built |
+| C4c | durable group commit (section 3.2) | next |
+| C4d | LSNs stable across log restarts (catch-up without reseeding) | after C4c |
+
+**C4a.**  A record frame is its 24-byte header plus the batch's used bytes (rounded to 8).  Each
+wal-index block (64 KB in BF builds) carries `aEnd[]`, the end offset of every frame.  The WAL
+and wal-index versions are 3007041.  Single-row commit: about 104 B of log, against at least
+4,120 B before.
+
+**C4b: the region.**
+- *Storage.*  The region is a list of segments in the database file (`bf_cache.h`).  Each
+  segment holds the state of the keys it lists: INSERT/DELETE entries carrying the op's frame,
+  plus KILL entries (a MERGED marker's range: older entries there are dead).
+- *Checkpoint.*  The checkpoint's system transaction (P4) appends one segment: the state of every
+  key with a log op since the newest segment, a KILL per marker since then, and a restatement of
+  every live key inside a killed range.  The restatement is needed because a BEGIN CONCURRENT
+  marker exempts ops after the merger's snapshot, and such an op may sit in an older segment.
+  The segment is followed by a CKPT op as the commit's last record.
+- *Compaction.*  When the region exceeds twice the size the last compaction left, it is rewritten
+  as one segment of the full state.
+- *File format.*  While a region exists, bytes 18/19 are 3, so stock SQLite refuses the file.
+- *Auto-vacuum.*  Auto-vacuum databases keep the merge checkpoint: relocation would need
+  pointer-map entries the region does not keep.
+
+**C4b: readers.**
+- *Seeding.*  The record index takes region entries as base ops: older than every log op, and
+  covered by any later MERGED marker unless their frame is in its exemption.  It is seeded
+  whenever it was rebuilt from the log alone (open, recovery, a generation this connection did
+  not write, read-mark 0).
+- *Folding.*  Ingesting a CKPT op folds the index into base ops.  A writer's log restart folds it
+  too, dropping frames.  This keeps markers and ops bounded by the span since the last
+  checkpoint; without it, the checkpoint's own scan was O(keys x markers) under the write lock.
+
+**Things that relied on "the checkpoint merges everything".**  Each needed its own fix:
+- `PRAGMA integrity_check` (walks base b-trees) now calls `sqlite3BfBtreeMergeAll`.
+- Leaving WAL mode merges everything, empties the region, and deletes the log (BF forces
+  persistent WAL, and a leftover log made the rollback-mode pager reopen it).
+- Deferred commits (`bf_deferred_commit`) are logged in a commit of their own before the region
+  is written, because the region is built from the log.
+- A full cache rebuild into a ring of the same size now resets the ring.  Before, the previous
+  contents' unlinked blocks stayed behind a live dirty block at the FIFO head, and the larger
+  replays C4b produces did not fit.
+
+**Not yet:**
+- The region still rides page frames: a checkpoint's segment is written to the log and then
+  backfilled.
+- Readers reseed from the region after every log restart (C4d removes this).
+- Page-path writes still do not log ops (P1).

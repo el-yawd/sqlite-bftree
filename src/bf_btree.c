@@ -742,6 +742,45 @@ int sqlite3BfBtreeLogFlushMarks(Btree *p){
 }
 
 /*
+** C4b: log a CKPT op (BFWAL_OP_CKPT) for the checkpoint's region commit,
+** staged now so that it is this commit's last record before any further
+** record the commit logs (those are newer than the region, and stay ops).
+*/
+int sqlite3BfBtreeLogCkpt(Btree *p){
+  BfCache *pBf;
+  BfLogAllCtx ctx;
+  BfGroup *g;
+  BfWalRec rec;
+  if( !p || !p->pBt ) return SQLITE_OK;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( !pBf ) return SQLITE_OK;
+  g = bfGroupGet(pBf, pBf->szPage);
+  if( !g ) return SQLITE_NOMEM_BKPT;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.pPager = p->pBt->pPager;
+  ctx.pGroup = g;
+  ctx.rc     = SQLITE_OK;
+  memset(&rec, 0, sizeof(rec));
+  rec.pgno = 1;
+  rec.rootPgno = 2;
+  rec.op = BFWAL_OP_CKPT;
+  bfLogAppendRec(&ctx, &rec);
+  bfGroupStage(g, ctx.pPager, &ctx.rc);
+  return ctx.rc;
+}
+/* C4b: committed records that only memory holds (deferred commit's open
+** batch, or a carry): a checkpoint must log them before it writes the
+** region, which is built from the log. */
+int sqlite3BfBtreeGroupPending(Btree *p){
+  BfCache *pBf;
+  BfGroup *g;
+  if( !p || !p->pBt ) return 0;
+  pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  g = pBf ? (BfGroup*)pBf->pGroupCommit : 0;
+  return g!=0 && (g->nCarry>0 || g->nOpen>0);
+}
+
+/*
 ** Gather every dirty-but-unlogged BF record across all mini-pages into WAL
 ** record-batch payloads and stage them for the pending commit.  Does NOT touch
 ** the base B-tree.  Returns SQLITE_OK, or an error (NOMEM/CORRUPT) in which case
@@ -1079,6 +1118,10 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[18] = pBf ? pBf->nRollbackIncr : 0;
   aOut[19] = pBf ? pBf->nEscalateTable : 0;
   aOut[5] = pBf ? pBf->nClearLogged : 0;
+  aOut[20] = pBf ? pBf->nRegionCkpt : 0;
+  aOut[21] = pBf ? pBf->nRegionCompact : 0;
+  aOut[22] = pBf ? pBf->nRegionPages : 0;
+  aOut[23] = pBf ? pBf->nRegionSeed : 0;
 }
 
 void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
@@ -1583,6 +1626,10 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
         pBf->nDirty = 0;
         if( rc!=SQLITE_OK ) return rc;
         if( cap>want ) pBf->nRingGrow++;
+      }else if( p->pBt->pCursor==0 ){
+        /* Same size: every block was just unlinked -- make it free space. */
+        sqlite3BfCircularBufferReset(&pBf->cb);
+        pBf->nDirty = 0;
       }
       if( cap>pBf->nRingPeak ) pBf->nRingPeak = cap;
     }
@@ -3808,6 +3855,7 @@ static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
     }
     return 0;
   }
+  if( op==BFWAL_OP_CKPT ) return 0;    /* C4b: a checkpoint changes no row */
   if( op==BFWAL_OP_MERGED ){
     /* C3: another transaction merged keys [lo, hi] into base pages.  Its
     ** marker covers only ops up to its snapshot plus its own, so it cannot

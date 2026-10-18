@@ -1785,8 +1785,10 @@ void sqlite3Pragma(
     for(j=0; j<db->nDb; j++){
       if( iDb>=0 && iDb!=j ) continue;
       if( db->aDb[j].pBt ){
-        (void)sqlite3BtreeCheckpoint(db->aDb[j].pBt, SQLITE_CHECKPOINT_PASSIVE,
-                                     0, 0);
+        /* C4b: the checkpoint no longer merges (it writes the region): ask
+        ** for the merge itself. */
+        extern int sqlite3BfBtreeMergeAll(Btree*);
+        (void)sqlite3BfBtreeMergeAll(db->aDb[j].pBt);
       }
     }
 #endif

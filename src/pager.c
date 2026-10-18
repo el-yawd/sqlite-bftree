@@ -4539,6 +4539,38 @@ u32 sqlite3PagerBfHeadFrame(Pager *pPager){
   return 0;
 }
 /* C3: this connection's logical op index (NULL outside WAL mode). */
+/* C4b: seeding the record index from the region (see wal.c bBfNeedSeed). */
+int sqlite3PagerBfNeedSeed(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) return sqlite3WalBfNeedSeed(pPager->pWal);
+#endif
+  return 0;
+}
+BfWalIndex *sqlite3PagerBfSeedIndex(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) return sqlite3WalBfSeedIndex(pPager->pWal);
+#endif
+  return 0;
+}
+void sqlite3PagerBfNoPersistWal(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) sqlite3WalBfNoPersist(pPager->pWal);
+#endif
+}
+void sqlite3PagerBfSeedDone(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) sqlite3WalBfSeedDone(pPager->pWal);
+#endif
+}
+void sqlite3PagerBfGeneration(Pager *pPager, u32 *aSalt, u32 *pmxFrame){
+  aSalt[0] = aSalt[1] = 0;
+  *pmxFrame = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    sqlite3WalBfGeneration(pPager->pWal, aSalt, pmxFrame);
+  }
+#endif
+}
 BfWalIndex *sqlite3PagerBfWalIndex(Pager *pPager){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pagerUseWal(pPager) ) return sqlite3WalBfIndex(pPager->pWal);

@@ -8125,6 +8125,15 @@ case OP_JournalMode: {    /* out2 */
         ** file. An EXCLUSIVE lock may still be held on the database file
         ** after a successful return.
         */
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+        /* C4b: merge every buffered record and empty the mini-page region
+        ** first -- the log checkpoint below cannot see record frames. */
+        {
+          extern int sqlite3BfBtreeLeaveWal(Btree*);
+          rc = sqlite3BfBtreeLeaveWal(pBt);
+        }
+        if( rc==SQLITE_OK )
+#endif
         rc = sqlite3PagerCloseWal(pPager, db);
         if( rc==SQLITE_OK ){
           sqlite3PagerSetJournalMode(pPager, eNew);

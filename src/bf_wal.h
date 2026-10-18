@@ -45,9 +45,10 @@
 /* Batch-payload header: magic(4) version(2) nRec(2) nUsed(4) = 12 bytes.  op
 ** values reuse the mini-page BFOP_* space; only the dirty ops are ever logged. */
 #define BFWAL_MAGIC     0x42465731u   /* "BFW1" */
-#define BFWAL_VERSION   5             /* v3: CLEAR (2026-09-24); v4: rowid keys sign-
+#define BFWAL_VERSION   6             /* v3: CLEAR (2026-09-24); v4: rowid keys sign-
                                       ** flipped (2026-10-01); v5: logical ops, CLEAR
-                                      ** replaced by MERGED (2026-10-18, C3) */
+                                      ** replaced by MERGED (2026-10-18, C3); v6: CKPT
+                                      ** (2026-10-18, C4b) */
 #define BFWAL_HDRSIZE   12
 #define BFWAL_OP_INSERT 0             /* == BFOP_INSERT */
 #define BFWAL_OP_DELETE 1             /* == BFOP_DELETE (valLen==0) */
@@ -61,6 +62,13 @@
 ** CONCURRENT) are not in its page images.  Replaces CLEAR(leaf), whose leaf
 ** keying made every split a hazard. */
 #define BFWAL_OP_MERGED 3
+/* v6 (C4b): "the mini-page region now holds the state of every key as of
+** this op" -- logged by a checkpoint's region commit, as its last record.  A
+** connection whose index holds the whole log up to here (and the region it
+** started from) folds it into base ops (sqlite3BfWalIndexRebase), which keeps
+** the index -- and every scan of its markers -- bounded by the span since the
+** last checkpoint.  pgno 1, root 2, no key, no value (placeholders). */
+#define BFWAL_OP_CKPT   4
 
 /* One logical record, as appended by the encoder or yielded by the iterator.
 ** On decode, pKey/pVal point INTO the source buffer (no copy). */
@@ -161,6 +169,47 @@ int         sqlite3BfWalIndexKeyCount(BfWalIndex *p);
 ** BFWAL_OK, BFWAL_CORRUPT (bad payload), or BFWAL_NOMEM. */
 int         sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf,
                                       u32 iFrame);
+
+/* C4b: region (persisted mini-page) entries as BASE ops: older than every
+** log op, covered by any MERGED marker over the key.  SetBase replaces the
+** key's base op. */
+int         sqlite3BfWalIndexHasBase(BfWalIndex *p, u32 root, const u8 *pKey);
+int         sqlite3BfWalIndexSetBase(BfWalIndex *p, u32 root, const u8 *pKey,
+                                     u8 op, const u8 *pVal, u32 nVal, u32 iFrame);
+/* The state (as sqlite3BfWalIndexKeyState at mxFrame) of every key with a log
+** op in frames (iAfter, mxFrame] -- or of every key, when bAll.  The last
+** callback argument says whether the key has such an op. */
+int         sqlite3BfWalIndexForEachState(BfWalIndex *p, u32 mxFrame, u32 iAfter,
+                int bAll, int (*xState)(void*, u32, const u8*, const BfKeyState*, int),
+                void *pCtx);
+/* Every MERGED marker in frames (iAfter, mxFrame]: (root, lo, hi). */
+int         sqlite3BfWalIndexForEachMarker(BfWalIndex *p, u32 mxFrame, u32 iAfter,
+                int (*xMark)(void*, u32, const u8*, const u8*), void *pCtx);
+
+/* C4b: every key's state at mxFrame becomes its base op; log ops and markers
+** are dropped (a log restart, when the region holds exactly that state). */
+void        sqlite3BfWalIndexRebase(BfWalIndex *p, u32 mxFrame, int bKeepFrames);
+/* The frame of a CKPT op appended since the last call (0 if none); clears it. */
+u32         sqlite3BfWalIndexTakeCkpt(BfWalIndex *p);
+
+/* C4b: region entry codec.  kind = BFWAL_OP_INSERT, BFWAL_OP_DELETE, or
+** BFREG_KILL (every older entry on a key in [key, hi] is dead). */
+#define BFREG_KILL 3
+typedef struct BfRegionEntry BfRegionEntry;
+struct BfRegionEntry {
+  u8 kind;
+  u32 root;
+  const u8 *pKey;      /* 8 bytes */
+  const u8 *pHi;       /* KILL: 8 bytes */
+  const u8 *pVal;      /* INSERT */
+  u32 nVal;
+  u32 iFrame;          /* INSERT/DELETE: the op's frame (see the codec) */
+};
+int  sqlite3BfRegionEntrySize(u8 kind, u32 nVal);
+int  sqlite3BfRegionEncode(u8 *a, u8 kind, u32 root, const u8 *pKey,
+                           const u8 *pVal, u32 nVal, u32 iFrame);
+/* Bytes consumed, or 0 if aBuf[0..nAvail) does not start with a valid entry. */
+int  sqlite3BfRegionDecode(const u8 *a, int nAvail, BfRegionEntry *pE);
 
 /* Drop every op and marker carried by a frame after mxFrame (a rollback or
 ** savepoint undo discarded them, or they are a crashed commit's torn tail). */

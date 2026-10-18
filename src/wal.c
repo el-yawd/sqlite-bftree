@@ -572,6 +572,14 @@ struct Wal {
   u64 nBfCommit;            /* Commit frames (transactions) written to the WAL */
   u64 nBfLogBytes;          /* C4a: bytes of frames (headers included) written */
   u8 bBfPrune;              /* pBfWal may hold ops past mxFrame (after undo) */
+  /* C4b (2026-10-18): pBfWal lacks the region's entries (its base ops): it was
+  ** rebuilt from the log alone (open, recovery, a new log generation this
+  ** connection did not write, read-mark 0).  The btree layer reads the region
+  ** at its next transaction start and clears the flag
+  ** (sqlite3WalBfSeedDone). */
+  u8 bBfNeedSeed;
+  u8 bBfNoPersist;          /* C4b: leaving WAL mode -- delete the log at close */
+  u8 bBfNoFold;             /* C4b: the frames being ingested follow a gap */
   /* Checkpoint cap (2026-10-17): the frame of this connection's checkpoint
   ** materialise commit, in the generation aBfCkptSalt.  Record frames are never
   ** backfilled -- the checkpoint skips them -- so frames past the materialise
@@ -1299,6 +1307,13 @@ static int walBfIngestRecordFrame(Wal *pWal, const u8 *aData, int nData,
   rc = sqlite3BfWalIndexAddFrame(pWal->pBfWal, aData, nData, iFrame);
   if( rc==BFWAL_NOMEM ) return SQLITE_NOMEM_BKPT;
   if( rc!=BFWAL_OK ) return SQLITE_CORRUPT_BKPT;
+  /* C4b: a checkpoint's CKPT op.  Frames are ingested in log order, so the
+  ** index holds every op before it; fold them into base ops -- unless the
+  ** index lacks the region it would fold onto (it is seeded later instead). */
+  if( sqlite3BfWalIndexTakeCkpt(pWal->pBfWal) && !pWal->bBfNeedSeed
+   && !pWal->bBfPrune && !pWal->bBfNoFold ){
+    sqlite3BfWalIndexRebase(pWal->pBfWal, iFrame, 1);
+  }
   return SQLITE_OK;
 }
 #endif /* SQLITE_OMIT_BF_CACHE */
@@ -1812,6 +1827,7 @@ static int walIndexRecover(Wal *pWal){
       ** so the scan repopulates it without double-counting record ops. */
       sqlite3BfWalIndexFree(pWal->pBfWal);
       pWal->pBfWal = 0;
+      pWal->bBfNeedSeed = 1;
 
       for(iPg=0; !bEnd; iPg++){
         u32 *aShare;
@@ -2182,6 +2198,9 @@ int sqlite3WalOpen(
   pRet->padToSectorBoundary = 1;
   pRet->exclusiveMode = (bNoShm ? WAL_HEAPMEMORY_MODE: WAL_NORMAL_MODE);
   sqlite3FastPrngInit(&pRet->sPrng);
+#ifndef SQLITE_OMIT_BF_CACHE
+  pRet->bBfNeedSeed = 1;        /* C4b: the database may hold a region */
+#endif
 
   /* Open file handle on the write-ahead log file. */
   flags = (SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_WAL);
@@ -2616,17 +2635,28 @@ static void walRestartHdr(Wal *pWal, u32 salt1){
   int i;                          /* Loop counter */
   u32 *aSalt = pWal->hdr.aSalt;   /* Big-endian salt values */
   pWal->nCkpt++;
-  pWal->hdr.mxFrame = 0;
 #ifndef SQLITE_OMIT_BF_CACHE
-  /* A restart happens only once every frame is backfilled, and BF's checkpoint
-  ** materialised every logged record into a page image first, so the record
-  ** ops describe nothing the database file lacks.  Keeping them would be worse
-  ** than useless: the next generation reuses frame numbers from 1, so a
-  ** rollback's replay would order these old ops against unrelated new frames. */
-  sqlite3BfWalIndexFree(pWal->pBfWal);
-  pWal->pBfWal = 0;
+  /* The next generation reuses frame numbers from 1, so the old generation's
+  ** log ops cannot stay in the index (a rollback's replay would order them
+  ** against unrelated new frames).  C4b: a restart needs the whole log
+  ** backfilled, and a checkpoint backfills only what its region commit covered,
+  ** so the region now holds every key's state at the old log end.  When this
+  ** index covers that whole log (and had the region to begin with), it folds
+  ** into base ops -- exactly what seeding from the region would give.
+  ** Otherwise it is dropped and seeded at the next transaction. */
+  if( !pWal->bBfNeedSeed && !pWal->bBfPrune
+   && pWal->iBfIngested==pWal->hdr.mxFrame
+   && memcmp(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt))==0 ){
+    sqlite3BfWalIndexRebase(pWal->pBfWal, pWal->hdr.mxFrame, 0);
+  }else{
+    sqlite3BfWalIndexFree(pWal->pBfWal);
+    pWal->pBfWal = 0;
+    pWal->bBfNeedSeed = 1;
+  }
   pWal->bBfPrune = 0;
+  pWal->bBfTouchOk = 0;
 #endif
+  pWal->hdr.mxFrame = 0;
   sqlite3Put4byte((u8*)&aSalt[0], 1 + sqlite3Get4byte((u8*)&aSalt[0]));
   memcpy(&pWal->hdr.aSalt[1], &salt1, 4);
 #ifndef SQLITE_OMIT_BF_CACHE
@@ -3030,6 +3060,12 @@ int sqlite3WalClose(
         sqlite3OsFileControlHint(
             pWal->pDbFd, SQLITE_FCNTL_PERSIST_WAL, &bPersist
         );
+#ifndef SQLITE_OMIT_BF_CACHE
+        /* C4b: leaving WAL mode, everything merged and backfilled.  A log
+        ** left behind (BF forces persistent WAL) would make the rollback-mode
+        ** pager reopen it on its next transaction. */
+        if( pWal->bBfNoPersist ) bPersist = 0;
+#endif
         if( bPersist!=1 ){
           /* Try to delete the WAL file if the checkpoint completed and
           ** fsynced (rc==SQLITE_OK) and if we are not in persistent-wal
@@ -5118,6 +5154,10 @@ static int walFrames(
   ** walRestartLog() has already run, so these writes cannot be clobbered by a
   ** log reset. */
   nBf = pWal->nBfStage;
+  /* Our own record frames are ingested as they are written; a CKPT among them
+  ** may fold the index only if it already held the log up to here. */
+  pWal->bBfNoFold = (pWal->iBfIngested<iBfBase
+                  || memcmp(pWal->aBfSalt, pWal->hdr.aSalt, 8)!=0);
   {
     int iBf;
     /* A record-only commit (no dirty page at all) lets the LAST record frame
@@ -5167,6 +5207,7 @@ static int walFrames(
       pWal->apBfStage[iBf] = 0;
     }
     pWal->nBfStage = 0;
+    pWal->bBfNoFold = 0;
     if( rc!=SQLITE_OK ) return rc;
   }
 #endif
@@ -5468,6 +5509,32 @@ u64 sqlite3WalBfLogBytes(Wal *pWal){
 ** logged records back into the BF record cache after recovery.  Returns NULL
 ** when no record frames have been seen (steady state) — the common case.
 */
+/* C4b: does the record index lack the region's entries?  sqlite3WalBfSeedIndex
+** returns the index to seed (created if absent; NULL on OOM), and
+** sqlite3WalBfSeedDone clears the flag once it is seeded. */
+int sqlite3WalBfNeedSeed(Wal *pWal){
+  return pWal!=0 && pWal->bBfNeedSeed;
+}
+BfWalIndex *sqlite3WalBfSeedIndex(Wal *pWal){
+  if( pWal==0 ) return 0;
+  if( pWal->pBfWal==0 ) pWal->pBfWal = sqlite3BfWalIndexNew();
+  return pWal->pBfWal;
+}
+void sqlite3WalBfSeedDone(Wal *pWal){
+  if( pWal ) pWal->bBfNeedSeed = 0;
+}
+void sqlite3WalBfNoPersist(Wal *pWal){
+  if( pWal ) pWal->bBfNoPersist = 1;
+}
+/* C4b: the generation salt and head of the log as this connection sees it --
+** a region segment records them, so the next checkpoint in the same
+** generation writes only what changed after it. */
+void sqlite3WalBfGeneration(Wal *pWal, u32 *aSalt, u32 *pmxFrame){
+  aSalt[0] = pWal ? pWal->hdr.aSalt[0] : 0;
+  aSalt[1] = pWal ? pWal->hdr.aSalt[1] : 0;
+  *pmxFrame = pWal ? pWal->hdr.mxFrame : 0;
+}
+
 BfWalIndex *sqlite3WalBfIndex(Wal *pWal){
   return pWal ? pWal->pBfWal : 0;
 }
@@ -5550,6 +5617,7 @@ static void walBfTouchRange(Wal *pWal, const BfWalRec *r){
   memcpy(g->hi, r->pKey+8, 8);
 }
 static void walBfTouchRec(Wal *pWal, const BfWalRec *r){
+  if( r->op==BFWAL_OP_CKPT ) return;               /* changes no key */
   if( r->op==BFWAL_OP_MERGED ) walBfTouchRange(pWal, r);
   else walBfTouchKey(pWal, r->rootPgno, r->pKey, r->nKey);
 }
@@ -5589,6 +5657,7 @@ static int walBfCatchUp(Wal *pWal){
     pWal->bBfTouchOk = 0;    /* the frames between are gone: full rebuild */
     sqlite3BfWalIndexFree(pWal->pBfWal);
     pWal->pBfWal = 0;
+    pWal->bBfNeedSeed = 1;   /* C4b: and the region describes what they held */
     pWal->bBfPrune = 0;
     pWal->iBfIngested = 0;
     memcpy(pWal->aBfSalt, pWal->hdr.aSalt, sizeof(pWal->aBfSalt));
@@ -5607,11 +5676,12 @@ static int walBfCatchUp(Wal *pWal){
     ** the log is backfilled, and a writer may restart the log -- overwrite
     ** these very frames -- while we read them (2026-10-17, mt_oracle: the
     ** salt test below then reported SQLITE_CORRUPT).  Nothing in them is
-    ** needed: a checkpoint backfills only frames its materialise covered
-    ** (Wal.bBfCkptCap), so every record op here is in a page already.  Forget
-    ** the index; the cache rebuild finds no buffered record, as it should. */
+    ** needed: a checkpoint backfills only frames its region commit covered
+    ** (Wal.bBfCkptCap), so every record op here is in a page or, C4b, in the
+    ** region.  Forget the index and seed it from the region. */
     sqlite3BfWalIndexFree(pWal->pBfWal);
     pWal->pBfWal = 0;
+    pWal->bBfNeedSeed = 1;
     pWal->bBfPrune = 0;
     pWal->bBfTouchOk = 0;
     pWal->iBfIngested = pWal->hdr.mxFrame;

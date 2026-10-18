@@ -280,6 +280,140 @@ static void test_merged_op(void){
   }
 }
 
+
+/* C4b base ops (region entries): used only when a key has no log op; covered
+** by any later marker over the key -- unless the base op keeps a frame inside
+** the marker's (snap, start) exemption. */
+static void setBase(BfWalIndex *ix, u32 root, int key, int op, const char *v, u32 f){
+  u8 k[8]; mkKey(k, key);
+  CHECK( sqlite3BfWalIndexSetBase(ix, root, k, (u8)op, (const u8*)v,
+                                  v ? (u32)strlen(v) : 0, f)==BFWAL_OK );
+}
+static void test_base_ops(void){
+  BfWalIndex *ix = sqlite3BfWalIndexNew();
+  const char *v;
+  u8 k[8];
+  setBase(ix, 2, 1, BFWAL_OP_INSERT, "base1", 0);
+  setBase(ix, 2, 2, BFWAL_OP_DELETE, 0, 0);
+  setBase(ix, 2, 3, BFWAL_OP_INSERT, "base3", 12);       /* frame kept (same gen) */
+  setBase(ix, 2, 4, BFWAL_OP_INSERT, "base4", 0);
+  mkKey(k, 1); CHECK( sqlite3BfWalIndexHasBase(ix, 2, k) );
+  mkKey(k, 9); CHECK( !sqlite3BfWalIndexHasBase(ix, 2, k) );
+  CHECK( stateOf(ix,2,1,100,0,&v)==BFWAL_OP_INSERT && memcmp(v,"base1",5)==0 );
+  CHECK( stateOf(ix,2,2,100,0,0)==BFWAL_OP_DELETE );
+  addOp(ix, 2, 4, BFWAL_OP_INSERT, "log4", 20);           /* a log op wins */
+  CHECK( stateOf(ix,2,4,100,0,&v)==BFWAL_OP_INSERT && memcmp(v,"log4",4)==0 );
+  CHECK( stateOf(ix,2,4,19,0,&v)==BFWAL_OP_INSERT && memcmp(v,"base4",5)==0 );
+  addMerged(ix, 2, 1, 3, 11, 14, 25);                     /* covers 1..3 ... */
+  CHECK( stateOf(ix,2,1,100,0,0)==-1 );
+  CHECK( stateOf(ix,2,2,100,0,0)==-1 );
+  CHECK( stateOf(ix,2,3,100,0,0)==BFWAL_OP_INSERT );      /* ... but 3 is exempt */
+  CHECK( stateOf(ix,2,1,24,0,0)==BFWAL_OP_INSERT );       /* marker past the end */
+  setBase(ix, 2, 1, BFWAL_OP_INSERT, "again", 0);          /* SetBase replaces */
+  CHECK( stateOf(ix,2,1,24,0,&v)==BFWAL_OP_INSERT && memcmp(v,"again",5)==0 );
+  sqlite3BfWalIndexFree(ix);
+}
+
+/* C4b rebase: folding the log into base ops preserves every key's state;
+** markers and log ops are gone; frames are kept only when asked (a CKPT in the
+** same generation), so a later marker's exemption still sees them. */
+static void test_rebase(void){
+  BfWalIndex *ix = sqlite3BfWalIndexNew();
+  int i, st[12];
+  const char *v;
+  setBase(ix, 2, 1, BFWAL_OP_INSERT, "b1", 0);
+  setBase(ix, 2, 2, BFWAL_OP_INSERT, "b2", 0);
+  addOp(ix, 2, 2, BFWAL_OP_INSERT, "l2", 5);
+  addOp(ix, 2, 3, BFWAL_OP_INSERT, "l3", 6);
+  addOp(ix, 2, 4, BFWAL_OP_DELETE, 0, 7);
+  addOp(ix, 2, 5, BFWAL_OP_INSERT, "l5", 8);
+  addMerged(ix, 2, 5, 6, 8, 9, 9);                        /* covers 5 (frame 8 <= snap) */
+  addOp(ix, 2, 6, BFWAL_OP_INSERT, "l6", 9);              /* own op, after */
+  addOp(ix, 2, 7, BFWAL_OP_INSERT, "l7", 8);              /* exempt from it */
+  addMerged(ix, 2, 7, 7, 7, 9, 10);
+  for(i=1;i<=8;i++) st[i] = stateOf(ix,2,i,10,0,0);
+  sqlite3BfWalIndexRebase(ix, 10, 1);
+  for(i=1;i<=8;i++) CHECK( stateOf(ix,2,i,100,0,0)==st[i] );
+  CHECK( stateOf(ix,2,2,100,0,&v)==BFWAL_OP_INSERT && memcmp(v,"l2",2)==0 );
+  CHECK( stateOf(ix,2,5,100,0,0)==-1 );                   /* covered: dropped */
+  CHECK( sqlite3BfWalIndexKeyCount(ix)==6 );              /* 1,2,3,4,6,7 */
+  /* A later BEGIN CONCURRENT merge with snap=7 exempts frame 8 (key 7)... */
+  addMerged(ix, 2, 1, 9, 7, 12, 12);
+  CHECK( stateOf(ix,2,7,100,0,0)==BFWAL_OP_INSERT );
+  CHECK( stateOf(ix,2,3,100,0,0)==-1 );                   /* frame 6 <= snap */
+  CHECK( stateOf(ix,2,6,100,0,0)==BFWAL_OP_INSERT );      /* frame 9: exempt too */
+  /* ... and a restart fold (frames dropped) then makes every base op coverable. */
+  sqlite3BfWalIndexRebase(ix, 100, 0);
+  CHECK( sqlite3BfWalIndexKeyCount(ix)==2 );              /* 6 and 7 survive */
+  addMerged(ix, 2, 1, 9, 0, 1, 1);
+  CHECK( stateOf(ix,2,6,100,0,0)==-1 );
+  CHECK( stateOf(ix,2,7,100,0,0)==-1 );
+  sqlite3BfWalIndexFree(ix);
+}
+
+/* CKPT op (payload v6): round-trips, carries no key or value, and is noted by
+** the index without becoming an op of any key. */
+static void test_ckpt_op(void){
+  u8 buf[512];
+  BfWalBatch b;
+  BfWalIter it;
+  BfWalRec r, o;
+  BfWalIndex *ix = sqlite3BfWalIndexNew();
+  u8 k[8];
+  mkKey(k, 3);
+  sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
+  memset(&r, 0, sizeof(r));
+  r.pgno=9; r.rootPgno=2; r.op=BFWAL_OP_INSERT; r.nKey=8; r.pKey=k; r.nVal=1; r.pVal=(const u8*)"x";
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
+  memset(&r, 0, sizeof(r));
+  r.pgno=1; r.rootPgno=2; r.op=BFWAL_OP_CKPT;
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
+  r.nKey=8; r.pKey=k;
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_FULL );    /* CKPT with a key */
+  sqlite3BfWalBatchFinish(&b);
+  CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
+  CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_OK && o.op==BFWAL_OP_INSERT );
+  CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_OK && o.op==BFWAL_OP_CKPT && o.nKey==0 );
+  CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_DONE );
+  CHECK( sqlite3BfWalIndexAddFrame(ix, buf, sizeof(buf), 7)==BFWAL_OK );
+  CHECK( sqlite3BfWalIndexKeyCount(ix)==1 );
+  CHECK( sqlite3BfWalIndexTakeCkpt(ix)==7 );
+  CHECK( sqlite3BfWalIndexTakeCkpt(ix)==0 );
+  /* A CKPT that claims a key does not decode. */
+  buf[BFWAL_HDRSIZE + (4+4+1+1+1+8+1) + 9] = 8;           /* its keyLen varint */
+  CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
+  CHECK( sqlite3BfWalIterNext(&it,&o)==BFWAL_OK );
+  CHECK( sqlite3BfWalIterNext(&it,&o)!=BFWAL_OK );
+  sqlite3BfWalIndexFree(ix);
+}
+
+/* C4b region entry codec: round trip of INSERT / DELETE / KILL, and every
+** truncation of an entry is rejected (0) rather than read past. */
+static void test_region_codec(void){
+  u8 a[256], lo[8], hi[8];
+  BfRegionEntry e;
+  int n, n1, n2, n3, i;
+  mkKey(lo, 5); mkKey(hi, 9);
+  n1 = sqlite3BfRegionEncode(a, BFWAL_OP_INSERT, 7, lo, (const u8*)"value", 5, 123);
+  CHECK( n1==sqlite3BfRegionEntrySize(BFWAL_OP_INSERT, 5) );
+  n2 = sqlite3BfRegionEncode(a+n1, BFWAL_OP_DELETE, 7, hi, 0, 0, 124);
+  CHECK( n2==sqlite3BfRegionEntrySize(BFWAL_OP_DELETE, 0) );
+  n3 = sqlite3BfRegionEncode(a+n1+n2, BFREG_KILL, 8, lo, hi, 8, 0);
+  CHECK( n3==sqlite3BfRegionEntrySize(BFREG_KILL, 8) );
+  n = sqlite3BfRegionDecode(a, n1+n2+n3, &e);
+  CHECK( n==n1 && e.kind==BFWAL_OP_INSERT && e.root==7 && e.iFrame==123
+      && e.nVal==5 && memcmp(e.pVal,"value",5)==0 && memcmp(e.pKey,lo,8)==0 );
+  n = sqlite3BfRegionDecode(a+n1, n2+n3, &e);
+  CHECK( n==n2 && e.kind==BFWAL_OP_DELETE && e.iFrame==124 && memcmp(e.pKey,hi,8)==0 );
+  n = sqlite3BfRegionDecode(a+n1+n2, n3, &e);
+  CHECK( n==n3 && e.kind==BFREG_KILL && e.root==8 && memcmp(e.pHi,hi,8)==0 );
+  for(i=0;i<n1;i++) CHECK( sqlite3BfRegionDecode(a, i, &e)==0 );
+  for(i=0;i<n3;i++) CHECK( sqlite3BfRegionDecode(a+n1+n2, i, &e)==0 );
+  a[0] = 9;  CHECK( sqlite3BfRegionDecode(a, n1, &e)==0 );            /* bad kind */
+  a[0] = BFWAL_OP_INSERT; a[1]=a[2]=a[3]=0; a[4]=1;
+  CHECK( sqlite3BfRegionDecode(a, n1, &e)==0 );                        /* root 1 */
+}
+
 int main(void){
   test_roundtrip();
   test_full();
@@ -289,6 +423,10 @@ int main(void){
   test_index_markers();
   test_index_from_frame();
   test_merged_op();
+  test_base_ops();
+  test_rebase();
+  test_ckpt_op();
+  test_region_codec();
   if( nFail==0 ) printf("wal_codec_test: ALL PASS\n");
   else printf("wal_codec_test: %d FAILURE(S)\n", nFail);
   return nFail!=0;

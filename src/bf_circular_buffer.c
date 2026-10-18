@@ -360,6 +360,24 @@ int sqlite3BfCircularBufferInit(BfCircularBuffer *pCb, u64 capacity){
 }
 
 /*
+** Empty the buffer without freeing it: every block becomes free space.  Only
+** for a caller that has just unlinked every block (a full cache rebuild with
+** no cursor holding a raw mini-page pointer).  C4b (2026-10-18): unlinked
+** blocks are reclaimed only as the FIFO head passes them, and a live dirty
+** block at the head stops that, so a rebuild into a ring of the same size
+** found it full of the previous contents' garbage and dropped a committed
+** record (mwriter_oracle seed 1, small ring, BF_FULL from the replay).
+*/
+void sqlite3BfCircularBufferReset(BfCircularBuffer *pCb){
+  int i;
+  if( pCb->pBuffer==0 ) return;
+  pCb->headAddr = 0;
+  pCb->tailAddr = 0;
+  pCb->evictingAddr = 0;
+  for(i=0; i<BF_SIZE_CLASS_COUNT; i++) pCb->freeList.apHead[i] = 0;
+}
+
+/*
 ** Destroy a circular buffer and free all resources.
 */
 void sqlite3BfCircularBufferDestroy(BfCircularBuffer *pCb){

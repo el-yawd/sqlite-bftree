@@ -690,6 +690,10 @@ struct BfCache {
   u64 nRollbackRehydrate;
   u64 nClearLogged;
   u64 nSnapshotRehydrate;   /* rebuilds because another connection wrote */
+  u64 nRegionCkpt;          /* C4b: checkpoints that wrote a region segment */
+  u64 nRegionCompact;       /* C4b: ... of which rewrote the region in full */
+  u64 nRegionPages;         /* C4b: region pages written */
+  u64 nRegionSeed;          /* C4b: record-index seeds read from the region */
   u64 nSnapshotIncr;        /* ... handled by dropping only the leaves it changed */
   u64 nSnapshotIncrPages;   /* leaves those incremental advances dropped */
   u64 nRingGrow;            /* rebuilds that grew the ring to fit the replay */
@@ -794,6 +798,7 @@ SQLITE_PRIVATE void sqlite3BfCacheDestroy(BfCache *pCache);
 SQLITE_PRIVATE int sqlite3BfCircularBufferInit(BfCircularBuffer *pCb, u64 capacity);
 SQLITE_PRIVATE void sqlite3BfCircularBufferDestroy(BfCircularBuffer *pCb);
 SQLITE_PRIVATE void *sqlite3BfCircularBufferAlloc(BfCircularBuffer *pCb, u32 size);
+SQLITE_PRIVATE void sqlite3BfCircularBufferReset(BfCircularBuffer *pCb);
 SQLITE_PRIVATE int sqlite3BfCircularBufferDealloc(BfCircularBuffer *pCb, void *ptr);
 SQLITE_PRIVATE int sqlite3BfCircularBufferEvictOne(BfCircularBuffer *pCb,
     int (*xEvict)(void*, void*), void *pCtx);
@@ -1087,7 +1092,32 @@ typedef struct BfFitOp BfFitOp;
 struct BfFitOp { u32 leaf; u8 op; u8 nKey; u16 nVal; u8 aKey[16]; };
 SQLITE_PRIVATE int sqlite3BfCacheLeafFits(BfCache*, u32 pgno, const BfFitOp *aExtra,
     int nExtra, BfMiniPage *pOurs);
+/*
+** C4b (2026-10-18): the mini-page region.  A checkpoint writes the buffered
+** records the log holds into the database file -- packed, not merged into
+** their leaves -- so the log can be truncated without a write-back (design
+** doc section 16).  The region is a list of SEGMENTS, newest first; each is a
+** chain of pages:
+**   first page: [next pgno][BFREG_MAGIC][older segment][nPages][nPayload]
+**               [nEntries][salt1][salt2][mxFrame] then payload
+**   other pages: [next pgno] then payload
+** The payload is a stream of region entries (bf_wal.h BfRegionEntry): INSERT /
+** DELETE (a key's state) and KILL (older entries on keys in a range are dead).
+** salt/mxFrame: the log generation and frame whose state the segment brings
+** the region to.  Page 1 holds the newest segment and the totals in its
+** reserved header bytes 72..87 (stock SQLite ignores them).
+*/
+#define BFREG_META_HEAD   72
+#define BFREG_META_PAGES  76
+#define BFREG_META_BYTES  80
+#define BFREG_META_COMPACT 84             /* payload bytes after the last compaction */
+#define BFREG_MAGIC       0x42465247u    /* "BFRG" */
+#define BFREG_HDR1        36
+#define BFREG_HDRN        4
+
 SQLITE_PRIVATE u32 sqlite3BfLeafForKey(void *pBtShared, u32 root, const u8 *pKey);
+SQLITE_PRIVATE int sqlite3BfBtreeLogCkpt(Btree*);
+SQLITE_PRIVATE int sqlite3BfBtreeGroupPending(Btree*);
 SQLITE_PRIVATE u32 sqlite3BfLeafForKeyCached(void *pBtShared, u32 root, const u8 *pKey);
 SQLITE_PRIVATE int sqlite3BfCacheReplayKeys(BfCache*, BfWalIndex*, u32 mxFrame,
     const BfKeyRef *aKey, int nKey, BfLeafFn xLeaf, void *pLeafArg);

@@ -150,8 +150,11 @@ int sqlite3BfWalBatchAppend(BfWalBatch *p, const BfWalRec *pRec){
   if( pRec->op==BFWAL_OP_MERGED && (pRec->nKey!=16 || pRec->nVal!=8) ){
     return BFWAL_FULL;      /* would not decode: refuse to encode it */
   }
+  if( pRec->op==BFWAL_OP_CKPT && (pRec->nKey!=0 || pRec->nVal!=0) ){
+    return BFWAL_FULL;
+  }
   if( pRec->op!=BFWAL_OP_INSERT && pRec->op!=BFWAL_OP_DELETE
-   && pRec->op!=BFWAL_OP_MERGED ){
+   && pRec->op!=BFWAL_OP_MERGED && pRec->op!=BFWAL_OP_CKPT ){
     return BFWAL_FULL;
   }
 
@@ -234,7 +237,8 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   rootPgno = bfGet32(p);  p += 4;  off += 4;
   op = *p++;              off += 1;
   if( pgno==0 || rootPgno<=1 ) return BFWAL_CORRUPT;
-  if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE && op!=BFWAL_OP_MERGED ){
+  if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE && op!=BFWAL_OP_MERGED
+   && op!=BFWAL_OP_CKPT ){
     return BFWAL_CORRUPT;
   }
 
@@ -251,6 +255,7 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   off += (int)nKey;
   if( nVal > (u32)(it->nUsed - off) ) return BFWAL_CORRUPT;
   if( op==BFWAL_OP_MERGED && (nKey!=16 || nVal!=8) ) return BFWAL_CORRUPT;
+  if( op==BFWAL_OP_CKPT && (nKey!=0 || nVal!=0) ) return BFWAL_CORRUPT;
 
   pRec->pgno = pgno;
   pRec->rootPgno = rootPgno;
@@ -293,6 +298,11 @@ struct BfKeyNode {
   int        nOp, nAlloc;
   BfKeyOp   *aOp;           /* log order */
   BfKeyNode *pNext;         /* bucket chain */
+  /* C4b: the key's entry in the database's mini-page region -- its state as
+  ** of a checkpoint, older than every op of the log (frame 0, sequence 0), so
+  ** any MERGED marker over the key covers it. */
+  u8         bBase;
+  BfKeyOp    base;
 };
 typedef struct BfMarker BfMarker;
 struct BfMarker {
@@ -309,6 +319,8 @@ struct BfWalIndex {
   BfMarker   *aMark;        /* log order */
   int         nMark, nMarkAlloc;
   u32         iSeq;         /* next sequence number */
+  u32         iCkpt;        /* C4b: frame of a CKPT op appended and not yet
+                            ** taken (sqlite3BfWalIndexTakeCkpt), else 0 */
 };
 
 #define BFWAL_IDX_INIT_BUCKETS 64
@@ -365,6 +377,7 @@ BfWalIndex *sqlite3BfWalIndexNew(void){
 
 static void bfIdxFreeNode(BfKeyNode *pN){
   int i;
+  if( pN->bBase ) BFWAL_FREE(pN->base.pVal);
   for(i=0; i<pN->nOp; i++) BFWAL_FREE(pN->aOp[i].pVal);
   BFWAL_FREE(pN->aOp);
   BFWAL_FREE(pN);
@@ -380,6 +393,24 @@ void sqlite3BfWalIndexFree(BfWalIndex *p){
   BFWAL_FREE(p->apBucket);
   BFWAL_FREE(p->aMark);
   BFWAL_FREE(p);
+}
+
+/* The key's node, created if absent (NULL on OOM). */
+static BfKeyNode *bfIdxNode(BfWalIndex *p, u32 root, const u8 *pKey){
+  BfKeyNode *pN = bfIdxFind(p, root, pKey);
+  if( pN==0 ){
+    if( bfIdxMaybeGrow(p) ){ /* NOMEM: proceed at current size, still correct */ }
+    pN = (BfKeyNode*)BFWAL_MALLOC((int)sizeof(*pN));
+    if( pN==0 ) return 0;
+    memset(pN, 0, sizeof(*pN));
+    pN->root = root;
+    memcpy(pN->aKey, pKey, 8);
+    { unsigned h = bfIdxHash(pN->root, pN->aKey, p->nBucket);
+      pN->pNext = p->apBucket[h];
+      p->apBucket[h] = pN; }
+    p->nKey++;
+  }
+  return pN;
 }
 
 static int bfIdxAddMarker(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
@@ -407,6 +438,10 @@ int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
   BfKeyNode *pN;
   BfKeyOp *pOp;
   if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_CORRUPT;
+  if( pRec->op==BFWAL_OP_CKPT ){
+    p->iCkpt = iFrame;          /* the caller decides whether to fold */
+    return BFWAL_OK;
+  }
   if( pRec->op==BFWAL_OP_MERGED ){
     if( pRec->nKey!=16 || pRec->nVal!=8 ) return BFWAL_CORRUPT;
     return bfIdxAddMarker(p, pRec, iFrame);
@@ -414,19 +449,8 @@ int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
   if( pRec->op!=BFWAL_OP_INSERT && pRec->op!=BFWAL_OP_DELETE ) return BFWAL_CORRUPT;
   if( pRec->nKey!=8 ) return BFWAL_CORRUPT;   /* BF buffers rowid keys only */
 
-  pN = bfIdxFind(p, pRec->rootPgno, pRec->pKey);
-  if( pN==0 ){
-    if( bfIdxMaybeGrow(p) ){ /* NOMEM: proceed at current size, still correct */ }
-    pN = (BfKeyNode*)BFWAL_MALLOC((int)sizeof(*pN));
-    if( pN==0 ) return BFWAL_NOMEM;
-    memset(pN, 0, sizeof(*pN));
-    pN->root = pRec->rootPgno;
-    memcpy(pN->aKey, pRec->pKey, 8);
-    { unsigned h = bfIdxHash(pN->root, pN->aKey, p->nBucket);
-      pN->pNext = p->apBucket[h];
-      p->apBucket[h] = pN; }
-    p->nKey++;
-  }
+  pN = bfIdxNode(p, pRec->rootPgno, pRec->pKey);
+  if( pN==0 ) return BFWAL_NOMEM;
   if( pN->nOp >= pN->nAlloc ){
     int newAlloc = pN->nAlloc ? pN->nAlloc*2 : 2;
     BfKeyOp *aNew = (BfKeyOp*)BFWAL_REALLOC(pN->aOp, newAlloc*(int)sizeof(BfKeyOp));
@@ -467,27 +491,213 @@ static int bfIdxCovered(BfWalIndex *p, u32 root, const u8 *k, const BfKeyOp *o,
   return 0;
 }
 
+/* The op that is node pN's replay state at mxFrame: its last op unless a
+** marker covers it (NULL: no op, or covered -- the base pages hold the key). */
+static BfKeyOp *bfIdxStateOp(BfWalIndex *p, BfKeyNode *pN, u32 mxFrame,
+                             int bKeepBeyond){
+  int i;
+  for(i=pN->nOp-1; i>=-1; i--){
+    BfKeyOp *o;
+    if( i>=0 ){
+      o = &pN->aOp[i];
+      if( o->iFrame>mxFrame && !bKeepBeyond ) continue;   /* torn tail */
+    }else{
+      if( !pN->bBase ) break;
+      o = &pN->base;              /* C4b: no log op -- the region's entry */
+    }
+    if( bfIdxCovered(p, pN->root, pN->aKey, o, mxFrame) ) return 0;
+    return o;
+  }
+  return 0;
+}
+
 int sqlite3BfWalIndexKeyState(BfWalIndex *p, u32 root, const u8 *pKey,
     u32 mxFrame, int bKeepBeyond, BfKeyState *pOut){
   BfKeyNode *pN;
-  int i;
+  const BfKeyOp *o;
   memset(pOut, 0, sizeof(*pOut));
   pOut->op = -1;
   if( p==0 ) return 0;
   pN = bfIdxFind(p, root, pKey);
   if( pN==0 ) return 0;
-  for(i=pN->nOp-1; i>=0; i--){
-    const BfKeyOp *o = &pN->aOp[i];
-    if( o->iFrame>mxFrame && !bKeepBeyond ) continue;   /* torn tail */
-    if( bfIdxCovered(p, root, pKey, o, mxFrame) ) return 1;  /* in base */
+  o = bfIdxStateOp(p, pN, mxFrame, bKeepBeyond);
+  if( o ){
     pOut->op = o->op;
     pOut->pVal = o->pVal;
     pOut->nVal = o->nVal;
     pOut->iFrame = o->iFrame;
     pOut->hint = o->hint;
-    return 1;
   }
   return 1;
+}
+
+/*
+** C4b: the region (the database's persisted mini-page entries).
+*/
+int sqlite3BfWalIndexHasBase(BfWalIndex *p, u32 root, const u8 *pKey){
+  BfKeyNode *pN = p ? bfIdxFind(p, root, pKey) : 0;
+  return pN!=0 && pN->bBase;
+}
+int sqlite3BfWalIndexSetBase(BfWalIndex *p, u32 root, const u8 *pKey, u8 op,
+                             const u8 *pVal, u32 nVal, u32 iFrame){
+  BfKeyNode *pN;
+  u8 *aCopy = 0;
+  if( root<=1 ) return BFWAL_CORRUPT;
+  if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE ) return BFWAL_CORRUPT;
+  if( op==BFWAL_OP_DELETE ) nVal = 0;
+  if( nVal ){
+    aCopy = (u8*)BFWAL_MALLOC((int)nVal);
+    if( aCopy==0 ) return BFWAL_NOMEM;
+    memcpy(aCopy, pVal, nVal);
+  }
+  pN = bfIdxNode(p, root, pKey);
+  if( pN==0 ){ BFWAL_FREE(aCopy); return BFWAL_NOMEM; }
+  if( pN->bBase ) BFWAL_FREE(pN->base.pVal);
+  memset(&pN->base, 0, sizeof(pN->base));
+  pN->base.op = op;
+  pN->base.iFrame = iFrame;
+  pN->base.nVal = nVal;
+  pN->base.pVal = aCopy;
+  pN->bBase = 1;
+  return BFWAL_OK;
+}
+int sqlite3BfWalIndexForEachState(BfWalIndex *p, u32 mxFrame, u32 iAfter,
+    int bAll, int (*xState)(void*, u32, const u8*, const BfKeyState*, int),
+    void *pCtx){
+  int i, j;
+  if( p==0 ) return BFWAL_OK;
+  for(i=0; i<p->nBucket; i++){
+    BfKeyNode *pN;
+    for(pN = p->apBucket[i]; pN; pN = pN->pNext){
+      BfKeyState st;
+      int bNew = 0;
+      for(j=0; !bNew && j<pN->nOp; j++){
+        u32 f = pN->aOp[j].iFrame;
+        if( f>iAfter && f<=mxFrame ) bNew = 1;
+      }
+      if( !bNew && !bAll ) continue;
+      sqlite3BfWalIndexKeyState(p, pN->root, pN->aKey, mxFrame, 0, &st);
+      j = xState(pCtx, pN->root, pN->aKey, &st, bNew);
+      if( j!=BFWAL_OK ) return j;
+    }
+  }
+  return BFWAL_OK;
+}
+int sqlite3BfWalIndexForEachMarker(BfWalIndex *p, u32 mxFrame, u32 iAfter,
+    int (*xMark)(void*, u32, const u8*, const u8*), void *pCtx){
+  int i;
+  if( p==0 ) return BFWAL_OK;
+  for(i=0; i<p->nMark; i++){
+    const BfMarker *m = &p->aMark[i];
+    if( m->iFrame<=iAfter || m->iFrame>mxFrame ) continue;
+    if( xMark(pCtx, m->root, m->lo, m->hi)!=BFWAL_OK ) return BFWAL_NOMEM;
+  }
+  return BFWAL_OK;
+}
+
+/*
+** C4b: fold the log into the base.  Each key's state at mxFrame becomes its
+** base op (none if covered), and every log op and marker is dropped -- what
+** the index looks like when seeded from a region written at mxFrame.  Used by
+** the writer at a log restart, when the log is entirely backfilled and the
+** region holds exactly this state.
+*/
+void sqlite3BfWalIndexRebase(BfWalIndex *p, u32 mxFrame, int bKeepFrames){
+  int i, j;
+  if( p==0 ) return;
+  for(i=0; i<p->nBucket; i++){
+    BfKeyNode **pp = &p->apBucket[i];
+    while( *pp ){
+      BfKeyNode *pN = *pp;
+      BfKeyOp nb;
+      int bKeep = 0;
+      memset(&nb, 0, sizeof(nb));
+      {
+        /* The state's op owns its value: detach it before the ops are freed. */
+        BfKeyOp *src = bfIdxStateOp(p, pN, mxFrame, 0);
+        if( src ){
+          nb.op = src->op;
+          nb.nVal = src->nVal;
+          nb.pVal = src->pVal;
+          /* Same generation (a CKPT): keep the op's frame, so a later MERGED
+          ** marker's (snap, start) exemption still recognises it.  A new
+          ** generation (a log restart) numbers frames from 1 again. */
+          nb.iFrame = bKeepFrames ? src->iFrame : 0;
+          src->pVal = 0;
+          bKeep = 1;
+        }
+      }
+      if( pN->bBase ) BFWAL_FREE(pN->base.pVal);
+      for(j=0; j<pN->nOp; j++) BFWAL_FREE(pN->aOp[j].pVal);
+      pN->nOp = 0;
+      pN->bBase = 0;
+      if( bKeep ){
+        pN->base = nb;
+        pN->bBase = 1;
+        pp = &pN->pNext;
+      }else{
+        *pp = pN->pNext;
+        BFWAL_FREE(pN->aOp);
+        BFWAL_FREE(pN);
+        p->nKey--;
+      }
+    }
+  }
+  p->nMark = 0;
+  p->iCkpt = 0;
+}
+u32 sqlite3BfWalIndexTakeCkpt(BfWalIndex *p){
+  u32 i = p ? p->iCkpt : 0;
+  if( p ) p->iCkpt = 0;
+  return i;
+}
+
+/*
+** C4b region entries: [kind u8][root u32][key 8]
+**   INSERT: [frame u32][nVal u32][val]   DELETE: [frame u32]   KILL: [hi 8]
+** frame: the log frame of the op the entry came from, meaningful only in the
+** generation the segment header names (MERGED exemptions need it).
+*/
+int sqlite3BfRegionEntrySize(u8 kind, u32 nVal){
+  if( kind==BFREG_KILL ) return 1+4+8+8;
+  if( kind==BFWAL_OP_DELETE ) return 1+4+8+4;
+  return 1+4+8+4+4+(int)nVal;
+}
+int sqlite3BfRegionEncode(u8 *a, u8 kind, u32 root, const u8 *pKey,
+                          const u8 *pVal, u32 nVal, u32 iFrame){
+  a[0] = kind;
+  bfPut32(a+1, root);
+  memcpy(a+5, pKey, 8);
+  if( kind==BFREG_KILL ){
+    memcpy(a+13, pVal, 8);           /* hi */
+    return 21;
+  }
+  bfPut32(a+13, iFrame);
+  if( kind==BFWAL_OP_DELETE ) return 17;
+  bfPut32(a+17, nVal);
+  if( nVal ) memcpy(a+21, pVal, nVal);
+  return 21+(int)nVal;
+}
+int sqlite3BfRegionDecode(const u8 *a, int nAvail, BfRegionEntry *pE){
+  if( nAvail<13 ) return 0;
+  memset(pE, 0, sizeof(*pE));
+  pE->kind = a[0];
+  pE->root = bfGet32(a+1);
+  pE->pKey = a+5;
+  if( pE->root<=1 ) return 0;
+  if( pE->kind==BFREG_KILL ){
+    if( nAvail<21 ) return 0;
+    pE->pHi = a+13;
+    return 21;
+  }
+  if( nAvail<17 ) return 0;
+  pE->iFrame = bfGet32(a+13);
+  if( pE->kind==BFWAL_OP_DELETE ) return 17;
+  if( pE->kind!=BFWAL_OP_INSERT || nAvail<21 ) return 0;
+  pE->nVal = bfGet32(a+17);
+  if( pE->nVal > (u32)(nAvail-21) ) return 0;
+  pE->pVal = a+21;
+  return 21+(int)pE->nVal;
 }
 
 int sqlite3BfWalIndexForEachKey(BfWalIndex *p,
