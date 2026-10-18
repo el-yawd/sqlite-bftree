@@ -1410,10 +1410,16 @@ void sqlite3LeaveMutexAndCloseZombie(sqlite3 *db){
   ** (bfCheckpointMaterialize early-outs) or the db is not in WAL mode; returns
   ** SQLITE_LOCKED (ignored) if a transaction is somehow still open, which the
   ** rollback below then discards. */
+  /* C4b/C4c (owner, 2026-10-18): PASSIVE.  With the mini-page region the log
+  ** never needs truncating for a reopen to be correct (the region plus the log
+  ** tail rebuild the record cache), and a TRUNCATE held the write lock while
+  ** it waited for every reader -- stalling every concurrent committer for as
+  ** long as a BEGIN CONCURRENT transaction stayed open (30-60 commits/s at 4
+  ** threads whenever a connection closed mid-run). */
   for(j=0; j<db->nDb; j++){
     Btree *pBt = db->aDb[j].pBt;
     if( pBt ){
-      (void)sqlite3BtreeCheckpoint(pBt, SQLITE_CHECKPOINT_TRUNCATE, 0, 0);
+      (void)sqlite3BtreeCheckpoint(pBt, SQLITE_CHECKPOINT_PASSIVE, 0, 0);
     }
   }
 #endif

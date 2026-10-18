@@ -3463,3 +3463,12 @@ Open items:
   checkpoint; owner to decide.
 - Group-commit batching efficiency.
 - C4d: LSNs stable across restarts, so readers stop reseeding from the region.
+
+### 2026-10-18 (cont.) — Claude Opus 5.5 — close-time checkpoint is PASSIVE (owner decision)
+
+- **The owner decided:** the close-time checkpoint (main.c) is PASSIVE, no longer TRUNCATE.  With
+  the region, a reopen needs no truncated log.
+- **The stall is gone:** a TRUNCATE held the write lock while it waited for every reader.  With
+  connections closing mid-run, 4/8 threads under FULL now reach 690/391 commits/s (group sync
+  off) and 1000/708 (group sync on), against 30-60 before.
+- **Verified:** gate --full 59/59; mt 54/54; mwriter 108/108.
