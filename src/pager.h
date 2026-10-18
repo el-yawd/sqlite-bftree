@@ -297,6 +297,7 @@ int sqlite3PagerBfStage(Pager *pPager, const u8 *aData, int szPage);
 void sqlite3PagerBfStageClear(Pager *pPager);
 int sqlite3PagerIsWal(Pager *pPager);
 void sqlite3PagerBfFrameStats(Pager*, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
+u64 sqlite3PagerBfLogBytes(Pager*);
 /* Phase 2 (WAL) rollback: rebuild the record cache from the committed log. */
 typedef u32 (*BfLeafFnP)(void*, u32, const unsigned char*);
 struct BfKeyRef;

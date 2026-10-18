@@ -3319,3 +3319,36 @@ Not measured: per the owner, there are no benchmarks at this stage.
 
 Next is C4: the BF log replaces the WAL, and group commit belongs to it (design section 14,
 option D).
+
+### 2026-10-18 (cont.) — Claude Opus 5.5 — C4 approved; C4a: variable-sized record frames (frame waste gone)
+
+Owner approved C4.  **Route (my decision, recorded in design doc section 16):** C4 evolves the
+`-wal` file into the design's log in place, rather than writing a new `<db>-log` module.  This
+keeps SQLite's proven locking, recovery and checkpoint protocol, and upstream BEGIN CONCURRENT's
+page-level validation, which runs over the wal-index.  The design's goals ("checkpoint write-back
+and frame waste gone") are reached in the substages C4a-C4d.
+
+**C4a, built:**
+- **Variable-sized record frames.**  A record frame is now a 24-byte header plus the batch's used
+  bytes rounded up to 8, not a whole page.  Its checksum covers exactly those bytes.
+- **Frame offsets come from the wal-index.**  A frame's position is no longer
+  `(iFrame-1)*(szPage+24)`.  Each wal-index block gains an `aEnd` array (frame end offsets, in
+  8-byte units) at byte 32768, and blocks grow to 64 KB.  The array is written for every frame at
+  write time or by recovery, and never zeroed.
+- **Unchanged:** frame numbers, the hash, `mxFrame` semantics, and BC validation.
+- **Recovery and the unreliable-shm check** read the log through a buffered sequential scanner
+  (`WalBfScan`).
+- **Every reader of frame offsets now uses the wal-index:** checkpoint, ReadFrame, LockForCommit,
+  RewriteChecksums, CatchUp (now wrapped in SEH_TRY), ConcurrentScan and SnapshotRecover.
+- **New WAL / wal-index versions (3007041).**  Stock SQLite and older BF builds refuse these files
+  instead of misreading them.  Stock builds are textually guarded and keep the old layout.
+- **New counter** `wal_bytes` in `PRAGMA bf_cache_stats`.
+- `bench/torn_tail_repro.sh` now parses variable frames.
+
+Sanity check (not a campaign): 2,000 single-row INSERT OR REPLACE commits with auto-checkpoint
+off.
+- -wal: stock 10.5 MB (5.2 KB/commit), BF 208 KB (104 B/commit).
+- Before C4a every record-only commit cost at least one 4,120-byte frame.
+
+Correctness: gate --full 58/58 (crash, powerloss including PSOW=0 padding, torn tail, recovery
+with a dirty heap); mwriter seeds 1-4 OK.

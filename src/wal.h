@@ -50,6 +50,7 @@
 #  define sqlite3WalBfStageClear(x)
 #  define sqlite3WalBfIndex(x)                   0
 #  define sqlite3WalBfFrameStats(w,x,y,z)
+#  define sqlite3WalBfLogBytes(x)                0
 #  define sqlite3WalBfHasStaged(x)               0
 #  define sqlite3WalBfMxFrame(x)                 0
 #  define sqlite3WalBfPrune(x)
@@ -135,6 +136,7 @@ int sqlite3WalBfConcurrentScan(Wal*, int(*)(void*,u32,u32,const u8*,int,int,int)
 #endif
 /* Write-amplification counters: record frames / page-image frames / commits. */
 void sqlite3WalBfFrameStats(Wal *pWal, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
+u64 sqlite3WalBfLogBytes(Wal *pWal);
 /* True iff record payloads are staged for the pending commit. */
 int sqlite3WalBfHasStaged(Wal *pWal);
 /* Record-op ordering and rollback support (see wal.c). */

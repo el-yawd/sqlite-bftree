@@ -606,6 +606,16 @@ void sqlite3PragmaBfCacheStats(
       sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
                             (const u8*)&nCommits, P4_INT64);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+      {
+        /* C4a: log bytes appended -- frame waste is gone when this tracks
+        ** the record bytes rather than 4 KB per commit. */
+        extern u64 sqlite3BfBtreeWalBytes(Btree*);
+        u64 nBytes = pBt ? sqlite3BfBtreeWalBytes(pBt) : 0;
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, "wal_bytes", P4_STATIC);
+        sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0,
+                              (const u8*)&nBytes, P4_INT64);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+      }
     }
 
 #if defined(SQLITE_BF_INSERT_BUFFERING)

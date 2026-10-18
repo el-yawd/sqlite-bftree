@@ -3504,6 +3504,11 @@ void sqlite3BfBtreeWalStats(Btree *p, u64 *pRecFrames, u64 *pPageFrames,
     sqlite3PagerBfFrameStats(p->pBt->pPager, pRecFrames, pPageFrames, pCommits);
   }
 }
+/* C4a: bytes this connection appended to the log (wal_bytes). */
+u64 sqlite3BfBtreeWalBytes(Btree *p){
+  if( p && p->pBt && p->pBt->pPager ) return sqlite3PagerBfLogBytes(p->pBt->pPager);
+  return 0;
+}
 
 /*
 ** Write-back delete statistics (Stage 2.3) for PRAGMA bf_cache_stats: number of

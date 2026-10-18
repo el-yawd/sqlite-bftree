@@ -4700,6 +4700,12 @@ void sqlite3PagerBfFrameStats(Pager *pPager, u64 *pnRec, u64 *pnPage,
   }
 #endif
 }
+u64 sqlite3PagerBfLogBytes(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pPager->pWal ) return sqlite3WalBfLogBytes(pPager->pWal);
+#endif
+  return 0;
+}
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */
 
 #if !defined(NDEBUG) || defined(SQLITE_TEST)

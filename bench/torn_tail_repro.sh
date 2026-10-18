@@ -81,15 +81,26 @@ import os, struct, sys
 p = sys.argv[1]
 w = open(p, 'rb').read()
 ps = struct.unpack('>I', w[8:12])[0]
-fs = 24 + ps
-n = (len(w) - 32) // fs
-frames = [struct.unpack('>II', w[32 + i*fs: 40 + i*fs]) for i in range(n)]
+# C4a (2026-10-18): a record frame (page 0xffffffff) is its 24-byte header plus
+# its payload's used bytes (header bytes 8..11) rounded up to 8; a page frame
+# is 24 + page size.
+frames, offs, off = [], [], 32
+while off + 24 <= len(w):
+    pg, nt = struct.unpack('>II', w[off:off+8])
+    if pg == 0xffffffff:
+        nused = struct.unpack('>I', w[off+24+8:off+24+12])[0]
+        size = 24 + ((nused + 7) & ~7)
+    else:
+        size = 24 + ps
+    if off + size > len(w):
+        break
+    frames.append((pg, nt)); offs.append(off); off += size
 commits = [i for i, (pg, nt) in enumerate(frames) if nt]
 last, prev = commits[-1], commits[-2]
 tail = frames[prev+1:last+1]
 if tail[0][0] != 0xffffffff or len(tail) < 3:
     sys.exit("SETUP FAIL: last commit is not [record][pages...]: %r" % (tail,))
-os.truncate(p, 32 + last*fs)       # keep everything before the commit frame
+os.truncate(p, offs[last])         # keep everything before the commit frame
 print("torn tail: %d frames, first is a record frame" % (len(tail) - 1))
 EOF
 
