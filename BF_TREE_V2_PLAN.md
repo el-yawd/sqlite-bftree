@@ -3441,8 +3441,8 @@ Bugs found while building it:
 Verified:
 - `gate --full` 59/59 before fix 5.  After it, 58/59, with one mt run failing "scr range wrong at
   key 218" (seed 3, promotion 100 / scan promotion 100).  That failure did not reproduce in
-  about 400 further runs of that configuration, of seed 3, and of full sweeps.  It is **open**;
-  a SQLITE_DEBUG sweep was left running to catch it.
+  about 600 further release runs (that configuration, seed 3 alone, and full sweeps) or in 144
+  SQLITE_DEBUG runs.  It is **open**: rate below 1 in 700, no assertion fired.
 - mt sweep 5-10: 54/54.  mwriter 5-10: 108/108.
 - mt power-cut, torn and lost, FULL: OK on 4 seeds.
 - **Mutation test:** a leader that skips its fsync fails the power-cut oracle 3/3 ("acknowledged
