@@ -55,6 +55,10 @@
 #  define sqlite3WalBfSeedIndex(x)               0
 #  define sqlite3WalBfSeedDone(x)
 #  define sqlite3WalBfNoPersist(x)
+#  define sqlite3WalBfArmGroupSync(x,y)
+#  define sqlite3WalBfGroupWait(x)               0
+#  define sqlite3WalBfSyncPending(x)             0
+#  define sqlite3WalBfGroupStats(x,y)
 #  define sqlite3WalBfGeneration(w,x,y)          (*(y)=0)
 #  define sqlite3WalBfHasStaged(x)               0
 #  define sqlite3WalBfMxFrame(x)                 0
@@ -146,6 +150,10 @@ int sqlite3WalBfNeedSeed(Wal *pWal);
 BfWalIndex *sqlite3WalBfSeedIndex(Wal *pWal);
 void sqlite3WalBfSeedDone(Wal *pWal);
 void sqlite3WalBfNoPersist(Wal *pWal);
+void sqlite3WalBfArmGroupSync(Wal *pWal, int bOn);
+int sqlite3WalBfGroupWait(Wal *pWal);
+int sqlite3WalBfSyncPending(Wal *pWal);
+void sqlite3WalBfGroupStats(Wal *pWal, u64 *aOut);
 void sqlite3WalBfGeneration(Wal *pWal, u32 *aSalt, u32 *pmxFrame);
 /* True iff record payloads are staged for the pending commit. */
 int sqlite3WalBfHasStaged(Wal *pWal);

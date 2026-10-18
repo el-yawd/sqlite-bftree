@@ -381,3 +381,25 @@ and wal-index versions are 3007041.  Single-row commit: about 104 B of log, agai
   backfilled.
 - Readers reseed from the region after every log restart (C4d removes this).
 - Page-path writes still do not log ops (P1).
+
+**C4c: durable group commit (built 2026-10-18).**  This is option B of section 14, scoped as
+section 3.2 says (in-process batching, used by BEGIN CONCURRENT).
+- *Deferral.*  A BEGIN CONCURRENT commit under `synchronous=FULL` writes its frames, stores
+  the header it would publish in a PENDING slot in shared memory (block 0's spare aEnd space),
+  and releases the write lock without fsync.  This is skipped when it would start a log
+  generation, and when the WAL pads to sector boundaries.
+- *Waiting.*  After its read lock is released, the commit waits until its frames are durable
+  and published.  The first waiter leads: it takes the writers' head under the write lock,
+  fsyncs, and publishes that head under the write lock.  Threads of a process queue on a
+  per-file leader mutex.
+- *Visibility.*  Readers read only the published header, so they see a commit only after it is
+  durable (section 3.3).
+- *Writers* (BeginWrite, LockForCommit, UpgradeSnapshot, walFrames' overwrite floor, Undo,
+  the commit scan, the RESTART/TRUNCATE test, and walTryBeginRead under the write lock) work
+  on the writers' head.
+- *Cross-process writers* see the pending slot, so they stay correct; they just do not share
+  fsyncs.
+- *Switch:* `PRAGMA bf_group_sync` (default 1).
+- *Counters:* `group_sync_deferred`, `group_sync_fsyncs`, `group_sync_shared`.
+- *Non-CONCURRENT writers* (the region checkpoint) first flush pending commits as a leader
+  would, so they are not refused with BUSY_SNAPSHOT.

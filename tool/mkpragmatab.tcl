@@ -449,6 +449,10 @@ set pragma_def {
   TYPE: BF_GROUP_COMMIT
   IF:   !defined(SQLITE_OMIT_BF_CACHE)
 
+  NAME: bf_group_sync
+  TYPE: BF_GROUP_SYNC
+  IF:   !defined(SQLITE_OMIT_BF_CACHE)
+
   NAME: bf_group_commit
   TYPE: BF_GROUP_COMMIT
   IF:   !defined(SQLITE_OMIT_BF_CACHE)

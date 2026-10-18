@@ -3551,6 +3551,11 @@ void sqlite3BfBtreeWalStats(Btree *p, u64 *pRecFrames, u64 *pPageFrames,
     sqlite3PagerBfFrameStats(p->pBt->pPager, pRecFrames, pPageFrames, pCommits);
   }
 }
+/* C4c: group-commit counters (deferred commits, leader fsyncs, free rides). */
+void sqlite3BfBtreeGroupSyncStats(Btree *p, u64 *aOut){
+  aOut[0] = aOut[1] = aOut[2] = 0;
+  if( p && p->pBt && p->pBt->pPager ) sqlite3PagerBfGroupStats(p->pBt->pPager, aOut);
+}
 /* C4a: bytes this connection appended to the log (wal_bytes). */
 u64 sqlite3BfBtreeWalBytes(Btree *p){
   if( p && p->pBt && p->pBt->pPager ) return sqlite3PagerBfLogBytes(p->pBt->pPager);

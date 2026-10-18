@@ -3410,3 +3410,56 @@ Correctness:
 - mt power-cut, torn and lost, FULL: OK.
 
 Next: C4c, durable group commit (design section 3.2), then C4d.
+
+### 2026-10-18 (cont.) — Claude Opus 5.5 — C4c: durable group commit
+
+Design doc section 16 (C4c) has the design.  In short:
+- **Deferral.**  A BEGIN CONCURRENT commit under FULL writes its frames and a PENDING
+  "writers' head" header in shared memory, releases the write lock, and waits.
+- **Leader.**  The first waiter fsyncs once for every frame written so far, then publishes.
+  Readers never see a non-durable commit.
+- **Switch:** `PRAGMA bf_group_sync` (default 1).
+- **Counters:** `group_sync_deferred`, `group_sync_fsyncs`, `group_sync_shared`.
+
+Bugs found while building it:
+1. **A TRUNCATE checkpoint restarted the log over pending commits.**  Its "fully backfilled"
+   test used the published header.  Restarting erased the commits, and their waiters took the
+   salt change for success.
+2. **Waiting while holding the read lock livelocked.**  A TRUNCATE checkpoint holding the write
+   lock waited for readers, while the waiter spun for the write lock.  The wait now runs at the
+   end of `sqlite3BtreeCommitPhaseTwo`.
+3. **A commit that starts a new generation must not defer.**  Writing frame 1 can pick new salts
+   (`walWriteWalHeader`).  Its pending header then looked stale: the next writer wrote frame 1
+   over it, and its own wait took the salt change as published.  This lost about 15% of commits
+   at 4 threads when connections closed during the run.
+4. **`walTryBeginRead` (via walUpgradeReadlock) compared the writers' head with the published
+   header** and retried until SQLITE_PROTOCOL (mt_oracle "locking protocol").
+5. **A non-CONCURRENT writer behind pending commits got BUSY_SNAPSHOT and slept in the busy
+   handler.**  The region checkpoint now flushes pending commits first
+   (`sqlite3WalBfSyncPending`).
+
+Verified:
+- `gate --full` 59/59 before fix 5.  After it, 58/59, with one mt run failing "scr range wrong at
+  key 218" (seed 3, promotion 100 / scan promotion 100).  That failure did not reproduce in
+  about 400 further runs of that configuration, of seed 3, and of full sweeps.  It is **open**;
+  a SQLITE_DEBUG sweep was left running to catch it.
+- mt sweep 5-10: 54/54.  mwriter 5-10: 108/108.
+- mt power-cut, torn and lost, FULL: OK on 4 seeds.
+- **Mutation test:** a leader that skips its fsync fails the power-cut oracle 3/3 ("acknowledged
+  transfer ... is gone").
+
+Sanity numbers (not a campaign): 4-16 threads, one row per commit, FULL, LUKS disk.
+- 10-16% of commits shared an fsync.  Throughput was noisy: 4 threads 737 -> 1075 commits/s,
+  16 threads 251 -> 323 commits/s.
+- The low share is because the leader takes the write lock twice per group, competing with
+  committers.  Tuning is left for the C-letter campaign.
+- Separately, throughput collapses (30-60 commits/s) when connections close during a run.  The
+  close-time TRUNCATE checkpoint holds the write lock while it waits for readers in BC
+  transactions.  This predates C4c (`bf_group_sync=0` shows it too); see the open items.
+
+Open items:
+- The mt flake above.
+- The close-time TRUNCATE checkpoint stall.  With the region, close needs only a PASSIVE
+  checkpoint; owner to decide.
+- Group-commit batching efficiency.
+- C4d: LSNs stable across restarts, so readers stop reseeding from the region.

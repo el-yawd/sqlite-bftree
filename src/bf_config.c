@@ -47,6 +47,7 @@ typedef struct BfConfig {
   int nEvictTarget;           /* M4: bytes per eviction batch; 0 = legacy 16 */
   int bReadRecordCache;       /* B3b: read miss caches a record (1) or the leaf */
   int nAdaptiveFull;          /* X1: miss threshold for record->leaf; 0 = off */
+  int bGroupSync;             /* C4c: durable group commit (one fsync, many commits) */
 } BfConfig;
 
 static BfConfig bfConfig = {
@@ -59,7 +60,8 @@ static BfConfig bfConfig = {
   BF_DEFAULT_SCAN_PROMOTION,  /* the reference's scan_promotion_rate default */
   BF_DEFAULT_EVICT_TARGET,    /* the reference's TARGET_EVICT_SIZE */
   1,                          /* the reference's read_record_cache default */
-  0                           /* X1 off: the reference has no such rule */
+  0,                          /* X1 off: the reference has no such rule */
+  1                           /* C4c group sync on (design section 3.2) */
 };
 
 /*
@@ -77,6 +79,16 @@ int sqlite3BfCacheEvictTarget(void){
 */
 int sqlite3BfGroupCommitTxns(void){
   return bfConfig.nGroupCommit;
+}
+
+/*
+** C4c: durable group commit (PRAGMA bf_group_sync).  A BEGIN CONCURRENT commit
+** under synchronous=FULL writes its frames, releases the write lock, and waits
+** for one fsync that covers every commit written so far; it becomes visible to
+** readers only after that fsync.  0 = every commit fsyncs under the lock.
+*/
+int sqlite3BfGroupSync(void){
+  return bfConfig.bGroupSync;
 }
 
 /*
@@ -618,6 +630,23 @@ void sqlite3PragmaBfCacheStats(
                               (const u8*)&nBytes, P4_INT64);
         sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
       }
+      {
+        /* C4c: commits that deferred their fsync, fsyncs run as leader, and
+        ** deferred commits another connection's fsync covered. */
+        static const char *const azGs[] = {
+          "group_sync_deferred", "group_sync_fsyncs", "group_sync_shared" };
+        extern void sqlite3BfBtreeGroupSyncStats(Btree*, u64*);
+        u64 aGs[3];
+        int iG;
+        memset(aGs, 0, sizeof(aGs));
+        if( pBt ) sqlite3BfBtreeGroupSyncStats(pBt, aGs);
+        for(iG=0; iG<3; iG++){
+          sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, azGs[iG], P4_STATIC);
+          sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 2, 0, (const u8*)&aGs[iG],
+                                P4_INT64);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+        }
+      }
     }
 
 #if defined(SQLITE_BF_INSERT_BUFFERING)
@@ -680,6 +709,35 @@ void sqlite3PragmaBfGroupCommit(
     if( n < 0 ) n = 0;
     if( n > BF_MAX_GROUP_COMMIT ) n = BF_MAX_GROUP_COMMIT;
     bfConfig.nGroupCommit = n;
+  }
+}
+
+/*
+** Implementation of PRAGMA bf_group_sync (C4c)
+**
+** PRAGMA bf_group_sync;       -- 1 = durable group commit (default), 0 = off
+** PRAGMA bf_group_sync = 0|1;
+**
+** DURABLE group commit, unlike bf_deferred_commit: no commit returns before
+** its frames are fsynced (synchronous=FULL), and readers never see a commit
+** before that.  Concurrent committers share one fsync.  Applies to BEGIN
+** CONCURRENT commits; others fsync under the write lock as stock does.
+*/
+void sqlite3PragmaBfGroupSync(
+  Parse *pParse,
+  const char *zDb,
+  const char *zValue
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  UNUSED_PARAMETER(zDb);
+  if( zValue==0 ){
+    pParse->nMem = MAX(pParse->nMem, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, bfConfig.bGroupSync, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "bf_group_sync", SQLITE_STATIC);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+  }else{
+    bfConfig.bGroupSync = sqlite3Atoi(zValue)!=0;
   }
 }
 

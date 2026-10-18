@@ -580,6 +580,15 @@ struct Wal {
   u8 bBfNeedSeed;
   u8 bBfNoPersist;          /* C4b: leaving WAL mode -- delete the log at close */
   u8 bBfNoFold;             /* C4b: the frames being ingested follow a gap */
+  /* C4c (2026-10-18): durable group commit.  See walBfGroupWait. */
+  u8 bBfGroupArm;           /* the commit being written may defer its fsync */
+  u32 iBfWaitFrame;         /* a deferred commit's last frame (0: none) */
+  u32 aBfWaitSalt[2];       /* ... and its log generation */
+  int bfWaitSync;           /* ... and its sync flags */
+  struct WalBfGroup *pBfGroup;  /* this file's leader mutex (in-process) */
+  u64 nBfGroupDefer;        /* stats: commits that deferred their fsync */
+  u64 nBfGroupSync;         /* stats: fsyncs this connection ran as leader */
+  u64 nBfGroupFree;         /* stats: deferred commits another's fsync covered */
   /* Checkpoint cap (2026-10-17): the frame of this connection's checkpoint
   ** materialise commit, in the generation aBfCkptSalt.  Record frames are never
   ** backfilled -- the checkpoint skips them -- so frames past the materialise
@@ -1056,6 +1065,129 @@ static SQLITE_NO_TSAN void walIndexWriteHdr(Wal *pWal){
   walShmBarrier(pWal);
   memcpy((void*)&aHdr[0], (const void*)&pWal->hdr, sizeof(WalIndexHdr));
 }
+
+#ifndef SQLITE_OMIT_BF_CACHE
+/*
+** C4c: durable group commit (design doc section 3.2, option B of section 14).
+**
+** A BEGIN CONCURRENT commit under synchronous=FULL writes its frames under the
+** write lock as usual but neither fsyncs nor publishes the wal-index header.
+** It stores the header it would have published in the PENDING slot instead
+** (the "writers' head"), releases the lock, and waits (walBfGroupWait) for an
+** fsync that covers its frames; whoever runs that fsync -- the first waiter,
+** the leader -- then publishes the newest header the fsync covered.  So:
+**   - readers, which read only the published header, never see a commit
+**     before it is durable (section 3.3);
+**   - writers append after the PENDING head (walBfWriterHead), so frames are
+**     never overwritten and every commit validates against all earlier ones;
+**   - N committers waiting together share one fsync.
+** The slot lives in shared memory (block 0's spare aEnd space), so writers in
+** other processes see it too and stay correct; the leader mutex that makes
+** threads share an fsync is per process (WalBfGroup), so other processes'
+** commits simply fsync on their own.  Not used when the WAL pads commits to a
+** sector boundary (no POWERSAFE_OVERWRITE): sharing a sector between an
+** acknowledged commit and the next one's write is exactly what that padding
+** prevents.
+*/
+#define WAL_BF_PEND_OFF (WAL_BF_AEND_OFF + HASHTABLE_NPAGE_ONE*sizeof(u32))
+static volatile WalIndexHdr *walBfPendHdr(Wal *pWal){
+  SEH_INJECT_FAULT;
+  return (volatile WalIndexHdr*)&((volatile u8*)pWal->apWiData[0])[WAL_BF_PEND_OFF];
+}
+/* hdr, made ready to publish (what walIndexWriteHdr stores). */
+static void walBfPrepHdr(Wal *pWal, WalIndexHdr *pOut){
+  const int nCksum = offsetof(WalIndexHdr, aCksum);
+  *pOut = pWal->hdr;
+  pOut->isInit = 1;
+  pOut->iVersion = WALINDEX_MAX_VERSION;
+  walChecksumBytes(1, (u8*)pOut, nCksum, 0, pOut->aCksum);
+}
+/* Publish header *pH as the wal-index header (both copies).  Write lock held. */
+static SQLITE_NO_TSAN void walBfPublishHdr(Wal *pWal, const WalIndexHdr *pH){
+  volatile WalIndexHdr *aHdr = walIndexHdr(pWal);
+  memcpy((void*)&aHdr[1], (const void*)pH, sizeof(WalIndexHdr));
+  walShmBarrier(pWal);
+  memcpy((void*)&aHdr[0], (const void*)pH, sizeof(WalIndexHdr));
+}
+/*
+** The head of the log for a WRITER: the pending header when it is valid and
+** ahead of the published one (same generation), else the published header.
+** Call with the write lock held (both are then stable).
+*/
+static void walBfWriterHead(Wal *pWal, WalIndexHdr *pOut){
+  WalIndexHdr pend;
+  u32 aCk[2];
+  memcpy(pOut, (void*)walIndexHdr(pWal), sizeof(WalIndexHdr));
+  memcpy(&pend, (void*)walBfPendHdr(pWal), sizeof(WalIndexHdr));
+  if( pend.isInit==0 ) return;
+  walChecksumBytes(1, (u8*)&pend, offsetof(WalIndexHdr, aCksum), 0, aCk);
+  if( aCk[0]!=pend.aCksum[0] || aCk[1]!=pend.aCksum[1] ) return;
+  if( memcmp(pend.aSalt, pOut->aSalt, sizeof(pend.aSalt))!=0 ) return;
+  if( pend.mxFrame<=pOut->mxFrame ) return;
+  *pOut = pend;
+}
+/* Is the deferred commit (iFrame of generation aSalt) published? */
+static int walBfPublished(Wal *pWal, u32 iFrame, const u32 *aSalt){
+  WalIndexHdr h;
+  memcpy(&h, (void*)walIndexHdr(pWal), sizeof(h));
+  /* Another generation: the log was restarted, which needs every frame
+  ** backfilled -- and only published frames are backfilled. */
+  if( memcmp(h.aSalt, aSalt, sizeof(h.aSalt))!=0 ) return 1;
+  return h.mxFrame>=iFrame;
+}
+
+/* Per-process leader mutexes, one per log file (by name). */
+typedef struct WalBfGroup WalBfGroup;
+struct WalBfGroup {
+  char *zName;
+  int nRef;
+  sqlite3_mutex *pLeader;
+  WalBfGroup *pNext;
+};
+static WalBfGroup *walBfGroupList = 0;
+static WalBfGroup *walBfGroupAttach(const char *zName){
+  sqlite3_mutex *pReg = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_VFS3);
+  WalBfGroup *g;
+  sqlite3_mutex_enter(pReg);
+  for(g=walBfGroupList; g; g=g->pNext){
+    if( strcmp(g->zName, zName)==0 ) break;
+  }
+  if( g==0 ){
+    int n = sqlite3Strlen30(zName);
+    g = (WalBfGroup*)sqlite3MallocZero(sizeof(*g) + n + 1);
+    if( g ){
+      g->zName = (char*)&g[1];
+      memcpy(g->zName, zName, n+1);
+      g->pLeader = sqlite3MutexAlloc(SQLITE_MUTEX_FAST);
+      if( g->pLeader==0 && sqlite3GlobalConfig.bCoreMutex ){
+        sqlite3_free(g);
+        g = 0;
+      }else{
+        g->pNext = walBfGroupList;
+        walBfGroupList = g;
+      }
+    }
+  }
+  if( g ) g->nRef++;
+  sqlite3_mutex_leave(pReg);
+  return g;
+}
+static void walBfGroupDetach(WalBfGroup *g){
+  sqlite3_mutex *pReg;
+  if( g==0 ) return;
+  pReg = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_VFS3);
+  sqlite3_mutex_enter(pReg);
+  if( --g->nRef==0 ){
+    WalBfGroup **pp;
+    for(pp=&walBfGroupList; *pp; pp=&(*pp)->pNext){
+      if( *pp==g ){ *pp = g->pNext; break; }
+    }
+    sqlite3_mutex_free(g->pLeader);
+    sqlite3_free(g);
+  }
+  sqlite3_mutex_leave(pReg);
+}
+#endif /* SQLITE_OMIT_BF_CACHE */
 
 /*
 ** This function encodes a single frame header and writes it to a buffer
@@ -1891,6 +2023,8 @@ static int walIndexRecover(Wal *pWal){
         SEH_SET_ON_ERROR(0,0);
         nHdr = (iPg==0 ? WALINDEX_HDR_SIZE : 0);
         nHdr32 = nHdr / sizeof(u32);
+        /* C4c: recovery publishes every commit it finds; no pending head. */
+        if( iPg==0 ) memset(&((u8*)aPrivate)[WAL_BF_PEND_OFF], 0, sizeof(WalIndexHdr));
         memcpy(&aShare[nHdr32], &aPrivate[nHdr32], WALINDEX_PGSZ-nHdr);
         SEH_INJECT_FAULT;
         if( rc!=SQLITE_OK ) break;
@@ -2879,6 +3013,15 @@ static int walCheckpoint(
   if( rc==SQLITE_OK && eMode!=SQLITE_CHECKPOINT_PASSIVE ){
     assert( pWal->writeLock );
     SEH_INJECT_FAULT;
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* C4c: commits written but not yet published (waiting for their group
+    ** fsync) are part of the log: restarting over them would erase them. */
+    WalIndexHdr bfHead;
+    walBfWriterHead(pWal, &bfHead);
+    if( pInfo->nBackfill<bfHead.mxFrame ){
+      rc = SQLITE_BUSY;
+    }else
+#endif
     if( pInfo->nBackfill<pWal->hdr.mxFrame ){
       rc = SQLITE_BUSY;
     }else if( eMode>=SQLITE_CHECKPOINT_RESTART ){
@@ -3093,6 +3236,7 @@ int sqlite3WalClose(
     WALTRACE(("WAL%p: closed\n", pWal));
     sqlite3_free((void *)pWal->apWiData);
 #ifndef SQLITE_OMIT_BF_CACHE
+    walBfGroupDetach(pWal->pBfGroup);
     sqlite3BfWalIndexFree(pWal->pBfWal);
     sqlite3WalBfStageClear(pWal);
     sqlite3_free(pWal->apBfStage);
@@ -3836,6 +3980,24 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
     */
     pWal->minFrame = AtomicLoad(&pInfo->nBackfill)+1; SEH_INJECT_FAULT;
     walShmBarrier(pWal);
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* C4c: a writer re-taking its read lock (walUpgradeReadlock) works on the
+    ** writers' head, which can be ahead of the published header while group
+    ** commits wait for their fsync; comparing it with the published one
+    ** retried forever and returned SQLITE_PROTOCOL (mt_oracle). */
+    if( useWal && pWal->writeLock ){
+      WalIndexHdr bfHead;
+      walBfWriterHead(pWal, &bfHead);
+      if( AtomicLoad(pInfo->aReadMark+mxI)!=mxReadMark
+       || memcmp(&bfHead, &pWal->hdr, sizeof(WalIndexHdr)) ){
+        walUnlockShared(pWal, WAL_READ_LOCK(mxI));
+        return WAL_RETRY;
+      }
+      assert( mxReadMark<=pWal->hdr.mxFrame );
+      pWal->readLock = (i16)mxI;
+      return SQLITE_OK;
+    }
+#endif
     if( AtomicLoad(pInfo->aReadMark+mxI)!=mxReadMark
      || memcmp((void *)walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr))
     ){
@@ -4346,9 +4508,17 @@ int sqlite3WalBeginWriteTransaction(Wal *pWal){
     ** the write is disallowed. Release the WRITER lock and return
     ** SQLITE_BUSY_SNAPSHOT in this case.  */
     SEH_TRY {
+#ifndef SQLITE_OMIT_BF_CACHE
+      WalIndexHdr bfHead;
+      walBfWriterHead(pWal, &bfHead);      /* C4c: pending commits count */
+      if( memcmp(&pWal->hdr, &bfHead, sizeof(WalIndexHdr))!=0 ){
+        rc = SQLITE_BUSY_SNAPSHOT;
+      }
+#else
       if( memcmp(&pWal->hdr, (void*)walIndexHdr(pWal),sizeof(WalIndexHdr))!=0 ){
         rc = SQLITE_BUSY_SNAPSHOT;
       }
+#endif
     }
     SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
     if( rc!=SQLITE_OK ){
@@ -4412,7 +4582,11 @@ static int walLockForCommit(
   if( rc==SQLITE_OK ){
     WalIndexHdr head;
 
-    if( walIndexLoadHdr(pWal, &head) ){
+    int bBadHdr = walIndexLoadHdr(pWal, &head);
+#ifndef SQLITE_OMIT_BF_CACHE
+    if( !bBadHdr ) walBfWriterHead(pWal, &head);   /* C4c: pending commits too */
+#endif
+    if( bBadHdr ){
       /* This branch is taken if the wal-index header is corrupted. This 
       ** occurs if some other writer has crashed while committing a 
       ** transaction to this database since the current concurrent transaction
@@ -4567,7 +4741,11 @@ int sqlite3WalUpgradeSnapshot(Wal *pWal){
 
   SEH_TRY {
     assert( pWal->szPage==pWal->hdr.szPage );
+#ifndef SQLITE_OMIT_BF_CACHE
+    walBfWriterHead(pWal, &pWal->hdr);       /* C4c: the writers' head */
+#else
     memcpy(&pWal->hdr, (void*)walIndexHdr(pWal), sizeof(WalIndexHdr));
+#endif
     assert( pWal->szPage==pWal->hdr.szPage || pWal->szPage==0 );
     pWal->szPage = pWal->hdr.szPage;
 
@@ -4587,6 +4765,70 @@ int sqlite3WalUpgradeSnapshot(Wal *pWal){
 ** End a write transaction.  The commit has already been done.  This
 ** routine merely releases the lock.
 */
+#ifndef SQLITE_OMIT_BF_CACHE
+/* C4c: take the WRITE lock for the leader's two short steps, waiting for the
+** committer that holds it (a commit holds it for its validation and write;
+** a non-CONCURRENT writer for its whole transaction). */
+static int walBfLockWrite(Wal *pWal){
+  int rc, n = 0;
+  while( (rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1))==SQLITE_BUSY ){
+    if( ++n > 1000000 ) return SQLITE_BUSY;       /* about a minute */
+    sqlite3OsSleep(pWal->pVfs, n<20 ? 5 : 50);
+  }
+  return rc;
+}
+/*
+** C4c: wait until the deferred commit (iBfWaitFrame) is durable and published,
+** running the fsync ourselves when no one else is.  The leader takes the
+** newest head under the write lock, fsyncs (which covers every frame written
+** before that), and publishes that head under the write lock, unless a newer
+** one is already published.  Threads of this process queue on the leader
+** mutex, so one fsync serves everyone whose frames preceded it.
+*/
+static int walBfGroupWait(Wal *pWal, int bOwnCommit){
+  int rc = SQLITE_OK;
+  u32 iWait = pWal->iBfWaitFrame;
+  u32 aSalt[2];
+  int bLed = 0;
+  memcpy(aSalt, pWal->aBfWaitSalt, sizeof(aSalt));
+  if( pWal->pBfGroup==0 ) pWal->pBfGroup = walBfGroupAttach(pWal->zWalName);
+  SEH_TRY {
+    while( !walBfPublished(pWal, iWait, aSalt) ){
+      WalIndexHdr h;
+      if( pWal->pBfGroup ) sqlite3_mutex_enter(pWal->pBfGroup->pLeader);
+      if( walBfPublished(pWal, iWait, aSalt) ){
+        if( pWal->pBfGroup ) sqlite3_mutex_leave(pWal->pBfGroup->pLeader);
+        break;
+      }
+      rc = walBfLockWrite(pWal);
+      if( rc==SQLITE_OK ){
+        walBfWriterHead(pWal, &h);
+        walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+        rc = sqlite3OsSync(pWal->pWalFd, WAL_SYNC_FLAGS(pWal->bfWaitSync));
+        pWal->nBfGroupSync++;
+        bLed = 1;
+      }
+      if( rc==SQLITE_OK ) rc = walBfLockWrite(pWal);
+      if( rc==SQLITE_OK ){
+        WalIndexHdr cur;
+        memcpy(&cur, (void*)walIndexHdr(pWal), sizeof(cur));
+        if( memcmp(cur.aSalt, h.aSalt, sizeof(cur.aSalt))==0
+         && cur.mxFrame<h.mxFrame ){
+          walBfPublishHdr(pWal, &h);
+        }
+        walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+      }
+      if( pWal->pBfGroup ) sqlite3_mutex_leave(pWal->pBfGroup->pLeader);
+      if( rc!=SQLITE_OK ) break;
+    }
+  }
+  SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  if( rc==SQLITE_OK && !bLed && bOwnCommit ) pWal->nBfGroupFree++;
+  pWal->iBfWaitFrame = 0;
+  return rc;
+}
+#endif
+
 int sqlite3WalEndWriteTransaction(Wal *pWal){
   if( pWal->writeLock ){
     walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
@@ -4596,6 +4838,42 @@ int sqlite3WalEndWriteTransaction(Wal *pWal){
   }
   return SQLITE_OK;
 }
+
+#ifndef SQLITE_OMIT_BF_CACHE
+/*
+** C4c: a deferred commit returns only once it is durable and visible.  Called
+** by the btree once the transaction is over -- after the read lock, too, is
+** released when nothing else holds it: a TRUNCATE checkpoint holding the
+** write lock waits for every reader, and a waiter that kept its read lock
+** while spinning for the write lock livelocked with it.
+*/
+int sqlite3WalBfGroupWait(Wal *pWal){
+  if( pWal==0 || pWal->iBfWaitFrame==0 ) return SQLITE_OK;
+  return walBfGroupWait(pWal, 1);
+}
+/*
+** C4c: make every pending group commit durable and published, as a leader
+** would.  For a non-CONCURRENT writer about to begin: it needs its snapshot to
+** be the writers' head, and a pending commit would refuse it with
+** SQLITE_BUSY_SNAPSHOT (the checkpoint's region transaction then slept in the
+** busy handler for as long as commits kept arriving).
+*/
+int sqlite3WalBfSyncPending(Wal *pWal){
+  int rc = SQLITE_OK;
+  WalIndexHdr h;
+  if( pWal==0 || pWal->nWiData<1 || pWal->apWiData[0]==0 ) return SQLITE_OK;
+  if( pWal->iBfWaitFrame ) return walBfGroupWait(pWal, 1);
+  SEH_TRY {
+    walBfWriterHead(pWal, &h);
+  }
+  SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  if( rc!=SQLITE_OK || h.mxFrame==0 ) return rc;
+  pWal->iBfWaitFrame = h.mxFrame;
+  memcpy(pWal->aBfWaitSalt, h.aSalt, sizeof(pWal->aBfWaitSalt));
+  pWal->bfWaitSync = SQLITE_SYNC_NORMAL;
+  return walBfGroupWait(pWal, 0);
+}
+#endif
 
 /*
 ** If any data has been written (but not committed) to the log file, this
@@ -4624,7 +4902,14 @@ int sqlite3WalUndo(
       /* Restore the clients cache of the wal-index header to the state it
       ** was in before the client began writing to the database.
       */
+#ifndef SQLITE_OMIT_BF_CACHE
+      /* C4c: to the WRITERS' head.  Frames between the published header and
+      ** it are other connections' commits, written and waiting for their
+      ** fsync: walCleanupHash below must not drop their index entries. */
+      walBfWriterHead(pWal, &pWal->hdr);
+#else
       memcpy(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr));
+#endif
 #ifndef SQLITE_OMIT_CONCURRENT
       if( bConcurrent ){
         pWal->hdr.aCksum[0]++;
@@ -5029,6 +5314,7 @@ static int walFrames(
 ){
 #ifndef SQLITE_OMIT_BF_CACHE
   u32 iBfBase = 0;                /* frames <= this were not written by this call */
+  u8 bBfArm = pWal->bBfGroupArm;  /* C4c: armed for this call only */
 #endif
   int rc;                         /* Used to catch return codes */
   u32 iFrame;                     /* Next frame address */
@@ -5052,6 +5338,9 @@ static int walFrames(
   assert( pList );
 #endif
   assert( pWal->writeLock );
+#ifndef SQLITE_OMIT_BF_CACHE
+  pWal->bBfGroupArm = 0;
+#endif
 
   /* If this frame set completes a transaction, then nTruncate>0.  If
   ** nTruncate==0 then this frame set does not complete the transaction. */
@@ -5064,10 +5353,23 @@ static int walFrames(
   }
 #endif
 
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* C4c: frames up to the writers' head belong to other commits, even when
+  ** they are not published yet: never overwrite them in place. */
+  {
+    WalIndexHdr bfLive;
+    walBfWriterHead(pWal, &bfLive);
+    (void)pLive;
+    if( memcmp(&pWal->hdr, &bfLive, sizeof(WalIndexHdr))!=0 ){
+      iFirst = bfLive.mxFrame+1;
+    }
+  }
+#else
   pLive = (WalIndexHdr*)walIndexHdr(pWal);
   if( memcmp(&pWal->hdr, (void *)pLive, sizeof(WalIndexHdr))!=0 ){
     iFirst = pLive->mxFrame+1;
   }
+#endif
 
   /* See if it is possible to write these frames into the start of the
   ** log file, instead of appending to it at pWal->hdr.mxFrame.
@@ -5292,6 +5594,21 @@ static int walFrames(
   ** sector boundary is synced; the part of the last frame that extends
   ** past the sector boundary is written after the sync.
   */
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* C4c: a group-commit commit fsyncs later, with others (walBfGroupWait). */
+  /* Never for a commit that began the log generation (iBfBase==0): writing
+  ** frame 1 may choose new salts (walWriteWalHeader), and until they are
+  ** published no one can tell its pending header from a stale one --
+  ** walBfWriterHead would ignore it, the next writer would write frame 1 over
+  ** it, and walBfPublished would take the salt change for a restart and
+  ** acknowledge it (4 threads, a TRUNCATE checkpoint at close: 15% of commits
+  ** lost). */
+  int bBfDefer = isCommit && WAL_SYNC_FLAGS(sync_flags)!=0
+              && bBfArm && !pWal->padToSectorBoundary && iBfBase>0;
+  if( bBfDefer ){
+    /* nothing here: the leader's fsync covers these frames */
+  }else
+#endif
   if( isCommit && WAL_SYNC_FLAGS(sync_flags)!=0 ){
     int bSync = 1;
     /* Padding repeats the final PAGE frame, so it cannot express a record-only
@@ -5367,6 +5684,20 @@ static int walFrames(
       pWal->hdr.nPage = nTruncate;
     }
     /* If this is a commit, update the wal-index header too. */
+#ifndef SQLITE_OMIT_BF_CACHE
+    if( isCommit && bBfDefer ){
+      /* C4c: not visible to readers yet: only the writers' head moves. */
+      WalIndexHdr h;
+      walBfPrepHdr(pWal, &h);
+      pWal->hdr = h;
+      memcpy((void*)walBfPendHdr(pWal), &h, sizeof(h));
+      pWal->iBfWaitFrame = iFrame;
+      memcpy(pWal->aBfWaitSalt, pWal->hdr.aSalt, sizeof(pWal->aBfWaitSalt));
+      pWal->bfWaitSync = sync_flags;
+      pWal->iCallback = iFrame;
+      pWal->nBfGroupDefer++;
+    }else
+#endif
     if( isCommit ){
       walIndexWriteHdr(pWal);
       pWal->iCallback = iFrame;
@@ -5526,6 +5857,15 @@ void sqlite3WalBfSeedDone(Wal *pWal){
 void sqlite3WalBfNoPersist(Wal *pWal){
   if( pWal ) pWal->bBfNoPersist = 1;
 }
+/* C4c: the next commit's frames may defer their fsync (BEGIN CONCURRENT). */
+void sqlite3WalBfArmGroupSync(Wal *pWal, int bOn){
+  if( pWal ) pWal->bBfGroupArm = (u8)(bOn!=0);
+}
+void sqlite3WalBfGroupStats(Wal *pWal, u64 *aOut){
+  aOut[0] = pWal ? pWal->nBfGroupDefer : 0;
+  aOut[1] = pWal ? pWal->nBfGroupSync : 0;
+  aOut[2] = pWal ? pWal->nBfGroupFree : 0;
+}
 /* C4b: the generation salt and head of the log as this connection sees it --
 ** a region segment records them, so the next checkpoint in the same
 ** generation writes only what changed after it. */
@@ -5632,7 +5972,7 @@ u32 sqlite3WalBfHeadFrame(Wal *pWal){
   ** single writer holding the write lock). */
   if( pWal->nWiData<1 || pWal->apWiData[0]==0 ) return pWal->hdr.mxFrame;
   SEH_TRY {
-    memcpy(&head, (void*)walIndexHdr(pWal), sizeof(head));
+    walBfWriterHead(pWal, &head);            /* C4c: pending commits too */
   }
   SEH_EXCEPT( return pWal->hdr.mxFrame; );
   return head.mxFrame;
@@ -5822,7 +6162,7 @@ static int walBfConcurrentScan(
   int rc = SQLITE_OK;
   *pbOther = 0;
   assert( pWal->writeLock );
-  memcpy(&head, (void*)walIndexHdr(pWal), sizeof(head));
+  walBfWriterHead(pWal, &head);              /* C4c: pending commits too */
   if( memcmp(head.aSalt, pWal->hdr.aSalt, 8)!=0 ) return SQLITE_BUSY_SNAPSHOT;
   if( head.mxFrame<=pWal->hdr.mxFrame ) return SQLITE_OK;
   if( pWal->iBfIngested!=pWal->hdr.mxFrame

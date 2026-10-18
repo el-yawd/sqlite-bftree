@@ -4732,6 +4732,25 @@ void sqlite3PagerBfFrameStats(Pager *pPager, u64 *pnRec, u64 *pnPage,
   }
 #endif
 }
+/* C4c: wait for this connection's deferred commit to be durable. */
+int sqlite3PagerBfGroupWait(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pPager->pWal ) return sqlite3WalBfGroupWait(pPager->pWal);
+#endif
+  return SQLITE_OK;
+}
+int sqlite3PagerBfSyncPending(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pPager->pWal ) return sqlite3WalBfSyncPending(pPager->pWal);
+#endif
+  return SQLITE_OK;
+}
+void sqlite3PagerBfGroupStats(Pager *pPager, u64 *aOut){
+  aOut[0] = aOut[1] = aOut[2] = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pPager->pWal ) sqlite3WalBfGroupStats(pPager->pWal, aOut);
+#endif
+}
 u64 sqlite3PagerBfLogBytes(Pager *pPager){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pPager->pWal ) return sqlite3WalBfLogBytes(pPager->pWal);
@@ -7159,6 +7178,12 @@ int sqlite3PagerCommitPhaseOne(
       }
       assert( rc==SQLITE_OK );
       if( pList || bRecCommit ){
+#ifndef SQLITE_OMIT_BF_CACHE
+        /* C4c: a BEGIN CONCURRENT commit may share its fsync with others
+        ** (it waits for it in sqlite3WalEndWriteTransaction). */
+        sqlite3WalBfArmGroupSync(pPager->pWal,
+                                 pPager->pAllRead!=0 && sqlite3BfGroupSync());
+#endif
         rc = pagerWalFrames(pPager, pList, pPager->dbSize, 1);
       }
       sqlite3PagerUnref(pPageOne);

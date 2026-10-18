@@ -1013,6 +1013,8 @@ SQLITE_PRIVATE void sqlite3BfBtreeGroupStagePending(Btree *p);
 SQLITE_PRIVATE void sqlite3BfBtreeGroupFree(BfCache *pBf);
 /* Transactions per record-frame group (PRAGMA bf_group_commit; 0/1 = off). */
 SQLITE_PRIVATE int sqlite3BfGroupCommitTxns(void);
+/* C4c: durable group commit on (PRAGMA bf_group_sync). */
+SQLITE_PRIVATE int sqlite3BfGroupSync(void);
 /* Merge-scan (Stage 2.2): flush table + drop merge state, revert to plain. */
 SQLITE_PRIVATE int sqlite3BfBtreeMergeBail(BtCursor *pCur);
 #if !defined(SQLITE_BF_NO_WRITEBACK_DELETE)

@@ -5090,6 +5090,16 @@ int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
   }
 
   btreeEndTransaction(p);
+#ifndef SQLITE_OMIT_BF_CACHE
+  /* C4c: a group-commit commit returns once its frames are durable. */
+  {
+    int rcW = sqlite3PagerBfGroupWait(p->pBt->pPager);
+    if( rcW!=SQLITE_OK ){
+      sqlite3BtreeLeave(p);
+      return rcW;
+    }
+  }
+#endif
   sqlite3BtreeLeave(p);
   return SQLITE_OK;
 }
@@ -14422,6 +14432,9 @@ static int bfCheckpointMaterialize(Btree *p, int bMerge){
   ** checkpoint -- did the same to a single writer's buffered rows.  The cost
   ** is the write lock on every checkpoint (SQLITE_BUSY if a commit holds it:
   ** the checkpoint is retried later, and the log is kept meanwhile). */
+  /* C4c: publish pending group commits first, or the write transaction below
+  ** is refused (its snapshot would be behind the writers' head). */
+  (void)sqlite3PagerBfSyncPending(pBt->pPager);
   rc = sqlite3BtreeBeginTrans(p, 1, 0);
 #ifdef SQLITE_BF_MCONN_TRACE
   { u32 aS[3]; sqlite3PagerBfSnapshot(pBt->pPager, aS);
