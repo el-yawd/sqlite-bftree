@@ -123,61 +123,95 @@ static void test_corrupt_header(void){
   CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_CORRUPT );
 }
 
-/* Index: ops come back per-page in log order; other pages unaffected. */
+/* Logical index (v5): a key's state is its LAST op; prune drops ops past the cut. */
+static void mkKey(u8 *k, int n){ memset(k, 0, 8); k[0]=0x80; k[6]=(u8)(n>>8); k[7]=(u8)n; }
+static void addOp(BfWalIndex *ix, u32 root, int key, int op, const char *v, u32 iFrame){
+  BfWalRec r; u8 k[8];
+  mkKey(k, key);
+  r.pgno=9; r.rootPgno=root; r.op=(u8)op; r.nKey=8; r.pKey=k;
+  r.nVal = v ? (u32)strlen(v) : 0; r.pVal=(const u8*)v;
+  CHECK( sqlite3BfWalIndexAppend(ix,&r,iFrame)==BFWAL_OK );
+}
+static void addMerged(BfWalIndex *ix, u32 root, int lo, int hi, u32 snap, u32 start,
+                      u32 iFrame){
+  BfWalRec r; u8 k[16], v[8];
+  mkKey(k, lo); mkKey(k+8, hi);
+  v[0]=(u8)(snap>>24); v[1]=(u8)(snap>>16); v[2]=(u8)(snap>>8); v[3]=(u8)snap;
+  v[4]=(u8)(start>>24); v[5]=(u8)(start>>16); v[6]=(u8)(start>>8); v[7]=(u8)start;
+  r.pgno=9; r.rootPgno=root; r.op=BFWAL_OP_MERGED; r.nKey=16; r.pKey=k; r.nVal=8; r.pVal=v;
+  CHECK( sqlite3BfWalIndexAppend(ix,&r,iFrame)==BFWAL_OK );
+}
+static int stateOf(BfWalIndex *ix, u32 root, int key, u32 mx, int keep, const char **pv){
+  BfKeyState st; u8 k[8];
+  mkKey(k, key);
+  sqlite3BfWalIndexKeyState(ix, root, k, mx, keep, &st);
+  if( pv ) *pv = st.op==BFWAL_OP_INSERT ? (const char*)st.pVal : 0;
+  return st.op;
+}
 static void test_index_order(void){
   BfWalIndex *ix = sqlite3BfWalIndexNew();
-  BfWalRec r;
-  int i;
+  const char *v;
   CHECK( ix!=0 );
-  /* Interleave three pages; values encode (pgno, seq) so order is checkable. */
-  for(i=0;i<30;i++){
-    u8 key[1]; u8 val[2];
-    u32 pg = (u32)(1 + (i%3));
-    key[0]=(u8)i; val[0]=(u8)pg; val[1]=(u8)i;
-    r.pgno=pg; r.rootPgno=50+pg; r.op=(i&1)?BFWAL_OP_DELETE:BFWAL_OP_INSERT;
-    r.nKey=1; r.pKey=key; r.nVal=(i&1)?0:2; r.pVal=(i&1)?0:val;
-    CHECK( sqlite3BfWalIndexAppend(ix,&r,(u32)(100+i))==BFWAL_OK );
-  }
-  CHECK( sqlite3BfWalIndexPageCount(ix,1)==10 );
-  CHECK( sqlite3BfWalIndexPageCount(ix,2)==10 );
-  CHECK( sqlite3BfWalIndexPageCount(ix,3)==10 );
-  CHECK( sqlite3BfWalIndexPageCount(ix,4)==0 );
-  /* Page 1 got i = 0,3,6,...,27; verify log order preserved via val[1]. */
-  for(i=0;i<10;i++){
-    CHECK( sqlite3BfWalIndexGet(ix,1,i,&r)==BFWAL_OK );
-    CHECK( r.pgno==1 && r.rootPgno==51 );
-    if( r.op==BFWAL_OP_INSERT ){ CHECK( r.nVal==2 && r.pVal[1]==(u8)(i*3) ); }
-  }
-  CHECK( sqlite3BfWalIndexGet(ix,1,10,&r)==BFWAL_DONE );
+  addOp(ix, 2, 1, BFWAL_OP_INSERT, "a", 10);
+  addOp(ix, 2, 1, BFWAL_OP_INSERT, "bb", 11);
+  addOp(ix, 3, 1, BFWAL_OP_INSERT, "other-table", 11);
+  addOp(ix, 2, 2, BFWAL_OP_INSERT, "x", 12);
+  addOp(ix, 2, 2, BFWAL_OP_DELETE, 0, 13);
+  CHECK( sqlite3BfWalIndexKeyCount(ix)==3 );
+  CHECK( stateOf(ix,2,1,100,0,&v)==BFWAL_OP_INSERT && v && memcmp(v,"bb",2)==0 );
+  CHECK( stateOf(ix,3,1,100,0,&v)==BFWAL_OP_INSERT && memcmp(v,"other-table",11)==0 );
+  CHECK( stateOf(ix,2,2,100,0,0)==BFWAL_OP_DELETE );
+  CHECK( stateOf(ix,2,3,100,0,0)==-1 );                  /* no op */
+  /* Torn tail: ops past mxFrame are ignored unless bKeepBeyond. */
+  CHECK( stateOf(ix,2,1,10,0,&v)==BFWAL_OP_INSERT && memcmp(v,"a",1)==0 );
+  CHECK( stateOf(ix,2,1,10,1,&v)==BFWAL_OP_INSERT && memcmp(v,"bb",2)==0 );
+  CHECK( stateOf(ix,2,2,12,0,0)==BFWAL_OP_INSERT );
+  sqlite3BfWalIndexPrune(ix, 11);
+  CHECK( stateOf(ix,2,2,100,0,0)==-1 );                  /* 12, 13 pruned */
+  CHECK( stateOf(ix,2,1,100,0,&v)==BFWAL_OP_INSERT && memcmp(v,"bb",2)==0 );
+  sqlite3BfWalIndexFree(ix);
+}
 
-  /* The frame tag round-trips, and prune drops exactly the ops carried by
-  ** frames past the cut: page 1 holds frames 100,103,...,127. */
-  CHECK( sqlite3BfWalIndexGet(ix,1,4,&r)==BFWAL_OK && r.iFrame==112 );
-  sqlite3BfWalIndexPrune(ix, 112);
-  CHECK( sqlite3BfWalIndexPageCount(ix,1)==5 );   /* 100..112 */
-  CHECK( sqlite3BfWalIndexPageCount(ix,2)==4 );   /* 101..110 */
-  CHECK( sqlite3BfWalIndexPageCount(ix,3)==4 );   /* 102..111 */
-  sqlite3BfWalIndexPrune(ix, 0);
-  CHECK( sqlite3BfWalIndexPageCount(ix,1)==0 );
-
+/* MERGED markers (v5): cover earlier ops on keys in [lo,hi] of the table, not
+** later ones, not other tables, not ops in frames (snap, start), and are never
+** honoured past mxFrame. */
+static void test_index_markers(void){
+  BfWalIndex *ix = sqlite3BfWalIndexNew();
+  addOp(ix, 2, 5, BFWAL_OP_INSERT, "old5", 10);
+  addOp(ix, 2, 6, BFWAL_OP_INSERT, "old6", 10);
+  addOp(ix, 2, 9, BFWAL_OP_INSERT, "out9", 10);           /* outside the range */
+  addOp(ix, 3, 5, BFWAL_OP_INSERT, "t3", 10);             /* other table */
+  addOp(ix, 2, 7, BFWAL_OP_INSERT, "foreign7", 12);       /* in (snap=11, start=14) */
+  addMerged(ix, 2, 5, 8, 11, 14, 14);                     /* a merge, commit at 14 */
+  addOp(ix, 2, 6, BFWAL_OP_INSERT, "new6", 14);           /* after the marker */
+  CHECK( stateOf(ix,2,5,100,0,0)==-1 );                   /* covered: in base */
+  CHECK( stateOf(ix,2,6,100,0,0)==BFWAL_OP_INSERT );      /* later op wins */
+  CHECK( stateOf(ix,2,9,100,0,0)==BFWAL_OP_INSERT );
+  CHECK( stateOf(ix,3,5,100,0,0)==BFWAL_OP_INSERT );
+  CHECK( stateOf(ix,2,7,100,0,0)==BFWAL_OP_INSERT );      /* not in its image */
+  CHECK( stateOf(ix,2,5,13,0,0)==BFWAL_OP_INSERT );       /* marker past the end */
+  addOp(ix, 2, 8, BFWAL_OP_INSERT, "own8", 14);           /* own commit, after */
+  addMerged(ix, 2, 8, 8, 11, 14, 15);                     /* same commit, later frame */
+  CHECK( stateOf(ix,2,8,100,0,0)==-1 );                   /* own frame >= start */
+  sqlite3BfWalIndexPrune(ix, 13);                         /* both markers go */
+  CHECK( stateOf(ix,2,5,100,0,0)==BFWAL_OP_INSERT );
   sqlite3BfWalIndexFree(ix);
 }
 
 /* Idempotence proxy: scanning the same record frame into two indexes yields
-** identical per-page op sequences ("replay twice = replay once" building block). */
+** identical key states ("replay twice = replay once" building block). */
 static void test_index_from_frame(void){
   u8 buf[4096];
   BfWalBatch b;
   BfWalRec r;
   BfWalIndex *ix1, *ix2;
-  u32 pg;
   const char *v="xy";
   int i;
   sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
   for(i=0;i<50;i++){
-    u8 key[2]; key[0]=(u8)i; key[1]=(u8)(i>>8);
-    r.pgno=(u32)(1+(i%5)); r.rootPgno=77; r.op=BFWAL_OP_INSERT; r.nKey=2; r.pKey=key;
-    r.nVal=2; r.pVal=(const u8*)v;
+    u8 key[8]; mkKey(key, i%20);
+    r.pgno=(u32)(1+(i%5)); r.rootPgno=77; r.op=(i%7)?BFWAL_OP_INSERT:BFWAL_OP_DELETE;
+    r.nKey=8; r.pKey=key; r.nVal=r.op==BFWAL_OP_INSERT?2:0; r.pVal=(const u8*)v;
     CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
   }
   sqlite3BfWalBatchFinish(&b);
@@ -185,32 +219,25 @@ static void test_index_from_frame(void){
   ix2 = sqlite3BfWalIndexNew();
   CHECK( sqlite3BfWalIndexAddFrame(ix1, buf, sizeof(buf), 1)==BFWAL_OK );
   CHECK( sqlite3BfWalIndexAddFrame(ix2, buf, sizeof(buf), 1)==BFWAL_OK );
-  for(pg=1; pg<=5; pg++){
-    int n1 = sqlite3BfWalIndexPageCount(ix1,pg);
-    CHECK( n1==sqlite3BfWalIndexPageCount(ix2,pg) );
-    for(i=0;i<n1;i++){
-      BfWalRec a, c;
-      CHECK( sqlite3BfWalIndexGet(ix1,pg,i,&a)==BFWAL_OK );
-      CHECK( sqlite3BfWalIndexGet(ix2,pg,i,&c)==BFWAL_OK );
-      CHECK( a.rootPgno==77 && c.rootPgno==77 );
-      CHECK( a.op==c.op && a.nKey==c.nKey && a.nVal==c.nVal );
-      CHECK( a.nKey==0 || memcmp(a.pKey,c.pKey,a.nKey)==0 );
-    }
+  CHECK( sqlite3BfWalIndexKeyCount(ix1)==20 && sqlite3BfWalIndexKeyCount(ix2)==20 );
+  for(i=0;i<20;i++){
+    CHECK( stateOf(ix1,77,i,1,0,0)==stateOf(ix2,77,i,1,0,0) );
   }
   sqlite3BfWalIndexFree(ix1);
   sqlite3BfWalIndexFree(ix2);
 }
 
-/* BFWAL_OP_CLEAR (payload v3): round-trips between ordinary ops, and a CLEAR
-** carrying a key or value is refused by the encoder and rejected by the
-** decoder -- replay treats it as "drop every earlier op of this leaf", so a
-** malformed one must never be taken for a valid one. */
-static void test_clear_op(void){
+/* BFWAL_OP_MERGED (payload v5): round-trips between ordinary ops; a marker
+** whose key is not 16 bytes or whose value is not 8 is refused by the encoder
+** and rejected by the decoder, and the retired CLEAR op (2) no longer decodes. */
+static void test_merged_op(void){
   u8 buf[512];
   BfWalBatch b;
   BfWalIter it;
   BfWalRec r, o;
-  u8 key[8] = {0,0,0,0,0,0,0,7};
+  u8 key[8] = {0x80,0,0,0,0,0,0,7};
+  u8 range[16] = {0x80,0,0,0,0,0,0,1, 0x80,0,0,0,0,0,0,9};
+  u8 sv[8] = {0,0,0,5, 0,0,0,7};
   int n = 0;
   sqlite3BfWalBatchInit(&b, buf, sizeof(buf));
   memset(&r, 0, sizeof(r));
@@ -218,22 +245,35 @@ static void test_clear_op(void){
   r.nVal=1; r.pVal=(const u8*)"v";
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
   memset(&r, 0, sizeof(r));
-  r.pgno=9; r.rootPgno=2; r.op=BFWAL_OP_CLEAR;
+  r.pgno=9; r.rootPgno=2; r.op=BFWAL_OP_MERGED; r.nKey=16; r.pKey=range;
+  r.nVal=8; r.pVal=sv;
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_OK );
-  r.nKey=8; r.pKey=key;                               /* CLEAR with a key */
+  r.nKey=8;                                            /* short range */
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_FULL );
+  r.nKey=16; r.nVal=0;                                 /* no snap/start */
+  CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_FULL );
+  r.op=2; r.nKey=0; r.nVal=0;                          /* the retired CLEAR */
   CHECK( sqlite3BfWalBatchAppend(&b,&r)==BFWAL_FULL );
   sqlite3BfWalBatchFinish(&b);
   CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
   while( sqlite3BfWalIterNext(&it, &o)==BFWAL_OK ){
-    if( n==1 ){ CHECK( o.op==BFWAL_OP_CLEAR && o.nKey==0 && o.nVal==0 ); }
+    if( n==1 ){
+      CHECK( o.op==BFWAL_OP_MERGED && o.nKey==16 && o.nVal==8 );
+      CHECK( memcmp(o.pKey, range, 16)==0 && memcmp(o.pVal, sv, 8)==0 );
+    }
     n++;
   }
   CHECK( n==2 );
-  /* Hand-corrupt the CLEAR's keyLen varint (after leaf,root,op) to 1. */
+  /* Hand-corrupt the marker's keyLen varint (after leaf,root,op) to 15. */
   {
     int off = BFWAL_HDRSIZE + 4+4+1+1+1+8+1;     /* skip the INSERT record */
-    CHECK( buf[off+8]==BFWAL_OP_CLEAR );
-    buf[off+9] = 1;
+    CHECK( buf[off+8]==BFWAL_OP_MERGED );
+    buf[off+9] = 15;
+    CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
+    CHECK( sqlite3BfWalIterNext(&it, &o)==BFWAL_OK );
+    CHECK( sqlite3BfWalIterNext(&it, &o)==BFWAL_CORRUPT );
+    buf[off+9] = 16;
+    buf[off+8] = 2;                              /* the old CLEAR op */
     CHECK( sqlite3BfWalIterInit(&it, buf, sizeof(buf))==BFWAL_OK );
     CHECK( sqlite3BfWalIterNext(&it, &o)==BFWAL_OK );
     CHECK( sqlite3BfWalIterNext(&it, &o)==BFWAL_CORRUPT );
@@ -246,8 +286,9 @@ int main(void){
   test_corrupt_header();
   test_fuzz_bounds();
   test_index_order();
+  test_index_markers();
   test_index_from_frame();
-  test_clear_op();
+  test_merged_op();
   if( nFail==0 ) printf("wal_codec_test: ALL PASS\n");
   else printf("wal_codec_test: %d FAILURE(S)\n", nFail);
   return nFail!=0;

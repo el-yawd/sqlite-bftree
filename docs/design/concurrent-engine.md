@@ -277,3 +277,47 @@ durable default mode as "records reach the OS before COMMIT returns" (no fsync, 
 reference).  So group commit only changes `synchronous=FULL` numbers.  Recommendation: **D** for
 the thesis path (C3 next), and **A** behind a PRAGMA only if FULL-mode concurrent throughput is
 needed before C4, reported with its visibility caveat.  Owner decision.
+
+## 15. C3 implementation plan (2026-10-18)
+
+C3 makes the record log logical while it still rides SQLite's WAL (C4 replaces the WAL).
+
+**Format v5.**  Ops INSERT / DELETE keep their fields; the leaf page number becomes a HINT,
+never trusted for correctness.  CLEAR(leaf) is replaced by
+`MERGED(root, lo, hi, snap, start)`: "every op on a key in [lo, hi] of table `root` that
+precedes this marker is in base pages -- except ops in frames (snap, start)".  `lo`/`hi` are the
+smallest and largest key the merged mini-page held; `snap` is the merging transaction's
+snapshot frame and `start` the first frame of its own commit, so ops other transactions
+committed after its snapshot (BEGIN CONCURRENT) are NOT covered.  For a single writer
+snap = start-1 and the exception is empty.
+
+**Index.**  Keyed by (root, rowid), not by leaf: per key its ops in log order, per table its
+markers.  A key's replay state is its LAST op unless a marker covers it -- every op is a full
+value (P2), so earlier ops never matter.
+
+**Replay places by key.**  Each record goes into the mini-page of the leaf that holds its key
+NOW (a descent through interior pages, which stay resident outside the budget).  So a split or
+merge that moved a key cannot strand its record (the D1 / C1 hazard).  Incremental replay
+(catch-up, rebase, rollback) works on KEYS: those of new record ops, plus those of the dirty
+records in every leaf a page frame changed (whose mini-pages are dropped first).
+
+**C1 rules retired:** "another op on a leaf we wrote" (placement is by key now), "another op on a
+leaf we merged" (the marker's snap), "another CLEAR on a leaf we read" -- replaced by: a foreign
+MERGED conflicts iff our read set intersects [lo, hi] (a merge inside a transaction can apply
+writes that never become ops -- the P1 gap C4 closes by logging them).
+
+**Not in C3:** logging page-path writes as ops (the flush-before-page-write rules still order
+them), capturing merged in-transaction writes as ops, retiring the live-cache flush rules.
+
+**Implementation notes (built 2026-10-18).**  Two rules the plan above did not state, each found
+by a BEGIN CONCURRENT oracle failure:
+- A marker's `start` is the SHARED log head + 1 (`sqlite3WalBfHeadFrame`), read while the commit
+  holds the write lock.  The connection's own header is still its snapshot when the markers are
+  logged (btreeFixUnlocked upgrades it later in CommitPhaseOne), and a `start` taken from it
+  made the marker cover rows other transactions committed in between (mwriter_oracle seed 2).
+- The commit scan's placement descent (`sqlite3BfLeafForKeyCached`) reads NO page: it runs after
+  upstream's walLockForCommit has dropped the cached pages others changed and before the
+  snapshot upgrade, so a page read then comes from the old snapshot and outlives the upgrade --
+  a stale leaf that later served an old row (seed 3).  An uncached path falls back to the op's
+  hint.  Replay's own descent (`sqlite3BfLeafForKey`) reads pages normally, at a consistent
+  snapshot, and ignores BF's known-leaf bitmap (a page can have become interior).

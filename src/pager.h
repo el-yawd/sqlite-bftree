@@ -298,21 +298,26 @@ void sqlite3PagerBfStageClear(Pager *pPager);
 int sqlite3PagerIsWal(Pager *pPager);
 void sqlite3PagerBfFrameStats(Pager*, u64 *pnRec, u64 *pnPage, u64 *pnCommit);
 /* Phase 2 (WAL) rollback: rebuild the record cache from the committed log. */
-int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable);
+typedef u32 (*BfLeafFnP)(void*, u32, const unsigned char*);
+struct BfKeyRef;
+int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable,
+                            BfLeafFnP xLeaf, void *pLeafArg);
 int sqlite3PagerBfSnapshot(Pager *pPager, u32 *aOut);
 u64 sqlite3PagerBfReplayBound(Pager *pPager, BfCache *pBf);
 int sqlite3PagerBfTouched(Pager*, const u32 *aOld, u32 **paPg, int *pnPg);
+struct BfKeyRange; struct BfWalIndex;
+void sqlite3PagerBfTouchedKeys(Pager*, struct BfKeyRef**, int*, struct BfKeyRange**, int*);
+struct BfWalIndex *sqlite3PagerBfWalIndex(Pager*);
+u32 sqlite3PagerBfHeadFrame(Pager*);
 void sqlite3PagerBfTouchReset(Pager*);
 void sqlite3PagerBfSetCkptCap(Pager*);
 u64 sqlite3PagerBfSpillCount(Pager*);
 int sqlite3PagerBfPruneClean(Pager*);
 void sqlite3PagerBfDirtyPgnos(Pager*, u32**, int*);
-int sqlite3PagerBfReplayPages(Pager*, BfCache*, const u32 *aPg, int nPg);
+int sqlite3PagerBfReplayKeys(Pager*, BfCache*, const struct BfKeyRef*, int,
+                             BfLeafFnP, void*);
 #ifdef SQLITE_BF_CONCURRENT
 int sqlite3PagerBfPageWasRead(Pager*, Pgno);
-struct BfFitOp; struct BfMiniPage;
-int sqlite3PagerBfLeafFits(Pager*, BfCache*, Pgno, const struct BfFitOp*, int,
-                           struct BfMiniPage*);
 int sqlite3PagerBfConcurrentScan(Pager*, int(*)(void*,u32,u32,const u8*,int,int,int), void*, int*);
 #endif
 void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage);

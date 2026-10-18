@@ -257,18 +257,39 @@ static int bfApplyOneRecord(void *pCtx, const u8 *pKey, int nKey,
 ** grow, bFlushedOom makes the commit fail (sqlite3BfBtreeLogAllDirty): a commit
 ** that logged only SOME of its CLEARs would leave replayable ops behind a flush.
 */
-static void bfNoteFlushed(BfCache *pBf, Btree *pBtree, u32 leaf, u32 root){
+static void bfNoteFlushed(BfCache *pBf, Btree *pBtree, BfMiniPage *pMini,
+                          u32 root){
+  BfFlushRec *f;
+  int i, n, bAny = 0;
+  u32 leaf = pMini->ownerPgno;
   if( leaf==0 || root<=1 ) return;
   if( !sqlite3PagerIsWal(pBtree->pBt->pPager) ) return;
-  if( pBf->nFlushed+2 > pBf->nFlushedAlloc ){
-    int nNew = pBf->nFlushedAlloc ? pBf->nFlushedAlloc*2 : 32;
-    u32 *aNew = (u32*)sqlite3_realloc64(pBf->aFlushed, (u64)nNew*sizeof(u32));
+  if( pBf->nFlushed >= pBf->nFlushedAlloc ){
+    int nNew = pBf->nFlushedAlloc ? pBf->nFlushedAlloc*2 : 16;
+    BfFlushRec *aNew = (BfFlushRec*)sqlite3_realloc64(pBf->aFlushed,
+                                                      (u64)nNew*sizeof(BfFlushRec));
     if( aNew==0 ){ pBf->bFlushedOom = 1; return; }
     pBf->aFlushed = aNew;
     pBf->nFlushedAlloc = nNew;
   }
-  pBf->aFlushed[pBf->nFlushed++] = leaf;
-  pBf->aFlushed[pBf->nFlushed++] = root;
+  f = &pBf->aFlushed[pBf->nFlushed];
+  f->leaf = leaf;
+  f->root = root;
+  /* C3: the key range the merge applied -- its smallest and largest DIRTY
+  ** record (records are sorted by key, memcmp order = numeric order).  Every
+  ** logged op on a key in that range is in this mini-page (placement is by
+  ** key), so the MERGED marker covering [lo, hi] covers exactly what the merge
+  ** put into base. */
+  n = sqlite3BfMiniPageCount(pMini);
+  for(i=0; i<n; i++){
+    const u8 *pK; int nK, nV; u8 op;
+    if( !sqlite3BfMiniPageAt(pMini, i, &pK, &nK, 0, &nV, &op) || nK!=8 ) continue;
+    if( op!=BFOP_INSERT && op!=BFOP_DELETE ) continue;
+    if( !bAny ){ memcpy(f->lo, pK, 8); bAny = 1; }
+    memcpy(f->hi, pK, 8);
+  }
+  if( !bAny ) return;                       /* nothing applied */
+  pBf->nFlushed++;
 }
 
 static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
@@ -339,7 +360,7 @@ static int bfFlushOneMiniPage(BfCache *pBf, Btree *pBtree, Pgno pgnoRoot,
 
   /* Mark applied records clean; leave failed ones dirty for retry. */
   if( ctx.nErrors==0 ){
-    bfNoteFlushed(pBf, pBtree, pMini->ownerPgno, (u32)pgnoRoot);
+    bfNoteFlushed(pBf, pBtree, pMini, (u32)pgnoRoot);
     sqlite3BfMiniPageMarkClean(pMini);
     pBf->nMergeToBase += (u64)ctx.nApplied;
     if( pMini->flags & BF_MINI_F_STALE ){
@@ -650,25 +671,41 @@ static int bfLogAllCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
 }
 
 /*
-** Append a BFWAL_OP_CLEAR for every leaf this transaction flushed, and empty
+** Append a BFWAL_OP_MERGED for every leaf this transaction merged, and empty
 ** the list.  Returns how many were appended (0 on error: ctx->rc is set).
 **
 ** They go into the batch AHEAD of the commit's own dirty records: a record
-** buffered after the flush, in the same transaction, is newer than the page
-** image and must survive replay, while every op already in the log -- earlier
-** commits, and group batches a flush staged into this commit -- is older.
+** buffered after the merge, in the same transaction, is newer than the page
+** image and must survive replay (it follows the marker in the log), while
+** every op already in the log is older.  snap is the transaction's snapshot
+** frame, start the first frame of this commit (C3, bf_wal.h): ops other
+** transactions committed in between were not in our page images.
 */
 static int bfLogClears(BfCache *pBf, BfLogAllCtx *ctx){
   int i, n = 0;
-  for(i=0; i+1<pBf->nFlushed && ctx->rc==SQLITE_OK; i+=2){
+  u32 snap, start;
+  /* Our frames follow the HEAD of the log.  Inside a BEGIN CONCURRENT commit
+  ** this connection's own WAL header is still its snapshot at this point
+  ** (btreeFixUnlocked upgrades it later in CommitPhaseOne): taking start from
+  ** it made the marker cover rows other transactions committed in between
+  ** (mwriter_oracle seed 2, 2026-10-18). */
+  start = sqlite3PagerBfHeadFrame(ctx->pPager) + 1;
+  snap = pBf->bConcSnap ? pBf->iConcSnap : start - 1;
+  for(i=0; i<pBf->nFlushed && ctx->rc==SQLITE_OK; i++){
     BfWalRec rec;
+    u8 aKey[16], aVal[8];
+    memcpy(aKey, pBf->aFlushed[i].lo, 8);
+    memcpy(aKey+8, pBf->aFlushed[i].hi, 8);
+    aVal[0] = (u8)(snap>>24); aVal[1] = (u8)(snap>>16);
+    aVal[2] = (u8)(snap>>8);  aVal[3] = (u8)snap;
+    aVal[4] = (u8)(start>>24); aVal[5] = (u8)(start>>16);
+    aVal[6] = (u8)(start>>8);  aVal[7] = (u8)start;
     memset(&rec, 0, sizeof(rec));
-    rec.pgno = pBf->aFlushed[i];
-    rec.rootPgno = pBf->aFlushed[i+1];
-    rec.op = BFWAL_OP_CLEAR;
-#ifdef SQLITE_BF_MCONN_TRACE
-    fprintf(stderr, "  LOGCLEAR cache=%p leaf=%u\n", (void*)pBf, rec.pgno);
-#endif
+    rec.pgno = pBf->aFlushed[i].leaf;
+    rec.rootPgno = pBf->aFlushed[i].root;
+    rec.op = BFWAL_OP_MERGED;
+    rec.pKey = aKey; rec.nKey = 16;
+    rec.pVal = aVal; rec.nVal = 8;
     bfLogAppendRec(ctx, &rec);
     n++;
   }
@@ -1225,16 +1262,83 @@ static int bfSortPgno(const void *a, const void *b){
   return x<y ? -1 : x>y;
 }
 /*
-** Drop the nPg leaves aPg (sorted, distinct) from the cache -- mini-page, full
-** page, leaf bit, X1 tallies -- and replay each one's committed ops after its
-** last CLEAR: exactly what the full rebuild produces for those leaves.  The
-** replayed records are all in the committed log, so they are marked logged and
-** the unlogged list is emptied.  SQLITE_FULL: the replay did not fit beside the
-** rest of the cache (the caller rebuilds in full, which can resize the ring).
+** C3 key set for an incremental replay: a growable, then sorted and
+** de-duplicated, array of (root, key).
 */
-static int bfDropReplay(BfCache *pBf, Pager *pPager, const u32 *aPg, int nPg){
+typedef struct BfKeySet BfKeySet;
+struct BfKeySet { BfKeyRef *a; int n, nAlloc; int bOom; };
+static void bfKeySetAdd(BfKeySet *ks, u32 root, const u8 *pKey){
+  if( ks->bOom ) return;
+  if( ks->n>=ks->nAlloc ){
+    int nNew = ks->nAlloc ? ks->nAlloc*2 : 64;
+    BfKeyRef *aNew = (BfKeyRef*)sqlite3_realloc64(ks->a, (u64)nNew*sizeof(BfKeyRef));
+    if( aNew==0 ){ ks->bOom = 1; return; }
+    ks->a = aNew;
+    ks->nAlloc = nNew;
+  }
+  ks->a[ks->n].root = root;
+  memcpy(ks->a[ks->n].aKey, pKey, 8);
+  ks->n++;
+}
+static int bfKeyRefCmp(const void *a, const void *b){
+  const BfKeyRef *x = (const BfKeyRef*)a, *y = (const BfKeyRef*)b;
+  if( x->root!=y->root ) return x->root<y->root ? -1 : 1;
+  return memcmp(x->aKey, y->aKey, 8);
+}
+static void bfKeySetSort(BfKeySet *ks){
+  int i, j;
+  if( ks->n<2 ) return;
+  qsort(ks->a, (size_t)ks->n, sizeof(BfKeyRef), bfKeyRefCmp);
+  for(i=1, j=1; i<ks->n; i++){
+    if( bfKeyRefCmp(&ks->a[i], &ks->a[j-1])!=0 ) ks->a[j++] = ks->a[i];
+  }
+  ks->n = j;
+}
+typedef struct BfRangeCtx BfRangeCtx;
+struct BfRangeCtx { BfKeySet *ks; const BfKeyRange *aR; int nR; };
+static int bfKeyInRangeCallback(void *pCtx, u32 root, const u8 *pKey){
+  BfRangeCtx *c = (BfRangeCtx*)pCtx;
+  int i;
+  for(i=0; i<c->nR; i++){
+    const BfKeyRange *r = &c->aR[i];
+    if( r->root==root && memcmp(pKey, r->lo, 8)>=0 && memcmp(pKey, r->hi, 8)<=0 ){
+      bfKeySetAdd(c->ks, root, pKey);
+      break;
+    }
+  }
+  return BFWAL_OK;
+}
+static u32 bfLeafForKeyCb(void *pArg, u32 root, const u8 *pKey){
+  return sqlite3BfLeafForKey(pArg, root, pKey);
+}
+
+/*
+** C3 (2026-10-18): incremental replay, by key.  The leaves aPg[0..nPg) are
+** dropped (mini-page, full page, leaf bit, X1 tallies) after collecting the key
+** of every record they held; those keys, plus aKey[0..nKey), plus every key of
+** the log index inside one of the ranges aRange[0..nRange), are then replayed
+** from the log (sqlite3BfCacheReplayKeys): each retracted wherever it is cached
+** and rewritten from its last uncovered op on the leaf that holds it now.
+** Exactly what the full rebuild produces for those keys, and nothing else
+** changed.  The replayed records are all in the committed log, so they are
+** marked logged.  SQLITE_FULL: the replay did not fit (the caller rebuilds in
+** full, which can resize the ring).
+*/
+static int bfDropReplay(BfCache *pBf, Btree *p, const u32 *aPg, int nPg,
+                        const BfKeyRef *aKey, int nKey,
+                        const BfKeyRange *aRange, int nRange){
+  Pager *pPager = p->pBt->pPager;
+  BfKeySet ks;
   u64 nDropBefore;
   int i, rc;
+  memset(&ks, 0, sizeof(ks));
+  for(i=0; i<nKey; i++) bfKeySetAdd(&ks, aKey[i].root, aKey[i].aKey);
+  if( nRange>0 ){
+    BfRangeCtx rc2;
+    rc2.ks = &ks; rc2.aR = aRange; rc2.nR = nRange;
+    sqlite3BfWalIndexForEachKey(sqlite3PagerBfWalIndex(pPager),
+                                bfKeyInRangeCallback, &rc2);
+  }
   for(i=0; i<nPg; i++){
     BfMapEntry *pEntry;
     sqlite3BfLeafBitClear(pBf, aPg[i]);    /* a page frame may make it interior */
@@ -1244,21 +1348,35 @@ static int bfDropReplay(BfCache *pBf, Pager *pPager, const u32 *aPg, int nPg){
       pEntry->nAdHit = 0;
       pEntry->nAdMiss = 0;
       if( pEntry->locType==BF_LOC_MINI ){
+        BfMiniPage *pMini = (BfMiniPage*)pEntry->pPage;
+        if( pMini ){
+          int k, nRec = sqlite3BfMiniPageCount(pMini);
+          for(k=0; k<nRec; k++){
+            const u8 *pK; int nK, nV; u8 op;
+            if( sqlite3BfMiniPageAt(pMini, k, &pK, &nK, 0, &nV, &op) && nK==8 ){
+              bfKeySetAdd(&ks, pMini->rootPgno, pK);
+            }
+          }
+        }
         pEntry->locType = BF_LOC_NULL;     /* slab becomes an orphan */
         pEntry->pPage = 0;
       }
     }
   }
+  if( ks.bOom ){ sqlite3_free(ks.a); return SQLITE_FULL; }  /* rebuild in full */
+  bfKeySetSort(&ks);
   nDropBefore = pBf->nReplayDropped;
-  rc = sqlite3PagerBfReplayPages(pPager, pBf, aPg, nPg);
+  rc = sqlite3PagerBfReplayKeys(pPager, pBf, ks.a, ks.n, bfLeafForKeyCb, p->pBt);
+  sqlite3_free(ks.a);
   if( rc==SQLITE_OK && pBf->nReplayDropped!=nDropBefore ){
     pBf->nReplayDropped = nDropBefore;
     return SQLITE_FULL;
   }
   if( rc==SQLITE_OK ){
-    for(i=0; i<nPg; i++){
-      BfMapEntry *pEntry = sqlite3BfMapLookup(pBf, aPg[i]);
-      if( pEntry ) bfMarkLoggedCallback(0, aPg[i], pEntry);
+    /* Every record replay wrote is in the committed log: none of it is this
+    ** connection's to log. */
+    if( sqlite3BfUnlogListIterate(pBf, bfMarkLoggedCallback, 0) ){
+      sqlite3BfMapIterate(pBf, bfMarkLoggedCallback, 0);
     }
     sqlite3BfUnlogListReset(pBf);
   }
@@ -1295,7 +1413,12 @@ int sqlite3BfBtreeSnapshotAdvance(Btree *p){
       if( nPg==0 || aPg[nPg-1]!=aPg[i] ) aPg[nPg++] = aPg[i];
     }
   }
-  rc = bfDropReplay(pBf, pPager, aPg, nPg);
+  {
+    BfKeyRef *aKey = 0; BfKeyRange *aRange = 0;
+    int nKey = 0, nRange = 0;
+    sqlite3PagerBfTouchedKeys(pPager, &aKey, &nKey, &aRange, &nRange);
+    rc = bfDropReplay(pBf, p, aPg, nPg, aKey, nKey, aRange, nRange);
+  }
   if( rc==SQLITE_FULL ){
     /* Did not fit beside what the cache already holds: the full rebuild can
     ** resize the ring, and fails loudly if even that is not enough. */
@@ -1370,19 +1493,32 @@ int sqlite3BfBtreeRollbackIncremental(Btree *p, const u32 *aDirty, int nDirty,
   if( (aDirty==0 && nDirty>0) || !sqlite3PagerBfPruneClean(pPager) ){
     return 0;
   }
-  nAll = pBf->nTxnPg + nDirty + pBf->nFlushed/2;
-  aPg = (u32*)sqlite3_malloc64(sizeof(u32)*(u64)(nAll+1));
+  nAll = pBf->nTxnPg + nDirty + pBf->nFlushed;
+  aPg = (u32*)sqlite3_malloc64(sizeof(u32)*(u64)(nAll+1)
+                               + sizeof(BfKeyRange)*(u64)(pBf->nFlushed+1));
   if( aPg==0 ) return 0;
   nAll = 0;
   for(i=0; i<pBf->nTxnPg; i++) aPg[nAll++] = pBf->aTxnPg[i];
   for(i=0; i<nDirty; i++) aPg[nAll++] = aDirty[i];
-  for(i=0; i+1<pBf->nFlushed; i+=2) aPg[nAll++] = pBf->aFlushed[i];
+  for(i=0; i<pBf->nFlushed; i++) aPg[nAll++] = pBf->aFlushed[i].leaf;
   qsort(aPg, (size_t)nAll, sizeof(u32), bfSortPgno);
   for(i=0; i<nAll; i++){
     if( aPg[i]<=1 ) continue;
     if( nPg==0 || aPg[nPg-1]!=aPg[i] ) aPg[nPg++] = aPg[i];
   }
-  rc = bfDropReplay(pBf, pPager, aPg, nPg);
+  {
+    /* C3: the keys this transaction merged into base pages the rollback just
+    ** reverted -- their records were marked clean, and a later balance may
+    ** have dropped them from the cache altogether -- come back from the log
+    ** by range. */
+    BfKeyRange *aR = (BfKeyRange*)&aPg[nAll+1];
+    for(i=0; i<pBf->nFlushed; i++){
+      aR[i].root = pBf->aFlushed[i].root;
+      memcpy(aR[i].lo, pBf->aFlushed[i].lo, 8);
+      memcpy(aR[i].hi, pBf->aFlushed[i].hi, 8);
+    }
+    rc = bfDropReplay(pBf, p, aPg, nPg, 0, 0, aR, pBf->nFlushed);
+  }
   sqlite3_free(aPg);
   if( rc==SQLITE_FULL ) return 0;
   pBf->nFlushed = 0;         /* every flush of this txn was rolled back too */
@@ -1451,7 +1587,8 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
       if( cap>pBf->nRingPeak ) pBf->nRingPeak = cap;
     }
     nDropBefore = pBf->nReplayDropped;
-    rc = sqlite3PagerBfReplayLog(p->pBt->pPager, pBf, &bAllDurable);
+    rc = sqlite3PagerBfReplayLog(p->pBt->pPager, pBf, &bAllDurable,
+                                 bfLeafForKeyCb, p->pBt);
     g = (BfGroup*)pBf->pGroupCommit;
     if( rc==SQLITE_OK && g==0 && nStage>0 ){
       g = bfGroupGet(pBf, pBf->szPage);
@@ -1492,7 +1629,8 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
           }
         }
         if( rc==SQLITE_OK ){
-          rc = sqlite3BfCacheReplayWal(pBf, pTmp, 0xffffffffu, 1);
+          rc = sqlite3BfCacheReplayWal(pBf, pTmp, 0xffffffffu, 1,
+                                       bfLeafForKeyCb, p->pBt);
         }
       }
     }
@@ -3470,6 +3608,7 @@ void sqlite3BfRsEnd(BtShared *pBt){
     pBf->bRsActive = 0;
     pBf->bRsAll = 0;
     pBf->nRs = 0;
+    pBf->bConcSnap = 0;
   }
 }
 
@@ -3552,11 +3691,22 @@ static int bfRsHit(BfCache *pBf, u32 root, i64 key){
   return 0;
 }
 
+/* C3: did this transaction observe any key of [lo, hi] of table root? */
+static int bfRsHitRange(BfCache *pBf, u32 root, i64 lo, i64 hi){
+  int i;
+  if( pBf->bRsAll ) return 1;
+  for(i=0; i<pBf->nRs; i++){
+    const BfRsRange *r = &pBf->aRs[i];
+    if( r->root==root && r->lo<=hi && lo<=r->hi ) return 1;
+  }
+  return 0;
+}
+
 /* sqlite3PagerBfConcurrentScan callback: one record op another transaction
 ** committed after our snapshot.  Non-zero = conflict. */
 typedef struct BfRsCtx BfRsCtx;
 struct BfRsCtx {
-  BfCache *pBf; Pager *pPager;
+  BfCache *pBf; Pager *pPager; BtShared *pBt;
   /* Other commits' ops on leaves this transaction also buffered records on:
   ** checked for fit at the end of the scan (op -2). */
   BfFitOp *aFit; int nFit, nFitAlloc;
@@ -3587,8 +3737,8 @@ static int bfRsFitCheck(BfRsCtx *ctx){
     u32 leaf = ctx->aFit[i].leaf;
     for(j=0; j<i && ctx->aFit[j].leaf!=leaf; j++){}
     if( j<i ) continue;                      /* leaf already checked */
-    if( !sqlite3PagerBfLeafFits(ctx->pPager, ctx->pBf, leaf, ctx->aFit,
-                                ctx->nFit, bfRsOurUnlogged(ctx->pBf, leaf)) ){
+    if( !sqlite3BfCacheLeafFits(ctx->pBf, leaf, ctx->aFit, ctx->nFit,
+                                bfRsOurUnlogged(ctx->pBf, leaf)) ){
       ctx->pBf->nConcNoFit++;
       return 1;
     }
@@ -3653,53 +3803,34 @@ static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
     }
     return 0;
   }
-  if( op==BFWAL_OP_CLEAR ){
-    /* NOT purely physical.  CLEAR(leaf) says "every earlier op of this leaf is
-    ** in its base page", and replay drops those ops; when the merge applied a
-    ** delete of a row that existed only as a buffered insert, the base page is
-    ** unchanged -- no page frame at all -- and the CLEAR alone is what deletes
-    ** the row (mwriter_oracle seed 2 with MW_NORANGE: a concurrent DELETE was
-    ** undone by a transaction that read and merged the same leaf).  So a CLEAR
-    ** conflicts with any transaction that read or wrote that leaf. */
-    if( sqlite3PagerBfPageWasRead(pPager, leaf) ) return 1;
-    pPg = sqlite3PagerLookup(pPager, leaf);
-    if( pPg ){
-      int bWritten = sqlite3PagerIswriteable(pPg);
-      sqlite3PagerUnref(pPg);
-      if( bWritten ) return 1;
-    }
-    return 0;
+  if( op==BFWAL_OP_MERGED ){
+    /* C3: another transaction merged keys [lo, hi] into base pages.  Its
+    ** marker covers only ops up to its snapshot plus its own, so it cannot
+    ** hide an op of ours or of a third transaction; but a merge inside a
+    ** transaction can apply writes that never became ops (merged before its
+    ** commit logged them -- the P1 gap C4 closes), e.g. deleting a row that
+    ** existed only as a buffered insert, with no page frame at all.  So it
+    ** conflicts with a read of any key in the range. */
+    if( nKey!=16 ) return 1;
+    return bfRsHitRange(pBf, root, bfDecodeRowid(pKey), bfDecodeRowid(pKey+8));
   }
   pBf->nConcOps++;
-  /* This transaction WROTE page `leaf` -- a merge, a split, or a rebalance of
-  ** a sibling.  The op is keyed to that leaf, but our image of it was built
-  ** without the op and may have moved the op's key to another leaf: replayed
-  ** under `leaf`, the record would hide behind the older base cell wherever
-  ** the key lives now (mwriter_oracle seed 2: a merge of leaves 4 and 6
-  ** rebalanced leaf 9 while another transaction updated a key on it).  With
-  ** records keyed by leaf that is a conflict; logical keys (design P1) remove
-  ** it. */
-  pPg = sqlite3PagerLookup(pPager, leaf);
-  if( pPg ){
-    int bWritten = sqlite3PagerIswriteable(pPg);
-    sqlite3PagerUnref(pPg);
-    if( bWritten ) return 1;
-  }
-  /* This transaction MERGED leaf `leaf` (it will log CLEAR(leaf)) from its own
-  ** snapshot's base, which lacks this op.  In log order the op precedes our
-  ** CLEAR, so replay would skip it although our page image never applied it:
-  ** a lost committed row (mwriter_oracle seed 3: a concurrent DELETE came back
-  ** after the deleting transaction's leaf was merged by another).  Under the
-  ** current CLEAR format that is a conflict; the concurrent engine's
-  ** idempotent op log (docs/design/concurrent-engine.md P2) removes it. */
-  for(i=0; i+1<pBf->nFlushed; i+=2){
-    if( pBf->aFlushed[i]==leaf ) return 1;
-  }
+  /* C3: the C1 rules "an op on a leaf we wrote" and "an op on a leaf we
+  ** merged" are gone.  Replay places every record by key (a split we made
+  ** cannot strand it), and our MERGED marker does not cover ops committed after
+  ** our snapshot (its snap/start).  Only the row matters now. */
   if( nKey!=8 ) return 1;              /* not a rowid key: be conservative */
   if( bfRsHit(pBf, root, bfDecodeRowid(pKey)) ) return 1;
-  if( bfRsOurUnlogged(pBf, leaf) ){
-    bfRsFitAdd((BfRsCtx*)pCtx, leaf, pKey, nKey, nVal, op);
+  {
+    /* Capacity: group the op with this transaction's records by the leaf
+    ** that holds the key in our tree. */
+    u32 leafNow = sqlite3BfLeafForKeyCached(((BfRsCtx*)pCtx)->pBt, root, pKey);
+    if( leafNow==0 ) leafNow = leaf;     /* not cached: the writer's hint */
+    if( bfRsOurUnlogged(pBf, leafNow) ){
+      bfRsFitAdd((BfRsCtx*)pCtx, leafNow, pKey, nKey, nVal, op);
+    }
   }
+  (void)i;
   return 0;
 }
 
@@ -3716,11 +3847,8 @@ static int bfRsOpCallback(void *pCtx, u32 leaf, u32 root,
 ** allocated (pgno >= iFirst, the file size at its snapshot + 1) into that page:
 ** the rows then move with the page image.  Done before validation, from
 ** sqlite3BtreeExclusiveLock, so whatever the merge writes is validated like
-** any page write of the transaction.  The CLEARs of those pages are dropped:
-** a page this transaction allocated had no committed op keyed to it (a freed
-** page's records were flushed, with a CLEAR, when it was freed), and a CLEAR
-** logged under a number that then changes would erase the other transaction's
-** records on its page.
+** any page write of the transaction.  (Until C3 their CLEARs were dropped,
+** since a CLEAR was keyed by page number; MERGED markers are keyed by key.)
 */
 typedef struct BfNewPgCtx BfNewPgCtx;
 struct BfNewPgCtx { u32 iFirst; u32 *a; int n, nAlloc; int bOom; };
@@ -3763,13 +3891,9 @@ int sqlite3BfBtreeFlushNewPages(Btree *p, u32 iFirst){
     bfEscalateIfMisplaced(pBf, p, root, nBal);
   }
   sqlite3_free(c.a);
-  /* No CLEAR for a page this transaction allocated (see above). */
-  for(i=j=0; i+1<pBf->nFlushed; i+=2){
-    if( pBf->aFlushed[i]>=iFirst ) continue;
-    pBf->aFlushed[j++] = pBf->aFlushed[i];
-    pBf->aFlushed[j++] = pBf->aFlushed[i+1];
-  }
-  pBf->nFlushed = j;
+  /* C3: the MERGED markers of these merges are kept -- they are keyed by
+  ** key range, not by the page numbers the commit is about to change. */
+  (void)j;
   return SQLITE_OK;
 }
 
@@ -3790,6 +3914,15 @@ int sqlite3BfBtreeConcurrentValidate(Btree *p){
   memset(&ctx, 0, sizeof(ctx));
   ctx.pBf = pBf;
   ctx.pPager = p->pBt->pPager;
+  ctx.pBt = p->pBt;
+  {
+    /* C3: this transaction's snapshot frame, the snap of its MERGED markers
+    ** (the commit moves pWal->hdr to the head before it logs them). */
+    u32 aSnap[3] = {0,0,0};
+    sqlite3PagerBfSnapshot(p->pBt->pPager, aSnap);
+    pBf->iConcSnap = aSnap[0];
+    pBf->bConcSnap = 1;
+  }
   rc = sqlite3PagerBfConcurrentScan(p->pBt->pPager, bfRsOpCallback, &ctx, &bOther);
   sqlite3_free(ctx.aFit);
   if( rc==SQLITE_BUSY_SNAPSHOT ) pBf->nConcConflict++;

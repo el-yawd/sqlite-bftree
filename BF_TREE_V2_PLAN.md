@@ -3279,3 +3279,43 @@ Profile (`profile_arm.py`, parity34 cell 30, bf update=100) + replays of the sam
 - Group commit: **wait for C4** (design section 14, option D).
 - **C3 approved**, and with it P1-P5 replace the locked "CLEAR" decision on this branch
   (design doc status ADOPTED; CLAUDE.md locked-decisions note).
+
+### 2026-10-18 (cont.) — Claude Opus 5.5 — C3 built: a logical record log (format v5)
+
+Design doc section 15.  Summary of what landed:
+- **Format v5.**  The leaf number in an INSERT/DELETE op is only a hint now.  CLEAR is gone (the
+  codec rejects op 2).  `MERGED(root, lo, hi, snap, start)` covers earlier ops on keys in
+  [lo, hi], except ops in frames (snap, start).
+- **Index by key.**  `BfWalIndex` is keyed by (root, rowid).  Replay applies each key's last
+  uncovered op, placed by a descent into the leaf that holds the key now (`sqlite3BfLeafForKey`).
+- **Incremental replay works on keys**, in catch-up, BC rebase and incremental ROLLBACK
+  (`bfDropReplay`).  The keys come from three places: new ops, the index keys inside new MERGED
+  ranges, and every record of a leaf a page frame touched.
+- **C1 rules.**  "Op on a leaf we wrote" and "op on a leaf we merged" are retired.  The CLEAR rule
+  becomes "a foreign MERGED conflicts with any read in [lo, hi]".
+- **Codec tests**: index order, markers, from-frame, MERGED.
+
+Bugs found while building it, all in BEGIN CONCURRENT paths (the single-writer gate was green on
+the first run):
+1. **The marker's `start` came from the snapshot, not the head.**  It covered other
+   transactions' commits, so a row was lost (mwriter seed 2).  Fixed by taking it from the shared
+   head (`sqlite3WalBfHeadFrame`).
+2. **The commit scan read pages at the old snapshot** after upstream had dropped the stale ones.
+   The re-read stale page 9 outlived the snapshot upgrade and served an old row (seed 3).  Fixed
+   with a descent that only uses pages already in the cache (`sqlite3BfLeafForKeyCached`), falling
+   back to the op's hint.
+3. **`sqlite3WalBfHeadFrame` read the wal-index header outside SEH_TRY.**  In the debug build this
+   fired an assert; in the release build it aborted on an attached second pager.  This one fix
+   accounted for 6 red gate tasks: fullpage_reset, torn_tail, recover, and the mconn checkcommit
+   tasks.  It now falls back to the connection's own header when no wal-index is mapped.
+
+Verified:
+- `gate.py --full`: 58/58 green.
+- mwriter sweep, seeds 5-20 in all three modes: 432/432.
+- mt crash mode, seeds 11-13 under MALLOC_PERTURB_: OK.
+- mt sweep, seeds 5-16 with MT_SMALL=1: 108/108.
+
+Not measured: per the owner, there are no benchmarks at this stage.
+
+Next is C4: the BF log replaces the WAL, and group commit belongs to it (design section 14,
+option D).

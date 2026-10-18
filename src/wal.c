@@ -595,6 +595,14 @@ struct Wal {
   u32 nBfTouchPage;         /* database size (pages) at iBfTouchFrom */
   u32 aBfTouchSalt[2];
   u8 bBfTouchOk;
+  /* C3 (2026-10-18): the KEYS other commits' record ops changed, and the key
+  ** ranges their MERGED markers covered, over the same range.  Replay places
+  ** by key, so incremental invalidation re-replays keys; pages in aBfTouch are
+  ** those page frames changed (their cached copies and records are dropped). */
+  BfKeyRef *aBfTouchKey;
+  int nBfTouchKey, nBfTouchKeyAlloc;
+  BfKeyRange *aBfTouchRange;
+  int nBfTouchRange, nBfTouchRangeAlloc;
 #endif
   FastPrng sPrng;            /* Random number generator */
 #ifdef SQLITE_USE_SEH
@@ -2727,6 +2735,8 @@ int sqlite3WalClose(
     sqlite3WalBfStageClear(pWal);
     sqlite3_free(pWal->apBfStage);
     sqlite3_free(pWal->aBfTouch);
+    sqlite3_free(pWal->aBfTouchKey);
+    sqlite3_free(pWal->aBfTouchRange);
 #endif
     sqlite3_free(pWal);
   }
@@ -5040,6 +5050,69 @@ static void walBfTouch(Wal *pWal, u32 pgno){
   pWal->aBfTouch[pWal->nBfTouch++] = pgno;
 }
 
+/* C3: a record op of another commit changed this key. */
+static void walBfTouchKey(Wal *pWal, u32 root, const u8 *pKey, u32 nKey){
+  BfKeyRef *k;
+  if( !pWal->bBfTouchOk ) return;
+  if( nKey!=8 ){ pWal->bBfTouchOk = 0; return; }
+  if( pWal->nBfTouchKey>=pWal->nBfTouchKeyAlloc ){
+    int nNew = pWal->nBfTouchKeyAlloc ? pWal->nBfTouchKeyAlloc*2 : 64;
+    BfKeyRef *aNew;
+    if( nNew>WAL_BF_TOUCH_MAX ){ pWal->bBfTouchOk = 0; return; }
+    aNew = (BfKeyRef*)sqlite3_realloc(pWal->aBfTouchKey, nNew*(int)sizeof(BfKeyRef));
+    if( aNew==0 ){ pWal->bBfTouchOk = 0; return; }
+    pWal->aBfTouchKey = aNew;
+    pWal->nBfTouchKeyAlloc = nNew;
+  }
+  k = &pWal->aBfTouchKey[pWal->nBfTouchKey++];
+  k->root = root;
+  memcpy(k->aKey, pKey, 8);
+}
+/* C3: a MERGED marker of another commit covered this range.  Ranges are few
+** (one per merged leaf); a commit with many -- a checkpoint materialise --
+** is cheaper to absorb with a full rebuild. */
+#define WAL_BF_TOUCH_RANGE_MAX 64
+static void walBfTouchRange(Wal *pWal, const BfWalRec *r){
+  BfKeyRange *g;
+  if( !pWal->bBfTouchOk ) return;
+  if( r->nKey!=16 || pWal->nBfTouchRange>=WAL_BF_TOUCH_RANGE_MAX ){
+    pWal->bBfTouchOk = 0;
+    return;
+  }
+  if( pWal->nBfTouchRange>=pWal->nBfTouchRangeAlloc ){
+    int nNew = pWal->nBfTouchRangeAlloc ? pWal->nBfTouchRangeAlloc*2 : 8;
+    BfKeyRange *aNew = (BfKeyRange*)sqlite3_realloc(pWal->aBfTouchRange,
+                                                    nNew*(int)sizeof(BfKeyRange));
+    if( aNew==0 ){ pWal->bBfTouchOk = 0; return; }
+    pWal->aBfTouchRange = aNew;
+    pWal->nBfTouchRangeAlloc = nNew;
+  }
+  g = &pWal->aBfTouchRange[pWal->nBfTouchRange++];
+  g->root = r->rootPgno;
+  memcpy(g->lo, r->pKey, 8);
+  memcpy(g->hi, r->pKey+8, 8);
+}
+static void walBfTouchRec(Wal *pWal, const BfWalRec *r){
+  if( r->op==BFWAL_OP_MERGED ) walBfTouchRange(pWal, r);
+  else walBfTouchKey(pWal, r->rootPgno, r->pKey, r->nKey);
+}
+
+/* C3: the last committed frame at the head of the log -- the shared header,
+** not this connection's snapshot (they differ inside a BEGIN CONCURRENT commit
+** until btreeFixUnlocked upgrades it).  Meaningful under the write lock. */
+u32 sqlite3WalBfHeadFrame(Wal *pWal){
+  WalIndexHdr head;
+  if( pWal==0 ) return 0;
+  /* Without a mapped wal-index, the connection's own header (the head for a
+  ** single writer holding the write lock). */
+  if( pWal->nWiData<1 || pWal->apWiData[0]==0 ) return pWal->hdr.mxFrame;
+  SEH_TRY {
+    memcpy(&head, (void*)walIndexHdr(pWal), sizeof(head));
+  }
+  SEH_EXCEPT( return pWal->hdr.mxFrame; );
+  return head.mxFrame;
+}
+
 /* The materialise commit just made frames <= mxFrame safe to backfill. */
 void sqlite3WalBfSetCkptCap(Wal *pWal){
   if( pWal==0 ) return;
@@ -5110,7 +5183,7 @@ int sqlite3WalBfCatchUp(Wal *pWal){
         BfWalRec r;
         if( sqlite3BfWalIterInit(&it, &aFrame[WAL_FRAME_HDRSIZE], szPage)
               ==BFWAL_OK ){
-          while( sqlite3BfWalIterNext(&it, &r)==BFWAL_OK ) walBfTouch(pWal, r.pgno);
+          while( sqlite3BfWalIterNext(&it, &r)==BFWAL_OK ) walBfTouchRec(pWal, &r);
         }else{
           pWal->bBfTouchOk = 0;
         }
@@ -5149,11 +5222,22 @@ int sqlite3WalBfTouched(Wal *pWal, const u32 *aOld, u32 **paPg, int *pnPg){
   *pnPg = pWal->nBfTouch;
   return 1;
 }
+/* C3: the keys and ranges of the same touch list (valid after
+** sqlite3WalBfTouched returned 1). */
+void sqlite3WalBfTouchedKeys(Wal *pWal, BfKeyRef **paKey, int *pnKey,
+                             BfKeyRange **paRange, int *pnRange){
+  *paKey = pWal ? pWal->aBfTouchKey : 0;
+  *pnKey = pWal ? pWal->nBfTouchKey : 0;
+  *paRange = pWal ? pWal->aBfTouchRange : 0;
+  *pnRange = pWal ? pWal->nBfTouchRange : 0;
+}
 
 /* The record cache now reflects the current snapshot: start an empty list. */
 void sqlite3WalBfTouchReset(Wal *pWal){
   if( pWal==0 ) return;
   pWal->nBfTouch = 0;
+  pWal->nBfTouchKey = 0;
+  pWal->nBfTouchRange = 0;
   pWal->iBfTouchFrom = pWal->hdr.mxFrame;
   pWal->iBfTouchTo = pWal->hdr.mxFrame;
   pWal->nBfTouchPage = pWal->hdr.nPage;
@@ -5239,7 +5323,7 @@ static int walBfConcurrentScan(
               rc = SQLITE_BUSY_SNAPSHOT;
             }
           }else{
-            walBfTouch(pWal, r.pgno);
+            walBfTouchRec(pWal, &r);
           }
         }
       }

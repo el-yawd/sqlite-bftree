@@ -4521,6 +4521,30 @@ int sqlite3PagerBfSnapshot(Pager *pPager, u32 *aOut){
 ** Also 0 when a rollback left record ops past the log end (a replay would
 ** have to mark them unlogged; the full rebuild handles that).
 */
+/* C3: the keys / ranges of the touch list (after sqlite3PagerBfTouched==1). */
+void sqlite3PagerBfTouchedKeys(Pager *pPager, BfKeyRef **paKey, int *pnKey,
+                               BfKeyRange **paRange, int *pnRange){
+  *paKey = 0; *pnKey = 0; *paRange = 0; *pnRange = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ){
+    sqlite3WalBfTouchedKeys(pPager->pWal, paKey, pnKey, paRange, pnRange);
+  }
+#endif
+}
+/* C3: the head of the log (sqlite3WalBfHeadFrame); 0 outside WAL mode. */
+u32 sqlite3PagerBfHeadFrame(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) return sqlite3WalBfHeadFrame(pPager->pWal);
+#endif
+  return 0;
+}
+/* C3: this connection's logical op index (NULL outside WAL mode). */
+BfWalIndex *sqlite3PagerBfWalIndex(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) ) return sqlite3WalBfIndex(pPager->pWal);
+#endif
+  return 0;
+}
 int sqlite3PagerBfTouched(Pager *pPager, const u32 *aOld, u32 **paPg, int *pnPg){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pagerUseWal(pPager) && !sqlite3WalBfPrunePending(pPager->pWal) ){
@@ -4572,15 +4596,12 @@ void sqlite3PagerBfTouchReset(Pager *pPager){
 }
 /* Replay the committed record ops of the nPg leaves aPg (each after its last
 ** CLEAR), as sqlite3PagerBfReplayLog does for every leaf. */
-int sqlite3PagerBfReplayPages(Pager *pPager, BfCache *pBf,
-                              const u32 *aPg, int nPg){
+int sqlite3PagerBfReplayKeys(Pager *pPager, BfCache *pBf, const BfKeyRef *aKey,
+                             int nKey, BfLeafFn xLeaf, void *pLeafArg){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pBf && pagerUseWal(pPager) ){
-    BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
-    if( pWalIdx ){
-      return sqlite3BfCacheReplayPages(pBf, pWalIdx,
-                 sqlite3WalBfMxFrame(pPager->pWal), aPg, nPg);
-    }
+    return sqlite3BfCacheReplayKeys(pBf, sqlite3WalBfIndex(pPager->pWal),
+               sqlite3WalBfMxFrame(pPager->pWal), aKey, nKey, xLeaf, pLeafArg);
   }
 #endif
   return SQLITE_OK;
@@ -4590,15 +4611,6 @@ int sqlite3PagerBfReplayPages(Pager *pPager, BfCache *pBf,
 /* C1: true iff the current CONCURRENT transaction read page pgno. */
 int sqlite3PagerBfPageWasRead(Pager *pPager, Pgno pgno){
   return pPager->pAllRead!=0 && sqlite3BitvecTestNotNull(pPager->pAllRead, pgno);
-}
-/* C1: would leaf pgno's replay fit one mini-page (sqlite3BfCacheLeafFits)? */
-int sqlite3PagerBfLeafFits(Pager *pPager, BfCache *pBf, Pgno pgno,
-    const BfFitOp *aExtra, int nExtra, BfMiniPage *pOurs){
-  if( pPager && pBf && pagerUseWal(pPager) ){
-    return sqlite3BfCacheLeafFits(pBf, sqlite3WalBfIndex(pPager->pWal), pgno,
-               sqlite3WalBfMxFrame(pPager->pWal), aExtra, nExtra, pOurs);
-  }
-  return 1;
 }
 /* C1: record-level validation of a BEGIN CONCURRENT commit (wal.c). */
 int sqlite3PagerBfConcurrentScan(Pager *pPager,
@@ -4625,7 +4637,8 @@ u64 sqlite3PagerBfReplayBound(Pager *pPager, BfCache *pBf){
   return 0;
 }
 
-int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable){
+int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable,
+                            BfLeafFn xLeaf, void *pLeafArg){
   *pbAllDurable = 0;
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pBf && pagerUseWal(pPager) ){
@@ -4636,7 +4649,8 @@ int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable){
     *pbAllDurable = !sqlite3WalBfPrunePending(pPager->pWal);
     if( pWalIdx ){
       rc = sqlite3BfCacheReplayWal(pBf, pWalIdx,
-                                   sqlite3WalBfMxFrame(pPager->pWal), 1);
+                                   sqlite3WalBfMxFrame(pPager->pWal), 1,
+                                   xLeaf, pLeafArg);
     }
     if( rc==SQLITE_OK ) sqlite3WalBfPrune(pPager->pWal);
     return rc;

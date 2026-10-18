@@ -575,6 +575,24 @@ int sqlite3BfMiniPageHasHoles(BfMiniPage *pMini){
 }
 
 /*
+** Remove the record for key pKey, whatever its op, leaving its bytes as dead
+** space (a copy reclaims them).  Returns 1 if a record was removed.  Used by
+** incremental replay (C3) to retract a record before rewriting a key's state.
+*/
+int sqlite3BfMiniPageRemove(BfMiniPage *pMini, const void *pKey, int nKey){
+  BfKVMeta *aMeta;
+  int idx, found, i;
+  if( pMini->metaCount==0 ) return 0;
+  aMeta = bfMiniPageMeta(pMini);
+  idx = bfBinarySearch(pMini, (const u8*)pKey, nKey, &found);
+  if( !found ) return 0;
+  for(i = idx; i < pMini->metaCount - 1; i++) aMeta[i] = aMeta[i+1];
+  pMini->metaCount--;
+  pMini->freeSpace += (u16)sizeof(BfKVMeta);
+  return 1;
+}
+
+/*
 ** Check if mini-page has any dirty records.
 */
 int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini){

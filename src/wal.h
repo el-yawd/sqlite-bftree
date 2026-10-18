@@ -55,6 +55,7 @@
 #  define sqlite3WalBfPrune(x)
 #  define sqlite3WalBfPrunePending(x)            0
 #  define sqlite3WalBfSetCkptCap(x)
+#  define sqlite3WalBfHeadFrame(x)               0
 #  define sqlite3WalBfStageTake(x,y,z)           (*(y)=0, *(z)=0)
 # endif
 # undef SQLITE_USE_SEH
@@ -122,6 +123,9 @@ void sqlite3WalBfStageClear(Wal *pWal);
 typedef struct BfWalIndex BfWalIndex;
 BfWalIndex *sqlite3WalBfIndex(Wal *pWal);
 void sqlite3WalBfSetCkptCap(Wal *pWal);
+u32 sqlite3WalBfHeadFrame(Wal *pWal);
+struct BfKeyRef; struct BfKeyRange;
+void sqlite3WalBfTouchedKeys(Wal*, struct BfKeyRef**, int*, struct BfKeyRange**, int*);
 int sqlite3WalBfCatchUp(Wal *pWal);
 void sqlite3WalBfSnapshot(Wal *pWal, u32 *aOut);
 int sqlite3WalBfTouched(Wal *pWal, const u32 *aOld, u32 **paPg, int *pnPg);

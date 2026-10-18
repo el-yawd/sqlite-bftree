@@ -45,18 +45,22 @@
 /* Batch-payload header: magic(4) version(2) nRec(2) nUsed(4) = 12 bytes.  op
 ** values reuse the mini-page BFOP_* space; only the dirty ops are ever logged. */
 #define BFWAL_MAGIC     0x42465731u   /* "BFW1" */
-#define BFWAL_VERSION   4             /* v3: BFWAL_OP_CLEAR (2026-09-24); v4: rowid
-                                      ** keys sign-flipped (2026-10-01, bfEncodeRowid) */
+#define BFWAL_VERSION   5             /* v3: CLEAR (2026-09-24); v4: rowid keys sign-
+                                      ** flipped (2026-10-01); v5: logical ops, CLEAR
+                                      ** replaced by MERGED (2026-10-18, C3) */
 #define BFWAL_HDRSIZE   12
 #define BFWAL_OP_INSERT 0             /* == BFOP_INSERT */
 #define BFWAL_OP_DELETE 1             /* == BFOP_DELETE (valLen==0) */
-/* "Every earlier op of this leaf is now in base pages": logged by the commit
-** whose page images applied the leaf's buffered records (a flush).  Carries no
-** key and no value.  Replay starts each leaf after its last CLEAR -- the only
-** sound way to order a record op against page images, because a flush writes
-** a leaf's records wherever their keys now live, which after a split need not
-** be that leaf at all. */
-#define BFWAL_OP_CLEAR  2
+/* v5 (C3): "every op on a key in [lo, hi] of this table that precedes me in the
+** log is in base pages -- except ops in frames (snap, start)".  key = lo||hi
+** (two 8-byte encoded rowids), val = snap||start (two u32, big-endian); the
+** page number is the merged leaf, a hint only.  Logged by a commit whose page
+** images applied a mini-page's buffered records (a merge).  snap = the
+** merging transaction's snapshot frame, start = the first frame of its own
+** commit: ops other transactions committed after its snapshot (BEGIN
+** CONCURRENT) are not in its page images.  Replaces CLEAR(leaf), whose leaf
+** keying made every split a hazard. */
+#define BFWAL_OP_MERGED 3
 
 /* One logical record, as appended by the encoder or yielded by the iterator.
 ** On decode, pKey/pVal point INTO the source buffer (no copy). */
@@ -64,7 +68,7 @@ typedef struct BfWalRec BfWalRec;
 struct BfWalRec {
   u32       pgno;      /* Target leaf page number (nonzero) */
   u32       rootPgno;  /* Owning rowid-table root page (greater than 1) */
-  u8        op;      /* BFWAL_OP_INSERT or BFWAL_OP_DELETE */
+  u8        op;      /* BFWAL_OP_INSERT, BFWAL_OP_DELETE or BFWAL_OP_MERGED */
   u32       nKey;    /* Key length in bytes */
   u32       nVal;    /* Value length in bytes (0 for DELETE) */
   const u8 *pKey;    /* Key bytes */
@@ -120,31 +124,47 @@ int  sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec);
 */
 typedef struct BfWalIndex BfWalIndex;
 
+/* A (table, key) reference and a key range (C3); also in bf_cache.h. */
+#ifndef BF_KEYREF_DEFINED
+#define BF_KEYREF_DEFINED
+typedef struct BfKeyRef BfKeyRef;
+struct BfKeyRef { u32 root; u8 aKey[8]; };
+typedef struct BfKeyRange BfKeyRange;
+struct BfKeyRange { u32 root; u8 lo[8]; u8 hi[8]; };
+#endif
+
+/* The replay state of one key: its LAST op unless a MERGED marker covers it.
+** op = BFWAL_OP_INSERT / BFWAL_OP_DELETE, or -1 (no op, or covered: the base
+** pages hold the key's value).  pVal points into the index. */
+typedef struct BfKeyState BfKeyState;
+struct BfKeyState {
+  int       op;
+  const u8 *pVal;
+  u32       nVal;
+  u32       iFrame;
+  u32       hint;      /* the leaf the writer used (a hint) */
+};
+
 BfWalIndex *sqlite3BfWalIndexNew(void);
 void        sqlite3BfWalIndexFree(BfWalIndex *p);
 int         sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec,
                                     u32 iFrame);
-int         sqlite3BfWalIndexPageCount(BfWalIndex *p, u32 pgno);
-int         sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec);
+/* Ops past mxFrame are ignored unless bKeepBeyond; markers past mxFrame are
+** never honoured.  Returns 1 if the key has any op at all, else 0. */
+int         sqlite3BfWalIndexKeyState(BfWalIndex *p, u32 root, const u8 *pKey,
+                                      u32 mxFrame, int bKeepBeyond, BfKeyState*);
+int         sqlite3BfWalIndexForEachKey(BfWalIndex *p,
+                int (*xKey)(void *pCtx, u32 root, const u8 *pKey), void *pCtx);
+int         sqlite3BfWalIndexKeyCount(BfWalIndex *p);
 
-/* Feed every op of one record-batch frame payload into the index (recovery /
-** reader walk convenience).  Returns BFWAL_OK, BFWAL_CORRUPT (bad payload), or
-** BFWAL_NOMEM. */
+/* Feed every op of one record-batch frame payload into the index.  Returns
+** BFWAL_OK, BFWAL_CORRUPT (bad payload), or BFWAL_NOMEM. */
 int         sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf,
                                       u32 iFrame);
 
-/* Drop every op carried by a frame after mxFrame.  Those frames are no longer
-** part of the log -- a rollback or savepoint undo discarded them, or they are
-** the torn tail of a crashed commit -- and their numbers will be reused by the
-** next frames written, so an op left behind would later be ordered against the
-** wrong page image.  Pages left with no ops keep their (empty) node. */
+/* Drop every op and marker carried by a frame after mxFrame (a rollback or
+** savepoint undo discarded them, or they are a crashed commit's torn tail). */
 void        sqlite3BfWalIndexPrune(BfWalIndex *p, u32 mxFrame);
-
-/* Visit each distinct target pgno held in the index (any order).  The callback
-** may then walk that page's ops via PageCount/Get.  Iteration stops early if a
-** callback returns non-BFWAL_OK, and that code is returned. */
-int         sqlite3BfWalIndexForEachPage(BfWalIndex *p,
-                int (*xPage)(void *pCtx, u32 pgno), void *pCtx);
 
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */
 #endif /* SQLITE_BF_WAL_H */

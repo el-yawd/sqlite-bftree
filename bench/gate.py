@@ -180,6 +180,7 @@ def main():
     # every acknowledged commit survived.  Its own driver build: the sweep task
     # above may still be running from the same binary path.
     mtc = ccdrv("mt_crash", "mt_oracle.c", "-O1 -g")
+    mtp = ccdrv("mt_power", "mt_oracle.c", "-O1 -g")   # its own binary: tasks overlap
     nk = 4 if full else 1
     add("mt:crash", f"{mtc} && for s in $(seq 1 {nk}); do "
                     f"MT_SMALL=1 MT_KILL_MS=300 MT_ITERS=10 {work}/mt_crash {work}/mtc$s.db $s 4 1000000 "
@@ -187,10 +188,10 @@ def main():
     # Power cuts (same driver, MT_POWER): unsynced writes reverted -- all, or
     # torn at sectors.  FULL: every acknowledged commit survives; NORMAL: the
     # survivors are a per-thread prefix.  Atomicity and the invariant always.
-    add("mt:power", f"{mtc} && for s in $(seq 1 {nk}); do for m in all torn; do "
-                    f"MT_SMALL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
+    add("mt:power", f"{mtp} && for s in $(seq 1 {nk}); do for m in all torn; do "
+                    f"MT_SMALL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_power "
                     f"{work}/mtp$s$m.db $s 4 1000000 || exit 1; "
-                    f"MT_SMALL=1 MT_FULL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_crash "
+                    f"MT_SMALL=1 MT_FULL=1 MT_POWER=$m MT_KILL_MS=300 MT_ITERS=6 {work}/mt_power "
                     f"{work}/mtpf$s$m.db $s 4 1000000 'PRAGMA synchronous=FULL;' || exit 1; "
                     f"done; done")
 

@@ -147,8 +147,12 @@ int sqlite3BfWalBatchAppend(BfWalBatch *p, const BfWalRec *pRec){
   if( p->nRec>=0xFFFF ) return BFWAL_FULL;
   if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_FULL;
   if( pRec->nKey>0x3FFF ) return BFWAL_FULL;
-  if( pRec->op==BFWAL_OP_CLEAR && (pRec->nKey!=0 || pRec->nVal!=0) ){
+  if( pRec->op==BFWAL_OP_MERGED && (pRec->nKey!=16 || pRec->nVal!=8) ){
     return BFWAL_FULL;      /* would not decode: refuse to encode it */
+  }
+  if( pRec->op!=BFWAL_OP_INSERT && pRec->op!=BFWAL_OP_DELETE
+   && pRec->op!=BFWAL_OP_MERGED ){
+    return BFWAL_FULL;
   }
 
   need = sqlite3BfWalRecSize(pRec);
@@ -230,7 +234,7 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   rootPgno = bfGet32(p);  p += 4;  off += 4;
   op = *p++;              off += 1;
   if( pgno==0 || rootPgno<=1 ) return BFWAL_CORRUPT;
-  if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE && op!=BFWAL_OP_CLEAR ){
+  if( op!=BFWAL_OP_INSERT && op!=BFWAL_OP_DELETE && op!=BFWAL_OP_MERGED ){
     return BFWAL_CORRUPT;
   }
 
@@ -246,7 +250,7 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
   if( nKey > (u32)(it->nUsed - off) ) return BFWAL_CORRUPT;
   off += (int)nKey;
   if( nVal > (u32)(it->nUsed - off) ) return BFWAL_CORRUPT;
-  if( op==BFWAL_OP_CLEAR && (nKey!=0 || nVal!=0) ) return BFWAL_CORRUPT;
+  if( op==BFWAL_OP_MERGED && (nKey!=16 || nVal!=8) ) return BFWAL_CORRUPT;
 
   pRec->pgno = pgno;
   pRec->rootPgno = rootPgno;
@@ -265,66 +269,81 @@ int sqlite3BfWalIterNext(BfWalIter *it, BfWalRec *pRec){
 }
 
 /****************************************************************************
-** In-memory page -> ordered record-ops index (see bf_wal.h).
+** In-memory LOGICAL op index (see bf_wal.h), format v5 (2026-10-18, C3).
 **
-** Chained hash by pgno.  Each page node holds its ops in a growable array in
-** log (append) order; each op owns one contiguous key||value allocation.
+** Ops are keyed by (table root, 8-byte rowid key); each key node keeps its
+** ops in log order.  MERGED markers are kept per index in log order.  Every
+** op and marker carries a sequence number in append (= log) order, so "this
+** marker comes after that op" is a comparison.  The leaf page number of an op
+** is only a hint: replay places a key by descending the tree (C3, P2).
 ****************************************************************************/
-typedef struct BfWalIdxOp BfWalIdxOp;
-struct BfWalIdxOp {
-  u32  rootPgno;            /* owning rowid-table root */
-  u32  iFrame;              /* WAL frame that carried this op */
+typedef struct BfKeyOp BfKeyOp;
+struct BfKeyOp {
+  u32  iFrame;              /* WAL frame that carried it */
+  u32  iSeq;                /* append order */
+  u32  hint;                /* leaf page the writer used (hint only) */
   u8   op;                  /* BFWAL_OP_INSERT / BFWAL_OP_DELETE */
-  u32  nKey;                /* key length */
-  u32  nVal;                /* value length */
-  u8  *pBody;               /* owned: [key bytes][val bytes], nKey+nVal long */
+  u32  nVal;
+  u8  *pVal;                /* owned (NULL when nVal==0) */
 };
-typedef struct BfWalIdxPage BfWalIdxPage;
-struct BfWalIdxPage {
-  u32           pgno;       /* target page */
-  int           nOp;        /* ops recorded */
-  int           nAlloc;     /* aOp capacity */
-  BfWalIdxOp   *aOp;        /* log order */
-  BfWalIdxPage *pNext;      /* bucket chain */
+typedef struct BfKeyNode BfKeyNode;
+struct BfKeyNode {
+  u32        root;
+  u8         aKey[8];
+  int        nOp, nAlloc;
+  BfKeyOp   *aOp;           /* log order */
+  BfKeyNode *pNext;         /* bucket chain */
+};
+typedef struct BfMarker BfMarker;
+struct BfMarker {
+  u32 root;
+  u8  lo[8], hi[8];         /* encoded rowids, memcmp order = numeric order */
+  u32 snap, start;          /* ops in frames (snap, start) are NOT covered */
+  u32 iFrame, iSeq;
+  u32 hint;
 };
 struct BfWalIndex {
-  BfWalIdxPage **apBucket;  /* nBucket chains (power of two) */
-  int            nBucket;
-  int            nPage;     /* live page nodes (for load factor) */
+  BfKeyNode **apBucket;     /* nBucket chains (power of two) */
+  int         nBucket;
+  int         nKey;         /* live key nodes */
+  BfMarker   *aMark;        /* log order */
+  int         nMark, nMarkAlloc;
+  u32         iSeq;         /* next sequence number */
 };
 
-#define BFWAL_IDX_INIT_BUCKETS 16
+#define BFWAL_IDX_INIT_BUCKETS 64
 
-static unsigned bfIdxHash(u32 pgno, int nBucket){
-  /* Fibonacci hash, then mask to the (power-of-two) bucket count. */
-  return (unsigned)((pgno * 2654435761u) >> 16) & (unsigned)(nBucket - 1);
+static unsigned bfIdxHash(u32 root, const u8 *k, int nBucket){
+  u32 h = root * 2654435761u;
+  int i;
+  for(i=0; i<8; i++) h = (h ^ k[i]) * 16777619u;
+  return (unsigned)(h ^ (h>>15)) & (unsigned)(nBucket - 1);
 }
 
-static BfWalIdxPage *bfIdxFind(BfWalIndex *p, u32 pgno){
-  BfWalIdxPage *pP = p->apBucket[bfIdxHash(pgno, p->nBucket)];
-  for(; pP; pP = pP->pNext){
-    if( pP->pgno==pgno ) return pP;
+static BfKeyNode *bfIdxFind(BfWalIndex *p, u32 root, const u8 *k){
+  BfKeyNode *pN = p->apBucket[bfIdxHash(root, k, p->nBucket)];
+  for(; pN; pN = pN->pNext){
+    if( pN->root==root && memcmp(pN->aKey, k, 8)==0 ) return pN;
   }
   return 0;
 }
 
-/* Grow and rehash when the table gets crowded (load factor > ~0.75). */
 static int bfIdxMaybeGrow(BfWalIndex *p){
   int newN, i;
-  BfWalIdxPage **apNew;
-  if( p->nPage <= (p->nBucket*3)/4 ) return BFWAL_OK;
+  BfKeyNode **apNew;
+  if( p->nKey <= (p->nBucket*3)/4 ) return BFWAL_OK;
   newN = p->nBucket * 2;
-  apNew = (BfWalIdxPage**)BFWAL_MALLOC((i64)newN * (int)sizeof(*apNew));
+  apNew = (BfKeyNode**)BFWAL_MALLOC((i64)newN * (int)sizeof(*apNew));
   if( apNew==0 ) return BFWAL_NOMEM;   /* keep running at the old size */
   memset(apNew, 0, (size_t)newN * sizeof(*apNew));
   for(i=0; i<p->nBucket; i++){
-    BfWalIdxPage *pP = p->apBucket[i];
-    while( pP ){
-      BfWalIdxPage *pNext = pP->pNext;
-      unsigned h = bfIdxHash(pP->pgno, newN);
-      pP->pNext = apNew[h];
-      apNew[h] = pP;
-      pP = pNext;
+    BfKeyNode *pN = p->apBucket[i];
+    while( pN ){
+      BfKeyNode *pNext = pN->pNext;
+      unsigned h = bfIdxHash(pN->root, pN->aKey, newN);
+      pN->pNext = apNew[h];
+      apNew[h] = pN;
+      pN = pNext;
     }
   }
   BFWAL_FREE(p->apBucket);
@@ -336,114 +355,156 @@ static int bfIdxMaybeGrow(BfWalIndex *p){
 BfWalIndex *sqlite3BfWalIndexNew(void){
   BfWalIndex *p = (BfWalIndex*)BFWAL_MALLOC((int)sizeof(*p));
   if( p==0 ) return 0;
+  memset(p, 0, sizeof(*p));
   p->nBucket = BFWAL_IDX_INIT_BUCKETS;
-  p->nPage = 0;
-  p->apBucket = (BfWalIdxPage**)BFWAL_MALLOC(p->nBucket * (int)sizeof(BfWalIdxPage*));
+  p->apBucket = (BfKeyNode**)BFWAL_MALLOC(p->nBucket * (int)sizeof(BfKeyNode*));
   if( p->apBucket==0 ){ BFWAL_FREE(p); return 0; }
-  memset(p->apBucket, 0, (size_t)p->nBucket * sizeof(BfWalIdxPage*));
+  memset(p->apBucket, 0, (size_t)p->nBucket * sizeof(BfKeyNode*));
   return p;
 }
 
-static void bfIdxFreePage(BfWalIdxPage *pP){
+static void bfIdxFreeNode(BfKeyNode *pN){
   int i;
-  for(i=0; i<pP->nOp; i++) BFWAL_FREE(pP->aOp[i].pBody);
-  BFWAL_FREE(pP->aOp);
-  BFWAL_FREE(pP);
+  for(i=0; i<pN->nOp; i++) BFWAL_FREE(pN->aOp[i].pVal);
+  BFWAL_FREE(pN->aOp);
+  BFWAL_FREE(pN);
 }
 
 void sqlite3BfWalIndexFree(BfWalIndex *p){
   int i;
   if( p==0 ) return;
   for(i=0; i<p->nBucket; i++){
-    BfWalIdxPage *pP = p->apBucket[i];
-    while( pP ){ BfWalIdxPage *pNext = pP->pNext; bfIdxFreePage(pP); pP = pNext; }
+    BfKeyNode *pN = p->apBucket[i];
+    while( pN ){ BfKeyNode *pNext = pN->pNext; bfIdxFreeNode(pN); pN = pNext; }
   }
   BFWAL_FREE(p->apBucket);
+  BFWAL_FREE(p->aMark);
   BFWAL_FREE(p);
 }
 
-int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
-  BfWalIdxPage *pP;
-  BfWalIdxOp *pOp;
-  u8 *pBody;
-
-  if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_CORRUPT;
-
-  pP = bfIdxFind(p, pRec->pgno);
-  if( pP==0 ){
-    if( bfIdxMaybeGrow(p) ){ /* NOMEM: proceed at current size, still correct */ }
-    pP = (BfWalIdxPage*)BFWAL_MALLOC((int)sizeof(*pP));
-    if( pP==0 ) return BFWAL_NOMEM;
-    pP->pgno = pRec->pgno;
-    pP->nOp = 0;
-    pP->nAlloc = 0;
-    pP->aOp = 0;
-    { unsigned h = bfIdxHash(pRec->pgno, p->nBucket);
-      pP->pNext = p->apBucket[h];
-      p->apBucket[h] = pP; }
-    p->nPage++;
-  }
-
-  if( pP->nOp >= pP->nAlloc ){
-    int newAlloc = pP->nAlloc ? pP->nAlloc*2 : 4;
-    BfWalIdxOp *aNew = (BfWalIdxOp*)BFWAL_REALLOC(pP->aOp,
-                                     newAlloc * (int)sizeof(BfWalIdxOp));
+static int bfIdxAddMarker(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
+  BfMarker *m;
+  if( p->nMark>=p->nMarkAlloc ){
+    int nNew = p->nMarkAlloc ? p->nMarkAlloc*2 : 16;
+    BfMarker *aNew = (BfMarker*)BFWAL_REALLOC(p->aMark, nNew*(int)sizeof(BfMarker));
     if( aNew==0 ) return BFWAL_NOMEM;
-    pP->aOp = aNew;
-    pP->nAlloc = newAlloc;
+    p->aMark = aNew;
+    p->nMarkAlloc = nNew;
   }
+  m = &p->aMark[p->nMark++];
+  m->root = pRec->rootPgno;
+  memcpy(m->lo, pRec->pKey, 8);
+  memcpy(m->hi, pRec->pKey+8, 8);
+  m->snap = bfGet32(pRec->pVal);
+  m->start = bfGet32(pRec->pVal+4);
+  m->iFrame = iFrame;
+  m->iSeq = p->iSeq++;
+  m->hint = pRec->pgno;
+  return BFWAL_OK;
+}
 
-  /* One contiguous allocation for key||value; +1 so a 0-length body still
-  ** yields a non-NULL pointer (distinguishes "empty" from "OOM"). */
-  pBody = (u8*)BFWAL_MALLOC((int)(pRec->nKey + pRec->nVal) + 1);
-  if( pBody==0 ) return BFWAL_NOMEM;
-  if( pRec->nKey ) memcpy(pBody, pRec->pKey, pRec->nKey);
-  if( pRec->nVal ) memcpy(pBody + pRec->nKey, pRec->pVal, pRec->nVal);
+int sqlite3BfWalIndexAppend(BfWalIndex *p, const BfWalRec *pRec, u32 iFrame){
+  BfKeyNode *pN;
+  BfKeyOp *pOp;
+  if( pRec->pgno==0 || pRec->rootPgno<=1 ) return BFWAL_CORRUPT;
+  if( pRec->op==BFWAL_OP_MERGED ){
+    if( pRec->nKey!=16 || pRec->nVal!=8 ) return BFWAL_CORRUPT;
+    return bfIdxAddMarker(p, pRec, iFrame);
+  }
+  if( pRec->op!=BFWAL_OP_INSERT && pRec->op!=BFWAL_OP_DELETE ) return BFWAL_CORRUPT;
+  if( pRec->nKey!=8 ) return BFWAL_CORRUPT;   /* BF buffers rowid keys only */
 
-  pOp = &pP->aOp[pP->nOp++];
-  pOp->rootPgno = pRec->rootPgno;
+  pN = bfIdxFind(p, pRec->rootPgno, pRec->pKey);
+  if( pN==0 ){
+    if( bfIdxMaybeGrow(p) ){ /* NOMEM: proceed at current size, still correct */ }
+    pN = (BfKeyNode*)BFWAL_MALLOC((int)sizeof(*pN));
+    if( pN==0 ) return BFWAL_NOMEM;
+    memset(pN, 0, sizeof(*pN));
+    pN->root = pRec->rootPgno;
+    memcpy(pN->aKey, pRec->pKey, 8);
+    { unsigned h = bfIdxHash(pN->root, pN->aKey, p->nBucket);
+      pN->pNext = p->apBucket[h];
+      p->apBucket[h] = pN; }
+    p->nKey++;
+  }
+  if( pN->nOp >= pN->nAlloc ){
+    int newAlloc = pN->nAlloc ? pN->nAlloc*2 : 2;
+    BfKeyOp *aNew = (BfKeyOp*)BFWAL_REALLOC(pN->aOp, newAlloc*(int)sizeof(BfKeyOp));
+    if( aNew==0 ) return BFWAL_NOMEM;
+    pN->aOp = aNew;
+    pN->nAlloc = newAlloc;
+  }
+  pOp = &pN->aOp[pN->nOp];
   pOp->iFrame = iFrame;
+  pOp->iSeq = p->iSeq;
+  pOp->hint = pRec->pgno;
   pOp->op = pRec->op;
-  pOp->nKey = pRec->nKey;
-  pOp->nVal = pRec->nVal;
-  pOp->pBody = pBody;
+  pOp->nVal = pRec->op==BFWAL_OP_DELETE ? 0 : pRec->nVal;
+  pOp->pVal = 0;
+  if( pOp->nVal ){
+    pOp->pVal = (u8*)BFWAL_MALLOC((int)pOp->nVal);
+    if( pOp->pVal==0 ) return BFWAL_NOMEM;
+    memcpy(pOp->pVal, pRec->pVal, pOp->nVal);
+  }
+  pN->nOp++;
+  p->iSeq++;
   return BFWAL_OK;
 }
 
-int sqlite3BfWalIndexPageCount(BfWalIndex *p, u32 pgno){
-  BfWalIdxPage *pP = bfIdxFind(p, pgno);
-  return pP ? pP->nOp : 0;
-}
-
-int sqlite3BfWalIndexGet(BfWalIndex *p, u32 pgno, int i, BfWalRec *pRec){
-  BfWalIdxPage *pP = bfIdxFind(p, pgno);
-  BfWalIdxOp *pOp;
-  if( pP==0 || i<0 || i>=pP->nOp ) return BFWAL_DONE;
-  pOp = &pP->aOp[i];
-  pRec->pgno = pgno;
-  pRec->rootPgno = pOp->rootPgno;
-  pRec->iFrame = pOp->iFrame;
-  pRec->op   = pOp->op;
-  pRec->nKey = pOp->nKey;
-  pRec->nVal = pOp->nVal;
-  pRec->pKey = pOp->nKey ? pOp->pBody : 0;
-  pRec->pVal = pOp->nVal ? pOp->pBody + pOp->nKey : 0;
-  return BFWAL_OK;
-}
-
-int sqlite3BfWalIndexForEachPage(BfWalIndex *p,
-    int (*xPage)(void *pCtx, u32 pgno), void *pCtx){
+/* Is op `o` of table root / key k covered by a marker that counts? */
+static int bfIdxCovered(BfWalIndex *p, u32 root, const u8 *k, const BfKeyOp *o,
+                        u32 mxFrame){
   int i;
-  if( p==0 || xPage==0 ) return BFWAL_OK;
+  for(i=p->nMark-1; i>=0; i--){
+    const BfMarker *m = &p->aMark[i];
+    if( m->iSeq < o->iSeq ) break;              /* markers before the op */
+    if( m->iFrame>mxFrame ) continue;           /* never honoured past the log end */
+    if( m->root!=root ) continue;
+    if( memcmp(k, m->lo, 8)<0 || memcmp(k, m->hi, 8)>0 ) continue;
+    if( o->iFrame>m->snap && o->iFrame<m->start ) continue;  /* foreign, after snap */
+    return 1;
+  }
+  return 0;
+}
+
+int sqlite3BfWalIndexKeyState(BfWalIndex *p, u32 root, const u8 *pKey,
+    u32 mxFrame, int bKeepBeyond, BfKeyState *pOut){
+  BfKeyNode *pN;
+  int i;
+  memset(pOut, 0, sizeof(*pOut));
+  pOut->op = -1;
+  if( p==0 ) return 0;
+  pN = bfIdxFind(p, root, pKey);
+  if( pN==0 ) return 0;
+  for(i=pN->nOp-1; i>=0; i--){
+    const BfKeyOp *o = &pN->aOp[i];
+    if( o->iFrame>mxFrame && !bKeepBeyond ) continue;   /* torn tail */
+    if( bfIdxCovered(p, root, pKey, o, mxFrame) ) return 1;  /* in base */
+    pOut->op = o->op;
+    pOut->pVal = o->pVal;
+    pOut->nVal = o->nVal;
+    pOut->iFrame = o->iFrame;
+    pOut->hint = o->hint;
+    return 1;
+  }
+  return 1;
+}
+
+int sqlite3BfWalIndexForEachKey(BfWalIndex *p,
+    int (*xKey)(void *pCtx, u32 root, const u8 *pKey), void *pCtx){
+  int i;
+  if( p==0 || xKey==0 ) return BFWAL_OK;
   for(i=0; i<p->nBucket; i++){
-    BfWalIdxPage *pP;
-    for(pP = p->apBucket[i]; pP; pP = pP->pNext){
-      int rc = xPage(pCtx, pP->pgno);
+    BfKeyNode *pN;
+    for(pN = p->apBucket[i]; pN; pN = pN->pNext){
+      int rc = xKey(pCtx, pN->root, pN->aKey);
       if( rc!=BFWAL_OK ) return rc;
     }
   }
   return BFWAL_OK;
 }
+
+int sqlite3BfWalIndexKeyCount(BfWalIndex *p){ return p ? p->nKey : 0; }
 
 int sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf,
                               u32 iFrame){
@@ -459,22 +520,22 @@ int sqlite3BfWalIndexAddFrame(BfWalIndex *p, const u8 *aBuf, int szBuf,
   return (rc==BFWAL_DONE) ? BFWAL_OK : rc;
 }
 
-/* Ops are appended in log order, so within one page the ops to drop are a
-** suffix: truncate from the first op past mxFrame. */
+/* Ops and markers are appended in log order, so those past mxFrame are a
+** suffix of each key's list and of the marker list. */
 void sqlite3BfWalIndexPrune(BfWalIndex *p, u32 mxFrame){
   int i;
   if( p==0 ) return;
   for(i=0; i<p->nBucket; i++){
-    BfWalIdxPage *pP;
-    for(pP = p->apBucket[i]; pP; pP = pP->pNext){
-      int j = pP->nOp;
-      while( j>0 && pP->aOp[j-1].iFrame>mxFrame ) j--;
-      while( pP->nOp>j ){
-        pP->nOp--;
-        BFWAL_FREE(pP->aOp[pP->nOp].pBody);
+    BfKeyNode *pN;
+    for(pN = p->apBucket[i]; pN; pN = pN->pNext){
+      while( pN->nOp>0 && pN->aOp[pN->nOp-1].iFrame>mxFrame ){
+        pN->nOp--;
+        BFWAL_FREE(pN->aOp[pN->nOp].pVal);
+        pN->aOp[pN->nOp].pVal = 0;
       }
     }
   }
+  while( p->nMark>0 && p->aMark[p->nMark-1].iFrame>mxFrame ) p->nMark--;
 }
 
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */

@@ -34,6 +34,18 @@
 #endif
 typedef struct BfCache BfCache;
 typedef struct BfRsRange BfRsRange;
+typedef struct BfFlushRec BfFlushRec;   /* C3: a merged leaf and its key range */
+struct BfFlushRec { u32 leaf, root; u8 lo[8], hi[8]; };
+/* C3 (2026-10-18): replay placement -- where key pKey (8-byte encoded rowid) of
+** table root lives now, 0 if unknown -- and a (table, key) reference. */
+typedef u32 (*BfLeafFn)(void*, u32 root, const u8 *pKey);
+#ifndef BF_KEYREF_DEFINED
+#define BF_KEYREF_DEFINED
+typedef struct BfKeyRef BfKeyRef;
+struct BfKeyRef { u32 root; u8 aKey[8]; };
+typedef struct BfKeyRange BfKeyRange;
+struct BfKeyRange { u32 root; u8 lo[8]; u8 hi[8]; };
+#endif
 struct BfRsRange { u32 root; i64 lo; i64 hi; };  /* C1 read-set entry */
 typedef struct BfCircularBuffer BfCircularBuffer;
 typedef struct BfMiniPage BfMiniPage;
@@ -691,10 +703,14 @@ struct BfCache {
   ** BFWAL_OP_CLEAR for each (sqlite3BfBtreeLogAllDirty) and empties the list,
   ** a rollback just empties it.  WAL mode only.  bFlushedOom: the list could
   ** not grow, so the commit must fail rather than log an incomplete set. */
-  u32 *aFlushed;
+  /* C3: each entry also carries the smallest and largest key the merge
+  ** applied; the commit logs BFWAL_OP_MERGED(root, lo, hi, snap, start). */
+  BfFlushRec *aFlushed;
   int nFlushed;
   int nFlushedAlloc;
   u8 bFlushedOom;
+  u8 bConcSnap;             /* C3: a BEGIN CONCURRENT commit: iConcSnap valid */
+  u32 iConcSnap;            /* ... its snapshot frame (MERGED's snap) */
 
   /* D3b blind insert (2026-09-29): a bitmap over pgno of pages KNOWN to be
   ** non-root table leaves, so an upsert can buffer against a child pgno
@@ -825,13 +841,13 @@ SQLITE_PRIVATE int sqlite3BfRecordRead(BfCache *pCache, u32 pgno,
     const void *pKey, int nKey, void *pBuf, int *pnBuf);
 SQLITE_PRIVATE int sqlite3BfRecordWrite(BfCache *pCache, u32 pgno,
     const void *pKey, int nKey, const void *pVal, int nVal, u8 opType);
-/* Phase 2 (WAL) recovery / rollback: replay a pgno->ops index back into the
-** mini-page cache (records written back dirty, unlogged).  Each leaf starts
-** after its last CLEAR; ops past mxFrame are skipped unless bKeepBeyond.  See
-** bf_cache.c. */
+/* Phase 2 (WAL) recovery / rollback: replay the logical op index into the
+** mini-page cache (records written back dirty, unlogged), each key's last
+** uncovered op placed by key (C3).  Ops past mxFrame are skipped unless
+** bKeepBeyond.  See bf_cache.c. */
 typedef struct BfWalIndex BfWalIndex;
 SQLITE_PRIVATE int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx,
-    u32 mxFrame, int bKeepBeyond);
+    u32 mxFrame, int bKeepBeyond, BfLeafFn xLeaf, void *pLeafArg);
 
 /*
 ** Pluggable cache interface for SQLite integration.
@@ -851,6 +867,7 @@ SQLITE_PRIVATE void sqlite3BfCircularBufferStats(BfCircularBuffer *pCb,
 */
 SQLITE_PRIVATE int sqlite3BfMiniPageDirtyCount(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfMiniPageHasHoles(BfMiniPage *pMini);
+SQLITE_PRIVATE int sqlite3BfMiniPageRemove(BfMiniPage *pMini, const void *pKey, int nKey);
 SQLITE_PRIVATE int sqlite3BfMiniPageIsDirty(BfMiniPage *pMini);
 SQLITE_PRIVATE void sqlite3BfMiniPageMarkClean(BfMiniPage *pMini);
 SQLITE_PRIVATE int sqlite3BfKvIsColdCache(const BfKVMeta *pMeta);
@@ -1065,15 +1082,15 @@ SQLITE_PRIVATE void sqlite3BfBtreeClearCache(Btree *p);
 ** state from the log (consumes apStage).  See bf_btree.c. */
 SQLITE_PRIVATE int sqlite3BfBtreeSnapshotRehydrate(Btree *p);
 SQLITE_PRIVATE u64 sqlite3BfCacheReplayBound(BfCache*, BfWalIndex*, u32, int);
-/* C1 (2026-10-17): would a replay of leaf pgno -- the committed ops after its
-** last CLEAR (<= mxFrame), then aExtra, then pOurs' unlogged records -- fit
-** in one mini-page?  See the definition. */
+/* C1 (2026-10-17) capacity check, key-centric since C3: see the definition. */
 typedef struct BfFitOp BfFitOp;
 struct BfFitOp { u32 leaf; u8 op; u8 nKey; u16 nVal; u8 aKey[16]; };
-SQLITE_PRIVATE int sqlite3BfCacheLeafFits(BfCache*, BfWalIndex*, u32 pgno,
-    u32 mxFrame, const BfFitOp *aExtra, int nExtra, BfMiniPage *pOurs);
-SQLITE_PRIVATE int sqlite3BfCacheReplayPages(BfCache*, BfWalIndex*, u32,
-                                             const u32*, int);
+SQLITE_PRIVATE int sqlite3BfCacheLeafFits(BfCache*, u32 pgno, const BfFitOp *aExtra,
+    int nExtra, BfMiniPage *pOurs);
+SQLITE_PRIVATE u32 sqlite3BfLeafForKey(void *pBtShared, u32 root, const u8 *pKey);
+SQLITE_PRIVATE u32 sqlite3BfLeafForKeyCached(void *pBtShared, u32 root, const u8 *pKey);
+SQLITE_PRIVATE int sqlite3BfCacheReplayKeys(BfCache*, BfWalIndex*, u32 mxFrame,
+    const BfKeyRef *aKey, int nKey, BfLeafFn xLeaf, void *pLeafArg);
 SQLITE_PRIVATE int sqlite3BfBtreeSnapshotAdvance(Btree *p);
 SQLITE_PRIVATE int sqlite3BfBtreeRollbackCanIncr(Btree*, int);
 SQLITE_PRIVATE int sqlite3BfBtreeRollbackIncremental(Btree*, const u32*, int,

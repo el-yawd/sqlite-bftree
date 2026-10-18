@@ -1446,34 +1446,13 @@ struct BfReplayCtx {
   BfWalIndex *pWalIdx;
   u32         mxFrame;      /* committed end of the log */
   int         bKeepBeyond;  /* replay ops past mxFrame too (rollback) */
-  int         rc;       /* first error, sticky */
+  BfLeafFn    xLeaf;        /* where a key lives NOW (C3: placement by key) */
+  void       *pLeafArg;
+  u32        *aLeaf;        /* leaves written: shrunk at the end */
+  int         nLeaf, nLeafAlloc;
+  int         rc;           /* first error, sticky */
 };
 
-/*
-** Ordering.  The index keeps each leaf's ops in log order, but the base tree a
-** replay writes them over is the NEWEST image of every page.  An op a flush has
-** already put into base pages must therefore not be replayed: measured before
-** this rule existed, an UPDATE and a DELETE that reached base through the page
-** path were undone by the next checkpoint (the stale INSERT overwrote the
-** update and resurrected the deleted row), and count(*) double-counted the
-** replayed rows in between.
-**
-** The flush says so explicitly: the commit that carries its page images logs a
-** BFWAL_OP_CLEAR for every leaf whose records it applied, and replay starts
-** each leaf after its last CLEAR.  A first attempt inferred the same thing from
-** page images instead ("a newer image of the op's leaf contains the op"), and
-** the crash oracle broke it within a few hundred runs: a flush writes a leaf's
-** records wherever their keys live NOW, and after a split that is another leaf,
-** whose image says nothing about the first.  An op no CLEAR covers was never
-** applied to base, and no page-path write can have touched its key since --
-** such a write needs the row in base, i.e. a flush first -- so replaying it over
-** the newest images is correct.
-**
-** Ops carried by frames past mxFrame belong to no committed log: at recovery
-** they are the torn tail of a crashed commit and are skipped; at rollback they
-** are group-commit batches of EARLIER, committed transactions that a spill
-** wrote inside the rolled-back one, and are kept (bKeepBeyond).
-*/
 /*
 ** After a leaf's replay: a mini-page the replay grew past the M5 cap
 ** (bReplayGrow) goes back to the smallest class that holds its records, as
@@ -1515,272 +1494,177 @@ static void bfReplayShrink(BfCache *pCache, u32 pgno){
   pEntry->pPage = pNew;
 }
 
-static int bfReplayOnePage(void *pCtx, u32 pgno){
+/*
+** C3 (2026-10-18): replay ONE key -- its last op unless a MERGED marker covers
+** it (sqlite3BfWalIndexKeyState; every op is a full value, so earlier ops never
+** matter, design P2) -- into the mini-page of the leaf that holds the key NOW
+** (ctx->xLeaf, a descent), whatever leaf the writer used.  bRemove first
+** retracts any record of the key already cached there (incremental replay:
+** catch-up, rebase, rollback); a full rebuild starts from an empty cache.
+**
+** A record that will not fit even at the page-sized class (bReplayGrow) is a
+** lost committed record: replay_dropped, which the callers turn into a full
+** rebuild or an error, never a silent wrong answer.
+*/
+static void bfReplayKey(BfReplayCtx *ctx, u32 root, const u8 *pKey, int bRemove){
+  BfCache *pCache = ctx->pCache;
+  BfKeyState st;
+  u32 leaf;
+  int wr;
+  u8 op;
+  if( ctx->rc!=SQLITE_OK ) return;
+  if( !sqlite3BfWalIndexKeyState(ctx->pWalIdx, root, pKey, ctx->mxFrame,
+                                 ctx->bKeepBeyond, &st) && !bRemove ){
+    return;
+  }
+  if( st.op<0 ){
+    pCache->nReplaySuperseded++;
+    if( !bRemove ) return;
+  }
+  leaf = ctx->xLeaf ? ctx->xLeaf(ctx->pLeafArg, root, pKey) : st.hint;
+  if( leaf==0 ){
+    if( st.op>=0 ) pCache->nReplayDropped++;   /* nowhere to put it */
+    return;
+  }
+  if( bRemove ){
+    BfMapEntry *pE = sqlite3BfMapLookup(pCache, leaf);
+    if( pE && pE->locType==BF_LOC_MINI && pE->pPage ){
+      sqlite3BfMiniPageRemove((BfMiniPage*)pE->pPage, pKey, 8);
+    }
+  }
+  if( st.op<0 ) return;
+  pCache->nReplayApplied++;
+  op = (st.op==BFWAL_OP_DELETE) ? BFOP_DELETE : BFOP_INSERT;
+  /* A replay may grow a mini-page past the M5 cap, up to the page size, and
+  ** bfReplayShrink brings it back once the replay is done (2026-10-17). */
+  pCache->bReplayGrow = 1;
+  wr = sqlite3BfRecordWrite(pCache, leaf, pKey, 8, st.pVal, (int)st.nVal, op);
+  /* Replay cannot fall back to a base write, so it must not give up while the
+  ** ring can still yield space (gen_update_stress seed 11, 2026-10-03). */
+  while( wr==BF_FULL && sqlite3BfCacheEvict(pCache, 64)>0 ){
+    wr = sqlite3BfRecordWrite(pCache, leaf, pKey, 8, st.pVal, (int)st.nVal, op);
+  }
+  pCache->bReplayGrow = 0;
+  if( wr==SQLITE_NOMEM ){ ctx->rc = SQLITE_NOMEM; return; }
+  if( wr!=BF_OK ){ pCache->nReplayDropped++; return; }
+  {
+    BfMapEntry *pE = sqlite3BfMapLookup(pCache, leaf);
+    if( pE && pE->locType==BF_LOC_MINI && pE->pPage ){
+      ((BfMiniPage*)pE->pPage)->rootPgno = root;
+    }
+  }
+  if( ctx->nLeaf==0 || ctx->aLeaf[ctx->nLeaf-1]!=leaf ){
+    if( ctx->nLeaf>=ctx->nLeafAlloc ){
+      int nNew = ctx->nLeafAlloc ? ctx->nLeafAlloc*2 : 64;
+      u32 *aNew = (u32*)sqlite3_realloc64(ctx->aLeaf, (u64)nNew*sizeof(u32));
+      if( aNew==0 ) return;               /* shrink is an optimisation */
+      ctx->aLeaf = aNew;
+      ctx->nLeafAlloc = nNew;
+    }
+    ctx->aLeaf[ctx->nLeaf++] = leaf;
+  }
+}
+static int bfReplayKeyCallback(void *pCtx, u32 root, const u8 *pKey){
   BfReplayCtx *ctx = (BfReplayCtx*)pCtx;
-  int n = sqlite3BfWalIndexPageCount(ctx->pWalIdx, pgno);
-  int i, iStart = 0;
-  /* Start after the last CLEAR that is part of the log being replayed. */
-  for(i=n-1; i>=0; i--){
-    BfWalRec rec;
-    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
-    if( rec.op!=BFWAL_OP_CLEAR ) continue;
-    /* A CLEAR past the log's end is never honoured, even when other ops there
-    ** are kept: CLEARs are written only by a commit, so one past mxFrame
-    ** belongs to a commit that did not complete, whose flush was undone. */
-    if( rec.iFrame>ctx->mxFrame ) continue;
-    iStart = i+1;
-    break;
-  }
-  ctx->pCache->nReplaySuperseded += (u64)iStart;
-#ifdef SQLITE_BF_MCONN_TRACE
-  fprintf(stderr, "  REPLAY cache=%p leaf=%u nops=%d start=%d mx=%u\n",
-          (void*)ctx->pCache, pgno, n, iStart, ctx->mxFrame);
-  for(i=0; i<n; i++){
-    BfWalRec r2;
-    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &r2)!=BFWAL_OK ) break;
-    fprintf(stderr, "    op%d f=%u op=%d key=", i, r2.iFrame, r2.op);
-    { int j; for(j=0;j<(int)r2.nKey;j++) fprintf(stderr,"%02x",r2.pKey[j]); }
-    fprintf(stderr, "\n");
-  }
-#endif
-  for(i=iStart; i<n; i++){
-    BfWalRec rec;
-    u8 op;
-    int wr;
-    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
-    if( rec.iFrame>ctx->mxFrame && !ctx->bKeepBeyond ){
-      ctx->pCache->nReplayTorn++;
-      continue;
-    }
-    if( rec.op==BFWAL_OP_CLEAR ) continue;  /* a torn-tail CLEAR, skipped above */
-    ctx->pCache->nReplayApplied++;
-    op = (rec.op==BFWAL_OP_DELETE) ? BFOP_DELETE : BFOP_INSERT;
-    /* A replay may grow a mini-page past the M5 cap, up to the page size
-    ** (2026-10-17).  It applies each commit's records in KEY order, the writer
-    ** applied them in MUTATION order, so the replay can need room the writer
-    ** never did: a writer at the cap that grew key A into the space a dropped
-    ** clean record freed, then inserted key B, replays as "insert B" (fits)
-    ** then "grow A" (does not) -- a lost committed record (mwriter_oracle
-    ** seed 12; no concurrency involved).  Every state a writer leaves is
-    ** within the cap, and a replay's state mid-commit holds each key at its
-    ** value before or after that commit, so it needs at most twice the cap;
-    ** the page-sized last class is that.  The next live write to such a page
-    ** finds no class to grow into and merges it (merge-on-full). */
-    ctx->pCache->bReplayGrow = 1;
-    wr = sqlite3BfRecordWrite(ctx->pCache, pgno, rec.pKey, (int)rec.nKey,
-                              rec.pVal, (int)rec.nVal, op);
-    /* A normal write that gets BF_FULL falls back to the base page; replay
-    ** has no fallback, so it must not give up while the ring can still yield
-    ** space.  sqlite3BfRecordWrite's own reclaim is one 16-slab sweep, and
-    ** right after a rollback's ClearCache the FIFO head is a run of small
-    ** orphans: 16 of them did not free room for one ~1.4 KB record, and the
-    ** committed row was dropped (gen_update_stress seed 11, ring variant,
-    ** 2026-10-03).  Sweep until it fits or the sweep stops progressing (empty
-    ** ring, or a dirty slab at the head). */
-    while( wr==BF_FULL && sqlite3BfCacheEvict(ctx->pCache, 64)>0 ){
-      wr = sqlite3BfRecordWrite(ctx->pCache, pgno, rec.pKey, (int)rec.nKey,
-                                rec.pVal, (int)rec.nVal, op);
-    }
-    ctx->pCache->bReplayGrow = 0;
-    if( wr==BF_OK ){
-      BfMapEntry *pEntry = sqlite3BfMapLookup(ctx->pCache, pgno);
-      if( pEntry && pEntry->locType==BF_LOC_MINI && pEntry->pPage ){
-        ((BfMiniPage*)pEntry->pPage)->rootPgno = rec.rootPgno;
-      }
-    }
-    if( wr==SQLITE_NOMEM ){
-      ctx->rc = SQLITE_NOMEM;
-      return BFWAL_NOMEM;   /* stop the walk */
-    }
-    /* BF_FULL (mini-page maxed) used to be "tolerated" on the grounds that the
-    ** record stays durable in the WAL and is re-applied at the next checkpoint
-    ** from the base path.  Nothing does that: checkpoint materialises the CACHE
-    ** and never reads record frames.  A refused op is a lost committed record,
-    ** so count it where it cannot be missed (bf_cache_stats replay_dropped). */
-    if( wr!=BF_OK ) ctx->pCache->nReplayDropped++;
-  }
-  bfReplayShrink(ctx->pCache, pgno);
-  return BFWAL_OK;
+  bfReplayKey(ctx, root, pKey, 0);
+  return ctx->rc==SQLITE_OK ? BFWAL_OK : BFWAL_NOMEM;
+}
+static void bfReplayFinish(BfReplayCtx *ctx){
+  int i;
+  for(i=0; i<ctx->nLeaf; i++) bfReplayShrink(ctx->pCache, ctx->aLeaf[i]);
+  sqlite3_free(ctx->aLeaf);
+  ctx->aLeaf = 0;
+  ctx->nLeaf = ctx->nLeafAlloc = 0;
 }
 
 /*
-** Upper bound on the ring bytes sqlite3BfCacheReplayWal(mxFrame, bKeepBeyond)
-** needs to hold everything it would apply (2026-10-12).
-**
-** A replay cannot make room by evicting what it writes -- every replayed record
-** is DIRTY -- so a dirty set larger than the ring used to be dropped, silently:
-** a writer killed after 12,000 buffered single-row UPDATEs, recovered with
-** bf_cache_size=262144, came back with 9,661 of them (replay_dropped 2339).
-** Per leaf: the ops after its last honoured CLEAR (the same rule as
-** bfReplayOnePage), sized as live records, rounded up to the size class a
-** mini-page holding them needs, plus the ring's per-allocation header.  Several
-** ops on one key overwrite each other in replay, so this over-counts; never
-** under.
+** Upper bound on the ring bytes a full replay needs (2026-10-12; key-centric
+** since C3).  Per key with a live state: the record, twice (rounding up to a
+** size class at most doubles a leaf's bytes), plus a mini-page header and the
+** ring's per-allocation header as if every key were alone on its leaf.  Never
+** under, often over: the cost is a larger ring for the rebuild.
 */
 typedef struct BfBoundCtx BfBoundCtx;
 struct BfBoundCtx {
-  BfCache    *pCache;
   BfWalIndex *pWalIdx;
   u32         mxFrame;
   int         bKeepBeyond;
   u64         nBytes;
 };
-static int bfReplayBoundOnePage(void *pCtx, u32 pgno){
+static int bfReplayBoundKey(void *pCtx, u32 root, const u8 *pKey){
   BfBoundCtx *ctx = (BfBoundCtx*)pCtx;
-  int n = sqlite3BfWalIndexPageCount(ctx->pWalIdx, pgno);
-  int i, iStart = 0, k;
-  u64 sum = sizeof(BfMiniPage);
-  for(i=n-1; i>=0; i--){
-    BfWalRec rec;
-    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
-    if( rec.op!=BFWAL_OP_CLEAR || rec.iFrame>ctx->mxFrame ) continue;
-    iStart = i+1;
-    break;
+  BfKeyState st;
+  sqlite3BfWalIndexKeyState(ctx->pWalIdx, root, pKey, ctx->mxFrame,
+                            ctx->bKeepBeyond, &st);
+  if( st.op>=0 ){
+    ctx->nBytes += 2*((u64)sizeof(BfKVMeta) + 8 + st.nVal)
+                 + 2*(u64)sizeof(BfMiniPage) + 16;
   }
-  if( iStart>=n ) return BFWAL_OK;
-  for(i=iStart; i<n; i++){
-    BfWalRec rec;
-    if( sqlite3BfWalIndexGet(ctx->pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
-    if( rec.iFrame>ctx->mxFrame && !ctx->bKeepBeyond ) continue;
-    if( rec.op==BFWAL_OP_CLEAR ) continue;
-    sum += sizeof(BfKVMeta) + rec.nKey + rec.nVal;
-  }
-  for(k=0; k<BF_SIZE_CLASS_COUNT; k++){
-    if( ctx->pCache->aSizeClass[k]>=sum ){ sum = ctx->pCache->aSizeClass[k]; break; }
-  }
-  ctx->nBytes += sum + 16;    /* + the ring's per-allocation header */
   return BFWAL_OK;
 }
 u64 sqlite3BfCacheReplayBound(BfCache *pCache, BfWalIndex *pWalIdx,
     u32 mxFrame, int bKeepBeyond){
   BfBoundCtx ctx;
   if( pCache==0 || pWalIdx==0 ) return 0;
-  ctx.pCache = pCache;
   ctx.pWalIdx = pWalIdx;
   ctx.mxFrame = mxFrame;
   ctx.bKeepBeyond = bKeepBeyond;
   ctx.nBytes = 0;
-  sqlite3BfWalIndexForEachPage(pWalIdx, bfReplayBoundOnePage, &ctx);
+  sqlite3BfWalIndexForEachKey(pWalIdx, bfReplayBoundKey, &ctx);
   return ctx.nBytes;
 }
 
 /*
-** C1 (2026-10-17): would a replay of leaf pgno fit in one mini-page?
-**
-** Replay (bfReplayOnePage) applies a leaf's committed ops after its last CLEAR
-** to one mini-page and has no fallback: an op that does not fit is a lost
-** committed record (replay_dropped, then SQLITE_FULL).  One writer can never
-** log more than fits -- its mini-page held every one of those records live, and
-** merge-on-full logs a CLEAR when it would not -- but BEGIN CONCURRENT writers
-** each fill a leaf's mini-page from their OWN snapshot, and the union of what
-** they commit can exceed it (mwriter_oracle, 2026-10-17: once inserts stopped
-** flushing the table, seeds 1-3 dropped records within 1,000 ops).  So the
-** concurrent commit check (sqlite3BfBtreeConcurrentValidate) asks this for each
-** leaf that both it and another transaction wrote since its snapshot.
-**
-** It replays sizes only, in replay order: the index's ops (<= mxFrame, after the
-** last CLEAR <= mxFrame, as bfReplayOnePage does), then aExtra (other commits'
-** ops not yet in the index; a CLEAR there resets), then pOurs' dirty unlogged
-** records -- what this commit will log.  Each step uses sqlite3BfRecordWrite's
-** own test: an overwrite no larger than the old value is in place; otherwise
-** the live records plus the new one must fit the largest size class a
-** mini-page may grow to (M5), compaction reclaiming dead bytes
-** (sqlite3BfMiniPageHasHoles).  Conservative where it is not exact (more than
-** BF_FIT_KEYS distinct keys, a key over 16 bytes): returns 0, a conflict.
+** C1 capacity check (2026-10-17), key-centric since C3: would leaf pgno's
+** replay fit one mini-page at the M5 cap?  Replay writes each key once -- its
+** final state -- so the bytes are the sum of final records, with no transient
+** (the key-order vs mutation-order hazard of the leaf-keyed replay is gone).
+** Conservative sum: every dirty record cached for the leaf (committed and this
+** transaction's), plus every other commit's op on a key of the leaf (aExtra,
+** placed by the caller), counting a key twice when both have it.
 */
-#define BF_FIT_KEYS 512
-typedef struct BfFitSim BfFitSim;
-struct BfFitSim {
-  u32 cap, live;
-  int n, bFail;
-  struct { u8 aKey[16]; u8 nKey; u32 sp; u16 nVal; } a[BF_FIT_KEYS];
-};
-static void bfFitStep(BfFitSim *f, const u8 *pKey, int nKey, int nVal, int bClear){
-  int i;
-  u32 sp;
-  if( f->bFail ) return;
-  if( bClear ){ f->n = 0; f->live = (u32)sizeof(BfMiniPage); return; }
-  if( nKey>16 || nKey<0 || nVal<0 ){ f->bFail = 1; return; }
-  sp = (u32)sizeof(BfKVMeta) + (u32)nKey + (u32)nVal;
-  for(i=0; i<f->n; i++){
-    if( f->a[i].nKey==nKey && memcmp(f->a[i].aKey, pKey, nKey)==0 ) break;
-  }
-  if( i<f->n && nVal<=f->a[i].nVal ){            /* in place */
-    f->live = f->live - f->a[i].sp + sp;
-    f->a[i].sp = sp;
-    f->a[i].nVal = (u16)nVal;
-    return;
-  }
-  if( f->live + sp > f->cap ){ f->bFail = 1; return; }
-  if( i<f->n ){
-    f->live = f->live - f->a[i].sp + sp;
-  }else{
-    if( f->n>=BF_FIT_KEYS ){ f->bFail = 1; return; }
-    memcpy(f->a[i].aKey, pKey, nKey);
-    f->a[i].nKey = (u8)nKey;
-    f->n++;
-    f->live += sp;
-  }
-  f->a[i].sp = sp;
-  f->a[i].nVal = (u16)nVal;
-}
-int sqlite3BfCacheLeafFits(BfCache *pCache, BfWalIndex *pWalIdx, u32 pgno,
-    u32 mxFrame, const BfFitOp *aExtra, int nExtra, BfMiniPage *pOurs){
-  BfFitSim *f;
-  int i, k, n, iStart = 0, bFit;
-  f = (BfFitSim*)sqlite3_malloc64(sizeof(BfFitSim));
-  if( f==0 ) return 0;
-  f->cap = 0;
+int sqlite3BfCacheLeafFits(BfCache *pCache, u32 pgno, const BfFitOp *aExtra,
+    int nExtra, BfMiniPage *pOurs){
+  u64 total = sizeof(BfMiniPage);
+  u32 cap = 0;
+  int i, k;
   for(k=0; k<BF_SIZE_CLASS_COUNT; k++){
     u32 c = pCache->aSizeClass[k];
-    if( c<=BF_MAX_MINI_GROW && c<=BF_MAX_MINI_PAGE && c>f->cap ) f->cap = c;
-  }
-  f->n = 0;
-  f->bFail = 0;
-  f->live = (u32)sizeof(BfMiniPage);
-  n = pWalIdx ? sqlite3BfWalIndexPageCount(pWalIdx, pgno) : 0;
-  for(i=n-1; i>=0; i--){
-    BfWalRec rec;
-    if( sqlite3BfWalIndexGet(pWalIdx, pgno, i, &rec)!=BFWAL_OK ) break;
-    if( rec.op!=BFWAL_OP_CLEAR || rec.iFrame>mxFrame ) continue;
-    iStart = i+1;
-    break;
-  }
-  for(i=iStart; i<n && !f->bFail; i++){
-    BfWalRec rec;
-    if( sqlite3BfWalIndexGet(pWalIdx, pgno, i, &rec)!=BFWAL_OK ){ f->bFail = 1; break; }
-    if( rec.iFrame>mxFrame || rec.op==BFWAL_OP_CLEAR ) continue;
-    bfFitStep(f, rec.pKey, (int)rec.nKey, (int)rec.nVal, 0);
-  }
-  for(i=0; i<nExtra && !f->bFail; i++){
-    if( aExtra[i].leaf!=pgno ) continue;
-    bfFitStep(f, aExtra[i].aKey, aExtra[i].nKey, aExtra[i].nVal,
-              aExtra[i].op==BFWAL_OP_CLEAR);
+    if( c<=BF_MAX_MINI_GROW && c<=BF_MAX_MINI_PAGE && c>cap ) cap = c;
   }
   if( pOurs ){
-    int nRec = sqlite3BfMiniPageCount(pOurs);
-    for(i=0; i<nRec && !f->bFail; i++){
-      const u8 *pKey; int nKey, nVal; u8 op;
-      if( sqlite3BfMiniPageDirtyUnloggedAt(pOurs, i, &pKey, &nKey, 0, &nVal, &op) ){
-        bfFitStep(f, pKey, nKey, nVal, 0);
+    int n = sqlite3BfMiniPageCount(pOurs);
+    for(i=0; i<n; i++){
+      const u8 *pK; int nK, nV; u8 op;
+      if( sqlite3BfMiniPageAt(pOurs, i, &pK, &nK, 0, &nV, &op)
+       && (op==BFOP_INSERT || op==BFOP_DELETE) ){
+        total += sizeof(BfKVMeta) + (u32)nK + (u32)nV;
       }
     }
   }
-  bFit = !f->bFail;
-  sqlite3_free(f);
-  return bFit;
+  for(i=0; i<nExtra; i++){
+    if( aExtra[i].leaf!=pgno ) continue;
+    total += sizeof(BfKVMeta) + aExtra[i].nKey
+           + (aExtra[i].op==BFWAL_OP_DELETE ? 0 : aExtra[i].nVal);
+  }
+  return total<=cap;
 }
 
+/* Full replay into an empty cache. */
 int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx,
-    u32 mxFrame, int bKeepBeyond){
+    u32 mxFrame, int bKeepBeyond, BfLeafFn xLeaf, void *pLeafArg){
   BfReplayCtx ctx;
   if( pCache==0 || pWalIdx==0 ) return SQLITE_OK;
+  memset(&ctx, 0, sizeof(ctx));
   ctx.pCache  = pCache;
   ctx.pWalIdx = pWalIdx;
   ctx.mxFrame = mxFrame;
   ctx.bKeepBeyond = bKeepBeyond;
+  ctx.xLeaf = xLeaf;
+  ctx.pLeafArg = pLeafArg;
   ctx.rc      = SQLITE_OK;
-  sqlite3BfWalIndexForEachPage(pWalIdx, bfReplayOnePage, &ctx);
+  sqlite3BfWalIndexForEachKey(pWalIdx, bfReplayKeyCallback, &ctx);
+  bfReplayFinish(&ctx);
   if( ctx.rc==SQLITE_OK ){
     /* Arm the pre-mutation / pre-scan / commit flush for the replayed rows. */
     pCache->bDirtyInserts = 1;
@@ -1788,24 +1672,24 @@ int sqlite3BfCacheReplayWal(BfCache *pCache, BfWalIndex *pWalIdx,
   return ctx.rc;
 }
 
-/* Replay only the leaves aPg[0..nPg) (incremental invalidation).  Each must be
-** absent from the cache, as after sqlite3BfCacheReplayWal's ClearCache. */
-int sqlite3BfCacheReplayPages(BfCache *pCache, BfWalIndex *pWalIdx,
-    u32 mxFrame, const u32 *aPg, int nPg){
+/* Replay only the keys aKey[0..nKey) (incremental), each retracted first. */
+int sqlite3BfCacheReplayKeys(BfCache *pCache, BfWalIndex *pWalIdx, u32 mxFrame,
+    const BfKeyRef *aKey, int nKey, BfLeafFn xLeaf, void *pLeafArg){
   BfReplayCtx ctx;
-  int i, bAny = 0;
-  if( pCache==0 || pWalIdx==0 ) return SQLITE_OK;
+  int i;
+  if( pCache==0 ) return SQLITE_OK;
+  memset(&ctx, 0, sizeof(ctx));
   ctx.pCache  = pCache;
   ctx.pWalIdx = pWalIdx;
   ctx.mxFrame = mxFrame;
-  ctx.bKeepBeyond = 0;
+  ctx.xLeaf = xLeaf;
+  ctx.pLeafArg = pLeafArg;
   ctx.rc      = SQLITE_OK;
-  for(i=0; i<nPg && ctx.rc==SQLITE_OK; i++){
-    if( sqlite3BfWalIndexPageCount(pWalIdx, aPg[i])==0 ) continue;
-    bAny = 1;
-    bfReplayOnePage(&ctx, aPg[i]);
+  for(i=0; i<nKey && ctx.rc==SQLITE_OK; i++){
+    bfReplayKey(&ctx, aKey[i].root, aKey[i].aKey, 1);
   }
-  if( ctx.rc==SQLITE_OK && bAny ) pCache->bDirtyInserts = 1;
+  if( ctx.rc==SQLITE_OK && ctx.nLeaf>0 ) pCache->bDirtyInserts = 1;
+  bfReplayFinish(&ctx);
   return ctx.rc;
 }
 

@@ -7203,6 +7203,75 @@ static int btreeBfServeFromCache(BtCursor *pCur, Pgno chldPg, i64 intKey,
 #endif
 
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+/*
+** C3 (2026-10-18): the leaf that holds rowid key pKey (8-byte encoded) of the
+** table rooted at `root`, NOW -- or 0 if the descent fails.  Replay places
+** every record by this, so a split or merge that moved a key can never strand
+** its record under a leaf that no longer owns it (log format v5: an op's leaf
+** is a hint).  Reads interior pages only (resident outside the BF budget) and
+** reads the leaf too, to learn that it is one (BF's known-leaf bitmap is not
+** trusted: it can name a page that has since become interior).  Needs the btree mutex and a read lock, which every
+** replay context holds (snapshot advance, rollback, commit rebase).
+*/
+static u32 bfLeafForKey(BtShared *pBt, u32 root, const u8 *pKey, int bCachedOnly){
+  i64 intKey = bfDecodeRowid(pKey);
+  Pgno pgno = (Pgno)root;
+  int depth;
+  for(depth=0; depth<40; depth++){
+    MemPage *pPage;
+    int lwr, upr;
+    Pgno chld;
+    if( bCachedOnly ){
+      /* Only pages already in the pager cache: no read at all (see
+      ** sqlite3BfLeafForKeyCached). */
+      pPage = btreePageLookup(pBt, pgno);
+      if( pPage==0 ) return 0;
+      if( pPage->isInit==0 && btreeInitPage(pPage)!=SQLITE_OK ){
+        releasePage(pPage);
+        return 0;
+      }
+    }else if( getAndInitPage(pBt, pgno, &pPage, 0)!=SQLITE_OK ){
+      return 0;
+    }
+    if( !pPage->intKey ){ releasePage(pPage); return 0; }
+    if( pPage->leaf ){ releasePage(pPage); return (u32)pgno; }
+    lwr = 0;
+    upr = pPage->nCell-1;
+    while( lwr<=upr ){
+      int idx = (lwr+upr)>>1;
+      i64 nCellKey;
+      getVarint(findCellPastPtr(pPage, idx), (u64*)&nCellKey);
+      if( nCellKey<intKey ) lwr = idx+1; else upr = idx-1;
+    }
+    if( lwr>=pPage->nCell ){
+      chld = get4byte(&pPage->aData[pPage->hdrOffset+8]);
+    }else{
+      chld = get4byte(findCell(pPage, lwr));
+    }
+    releasePage(pPage);
+    if( chld<2 ) return 0;
+    pgno = chld;
+  }
+  return 0;
+}
+u32 sqlite3BfLeafForKey(void *pArg, u32 root, const u8 *pKey){
+  return bfLeafForKey((BtShared*)pArg, root, pKey, 0);
+}
+/*
+** The same descent through pages ALREADY in the pager cache, reading nothing;
+** 0 when a page on the way is not cached.  For the BEGIN CONCURRENT commit
+** scan, which runs after upstream's walLockForCommit has dropped every cached
+** page another transaction changed since our snapshot and before the snapshot
+** is upgraded to the head: what is still cached is valid at both, but a page
+** READ now would come from the old snapshot and outlive the upgrade -- a stale
+** leaf that served an old row (mwriter_oracle seed 3, 2026-10-18).
+*/
+u32 sqlite3BfLeafForKeyCached(void *pArg, u32 root, const u8 *pKey){
+  return bfLeafForKey((BtShared*)pArg, root, pKey, 1);
+}
+#endif
+
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
 /* True if this cursor's table may have buffered records, so a base cell alone
 ** does not answer a point seek (see sqlite3BtreeTableMoveto). */
 static int bfCursorMayHaveBuffered(BtCursor *pCur){
