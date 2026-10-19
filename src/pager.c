@@ -4769,6 +4769,22 @@ int sqlite3PagerBfFramePages(Pager *pPager, u32 iFrom, u32 iTo, u32 **paPg, int 
 #endif
   return SQLITE_OK;
 }
+/* C4c: WRITE lock before the snapshot (wal.c sqlite3WalBfWriteLockFirst).
+** Only once the WAL is open (a first transaction finds no WAL yet). */
+int sqlite3PagerBfWriteLockFirst(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) && pPager->pWal
+   && pPager->exclusiveMode==0 && sqlite3BfGroupSync() ){
+    return sqlite3WalBfWriteLockFirst(pPager->pWal);
+  }
+#endif
+  return SQLITE_OK;
+}
+void sqlite3PagerBfWriteUnlockFirst(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pPager->pWal ) sqlite3WalBfWriteUnlockFirst(pPager->pWal);
+#endif
+}
 int sqlite3PagerBfSyncPending(Pager *pPager){
 #ifndef SQLITE_OMIT_WAL
   if( pPager && pPager->pWal ) return sqlite3WalBfSyncPending(pPager->pWal);

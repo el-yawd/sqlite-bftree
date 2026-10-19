@@ -2518,6 +2518,27 @@ int sqlite3WalDefaultHook(
   const char *zDb,       /* Database */
   int nFrame             /* Size of WAL */
 ){
+#if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
+  /* BF (2026-10-18): once per threshold of NEW frames, not once per commit.
+  ** Stock checkpoints after every commit while the log is past the threshold,
+  ** which is cheap for it.  A BF checkpoint is a system transaction (it
+  ** writes a region segment and fsyncs under the write lock) and, under
+  ** concurrent load, the log cannot restart, so it stays past the threshold:
+  ** every commit ran one.  16 BEGIN CONCURRENT threads under FULL: 398 ->
+  ** 3809 commits/s with auto-checkpoint off, group commit sharing 87% of
+  ** fsyncs instead of 13%. */
+  {
+    int nMin = SQLITE_PTR_TO_INT(pClientData);
+    if( nFrame<db->nBfAutoCkptAt ) db->nBfAutoCkptAt = 0;   /* restarted */
+    if( nFrame>=nMin && nFrame-db->nBfAutoCkptAt>=nMin ){
+      db->nBfAutoCkptAt = nFrame;
+      sqlite3BeginBenignMalloc();
+      sqlite3_wal_checkpoint(db, zDb);
+      sqlite3EndBenignMalloc();
+    }
+    return SQLITE_OK;
+  }
+#endif
   if( nFrame>=SQLITE_PTR_TO_INT(pClientData) ){
     sqlite3BeginBenignMalloc();
     sqlite3_wal_checkpoint(db, zDb);

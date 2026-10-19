@@ -3996,6 +3996,16 @@ static SQLITE_NOINLINE int btreeBeginTrans(
   if( pBt->nPage==0 ) pBt->btsFlags |= BTS_INITIALLY_EMPTY;
   do {
     sqlite3PagerWalDb(pPager, p->db);
+#ifndef SQLITE_OMIT_BF_CACHE
+    /* C4c: a non-CONCURRENT write transaction takes the WRITE lock before its
+    ** snapshot, so pending group commits cannot keep it out
+    ** (sqlite3WalBfWriteLockFirst). */
+    if( wrflag && !bConcurrent && pBt->pPage1==0
+     && pBt->inTransaction==TRANS_NONE ){
+      rc = sqlite3PagerBfWriteLockFirst(pPager);
+      if( rc!=SQLITE_OK ) continue;          /* BUSY: the busy handler */
+    }
+#endif
 
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
     /* If transitioning from no transaction directly to a write transaction,
@@ -4128,6 +4138,9 @@ static SQLITE_NOINLINE int btreeBeginTrans(
 #endif
   }while( (rc&0xFF)==SQLITE_BUSY && pBt->inTransaction==TRANS_NONE &&
           btreeInvokeBusyHandler(pBt) );
+#ifndef SQLITE_OMIT_BF_CACHE
+  if( rc!=SQLITE_OK ) sqlite3PagerBfWriteUnlockFirst(pPager);
+#endif
   sqlite3PagerWalDb(pPager, 0);
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
   if( rc==SQLITE_BUSY_TIMEOUT ) rc = SQLITE_BUSY;
@@ -14833,6 +14846,20 @@ int sqlite3BtreeCheckpoint(Btree *p, int eMode, int *pnLog, int *pnCkpt){
     }else{
 #if !defined(SQLITE_OMIT_BF_CACHE) && defined(SQLITE_BF_INSERT_BUFFERING)
       rc = bfCheckpointMaterialize(p, 0);
+      /* A PASSIVE checkpoint does what it can and never fails for a lock --
+      ** the auto-checkpoint after every large enough COMMIT is one, and its
+      ** result becomes that COMMIT's result (sqlite3Step / doWalCallbacks).
+      ** Since C4b the region step needs the write lock; when another writer
+      ** holds it, skip the whole checkpoint -- the backfill too, which without
+      ** the region commit has no cap -- and report success.  Before this, a
+      ** COMMIT that had committed returned SQLITE_BUSY, and an application
+      ** retrying it applied the transaction twice. */
+      if( (rc==SQLITE_BUSY || rc==SQLITE_BUSY_SNAPSHOT)
+       && eMode==SQLITE_CHECKPOINT_PASSIVE ){
+        rc = SQLITE_OK;
+        if( pnLog ) *pnLog = -1;
+        if( pnCkpt ) *pnCkpt = -1;
+      }else
       if( rc==SQLITE_OK )
 #endif
       rc = sqlite3PagerCheckpoint(pBt->pPager, p->db, eMode, pnLog, pnCkpt);

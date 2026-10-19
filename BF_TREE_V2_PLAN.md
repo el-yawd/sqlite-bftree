@@ -3509,3 +3509,60 @@ C4 is complete: C4a-d.  Open:
 - The earlier mt range-read flake (C4c); not seen again.
 - Group-commit batching efficiency.
 - The C-letter campaign, which measures C1-C4 with their ablation switches.
+
+### 2026-10-18 (cont.) — Claude Opus 5.5 — C4c group commit: why batches were poor, and the fixes
+
+Owner question: why does group commit batch so few commits?  Measured with a threaded
+checker (random upserts into a 200k-row table, btrfs+LUKS, fsync about 0.7-2.4 ms).  Causes,
+largest first:
+1. **The auto-checkpoint storm.**  Under concurrent load the log never drops below 1000 frames,
+   so EVERY commit ran a BF checkpoint.  With `wal_autocheckpoint=0`, 16 threads reached 3809
+   commits/s with 87% of commits sharing an fsync.
+2. **A non-CONCURRENT writer (the region checkpoint txn) waited 1.6 s on average.**  It got
+   BUSY_SNAPSHOT while commits were pending, then the busy handler slept.
+3. **Busy-handler sleeps (1-100 ms) are 50x an fsync.**  A waiter for the WRITE lock slept far
+   past the moment the lock came free.
+4. **The leader mutex was not FIFO**, so a waiter whose commit was already covered waited
+   behind the next leader's fsync.
+Not a cause: the "COMMIT rc=5" errors were BUSY_SNAPSHOT conflicts (517) with a stale errmsg
+left by the auto-checkpoint.  Nothing was committed-but-reported-busy.
+
+Fixes (wal.c, btree.c, pager.c, main.c; all BF-guarded):
+- **In-process WRITE-lock wait** (`walBfWriteLockWait`): a per-file condvar, broadcast on
+  every WRITE unlock (`WAL_WRITE_UNLOCK`), in 2 ms slices, up to 100 ms, before falling back
+  to the busy handler.  Switch: `-DSQLITE_BF_NO_LOCKWAIT` (also used when not unix or not
+  threadsafe).
+- **Group wait on a condvar:** one leader at a time; the others re-check publication when it
+  broadcasts.  The leader reads the head lock-free (checksummed pending slot) and takes the
+  WRITE lock only to publish.
+- **Lock-first for non-CONCURRENT writers:**
+  - `btreeBeginTrans` takes WRITE before the read snapshot (`sqlite3PagerBfWriteLockFirst`),
+    publishes pending commits, then begins on a snapshot that can no longer be stale.
+  - `sqlite3WalBeginWriteTransaction` adopts the lock.
+  - Only when `bf_group_sync` is on, the db is not in exclusive mode, and WAL is open.
+- **PASSIVE checkpoint, BUSY region txn -> OK with -1/-1.**  The pager checkpoint is skipped,
+  because without the region cap a backfill would be unsafe.
+- **Auto-checkpoint throttle** (`db->nBfAutoCkptAt`): the hook fires again only after another
+  N frames, not on every commit while the log is above N.
+
+Measured (noisy: btrfs+LUKS throughput varies 487-3831 commits/s run to run):
+
+| | commits sharing an fsync |
+|---|---|
+| before, 4 / 16 threads | 13-28% |
+| after, 4 threads | ~50% |
+| after, 16 threads | ~87% |
+
+About 800 fsyncs per run, with auto-checkpoint on or off.  Auto-checkpoint still costs
+latency: 15-19 ms per commit at 16 threads, against ~3 ms with it off.  Next lever: a cheaper
+region checkpoint.
+
+Verified:
+- `gate --full` 60/60.
+- mt (MT_SMALL) 3-10 x3: 216/216.
+- 180 parallel repeats of the old failing cell: 0 failures.
+- mwriter 108/108 (plus 324 and 432 more in the background runs).
+- mt crash 3 seeds, power torn/lost: OK.
+- The 2/72 "scr range wrong" failures seen mid-work came from a sweep WITHOUT `MT_SMALL=1`.
+  Pristine HEAD fails that mode too (1/144, "malformed"): the known upstream free-list bug,
+  not a regression.

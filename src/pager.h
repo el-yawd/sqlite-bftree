@@ -301,6 +301,8 @@ u64 sqlite3PagerBfLogBytes(Pager*);
 void sqlite3PagerBfGroupStats(Pager*, u64 *aOut);
 int sqlite3PagerBfGroupWait(Pager*);
 int sqlite3PagerBfSyncPending(Pager*);
+int sqlite3PagerBfWriteLockFirst(Pager*);
+void sqlite3PagerBfWriteUnlockFirst(Pager*);
 #ifndef BF_CROSSINFO_TYPEDEF
 #define BF_CROSSINFO_TYPEDEF
 typedef struct BfCrossInfo BfCrossInfo;

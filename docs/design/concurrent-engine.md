@@ -424,3 +424,11 @@ in place, so it cannot have them), a restart is bridged with region segments.
     into the index it drops.
   - No CKPT fold or restart fold while a crossing is pending, or older segments overwrite newer
     folded ops.
+- *Batching (2026-10-18):*
+  - In-process writers wait for the WRITE lock on a condvar instead of busy-handler sleeps.
+  - Group waiters sleep on a condvar behind one leader.
+  - Non-CONCURRENT writers lock first: they take WRITE, then publish pending commits, then
+    take a snapshot.
+  - The BF auto-checkpoint is throttled to once per N new frames.
+  - Result: commits sharing an fsync rose from 13-28% to ~50% (4 threads) and ~87% (16).
+  - Switch: `SQLITE_BF_NO_LOCKWAIT`.

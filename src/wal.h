@@ -62,6 +62,8 @@
 #  define sqlite3WalBfSetLastSeg(w,x,y,z)
 #  define sqlite3WalBfFramePages(v,w,x,y,z)      0
 #  define sqlite3WalBfSyncPending(x)             0
+#  define sqlite3WalBfWriteLockFirst(x)          0
+#  define sqlite3WalBfWriteUnlockFirst(x)
 #  define sqlite3WalBfGroupStats(x,y)
 #  define sqlite3WalBfGeneration(w,x,y)          (*(y)=0)
 #  define sqlite3WalBfHasStaged(x)               0
@@ -166,6 +168,8 @@ int sqlite3WalBfCrossGenDone(Wal *pWal, int bOk, const u32 *aSegSalt, u32 iSegMx
 void sqlite3WalBfSetLastSeg(Wal *pWal, int bKnown, const u32 *aSalt, u32 iMx);
 int sqlite3WalBfFramePages(Wal *pWal, u32 iFrom, u32 iTo, u32 **paPg, int *pnPg);
 int sqlite3WalBfSyncPending(Wal *pWal);
+int sqlite3WalBfWriteLockFirst(Wal *pWal);
+void sqlite3WalBfWriteUnlockFirst(Wal *pWal);
 void sqlite3WalBfGroupStats(Wal *pWal, u64 *aOut);
 void sqlite3WalBfGeneration(Wal *pWal, u32 *aSalt, u32 *pmxFrame);
 /* True iff record payloads are staged for the pending commit. */
