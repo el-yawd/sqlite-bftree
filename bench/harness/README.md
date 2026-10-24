@@ -284,6 +284,33 @@ report excludes the run, if they grow by more than 256 pages.  In a valid direct
 `O_DIRECT` kills the run rather than falling back.  Warm up in operations
 (`warmup_ops`), not seconds, so both modes enter the measured phase with the same history.
 
+## Hardware counters: instructions/op (`pmu` in the result JSON; 2026-10-24)
+
+Throughput on these machines moves 10-20% run to run, and a cloud VM adds
+neighbours.  Two metrics do not move: **device reads/op** (direct I/O) and
+**user-space instructions/op**.  The same code on the same input retires the
+same instructions; measured here, two identical runs read 4556.4 and 4556.4
+instructions/op, while cycles/op moved 3%.  Quote these two first, and time
+second.
+
+- `bfbench` opens one `perf_event_open` group (instructions, cycles,
+  branches, branch-misses) **per core-type PMU** and sums the groups.
+  - On a hybrid CPU (this laptop's i5-1235U: `cpu_core` + `cpu_atom`), a
+    plain event counts only while the thread sits on ONE core type.
+  - The first version read 22-28% of the task's time.  Two identical runs
+    then gave 999 vs 1278 instructions/op.
+- `coverage` = time_running / time_enabled.  `report.py` uses a count only at
+  coverage >= 0.99; below that it is a multiplexed sample, not a total.
+- User space only (`exclude_kernel`): works at `perf_event_paranoid=2`, and
+  keeps the I/O stack's syscall work out.
+- The count includes the driver's own per-op work (zipf sampling, timing),
+  identical for every SUT.  Compare SUTs, not absolute numbers.
+- Many VMs expose no PMU.  Then `"pmu": {"available": 0}`, the run goes on,
+  and the `instr/op` column shows `-`.  `run_thesis_cloud.sh check` probes
+  for it.
+- `report.py` prints `dev reads/op` and `instr/op` in every experiment table,
+  and their stock/bf ratios in the comparison block.
+
 ## Known gaps
 
 - **Single threaded.** The fork keeps SQLite's single-writer serialisation, so

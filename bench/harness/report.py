@@ -68,6 +68,15 @@ def metrics(r):
     files = res.get("files") or {}
     bf = res.get("bf") or {}
     cpu = res.get("cpu") or {}
+    dio = res.get("dio") or {}
+    pmu = res.get("pmu") or {}
+    nops = res.get("ops") or 0
+    # The two machine-independent metrics (2026-10-24): device reads/op (direct
+    # I/O only -- buffered runs read through the OS cache) and user-space
+    # instructions/op from the PMU, valid only at full coverage (no hybrid-core
+    # gaps, no multiplexing; bfbench.c pmuOpen).
+    pmu_ok = (pmu.get("available") == 1 and pmu.get("coverage", 0) >= 0.99
+              and pmu.get("instructions") is not None)
 
     # The latency we quote is the dominant op of the mix, so a 95/5 workload is
     # reported by its reads and a scan workload by its scans.
@@ -98,6 +107,12 @@ def metrics(r):
                               if res.get("ops") else 0.0),
         "write_bytes_per_commit": (wal_written / commits) if commits else 0.0,
         "cpu_s": cpu.get("user_s", 0.0) + cpu.get("sys_s", 0.0),
+        "dev_reads_per_op": (dio.get("reads", 0) / nops
+                             if dio.get("direct_io") and nops else None),
+        "instr_per_op": (pmu["instructions"] / nops if pmu_ok and nops else None),
+        "branch_miss_per_op": (pmu["branch_misses"] / nops
+                               if pmu_ok and nops and pmu.get("branch_misses") is not None
+                               else None),
         "maxrss_MiB": cpu.get("maxrss_kb", 0) / 1024.0,
         # Record-cache hit rate.  Before the bf_cache.c counter split this
         # shared its counters with the pcache2 xFetch path, so it reported the
@@ -192,7 +207,8 @@ NOISE_THRESHOLD = 0.15
 LOWER_IS_BETTER = {"p50_us", "p99_us", "p999_us", "commit_p50_us",
                    "commit_p99_us", "read_MiB", "write_MiB", "cpu_s",
                    "read_bytes_per_op", "write_bytes_per_commit",
-                   "maxrss_MiB", "bf_bytes_per_record"}
+                   "maxrss_MiB", "bf_bytes_per_record",
+                   "dev_reads_per_op", "instr_per_op", "branch_miss_per_op"}
 
 
 def ratio(metric, bf_val, stock_val):
@@ -306,7 +322,8 @@ def main():
         hdr = ["config", "sut", "ops/s", "spread", "p50 us", "p99 us", "p99.9 us"]
         if has_commit:
             hdr += ["commit p50 us", "commit p99 us", "WAL B/commit"]
-        hdr += ["read MiB", "write MiB", "CPU s", "rec hit%", "pg hit%"]
+        hdr += ["dev reads/op", "instr/op", "read MiB", "write MiB", "CPU s",
+                "rec hit%", "pg hit%"]
         W("| " + " | ".join(hdr) + " |")
         W("|" + "---|" * len(hdr))
 
@@ -338,6 +355,10 @@ def main():
                     hfmt = lambda h: fmt(median(h), 1) + "L"
                 phit = [m["bf_page_hit_rate"] for m in ms
                         if m.get("bf_page_hit_rate") is not None]
+                def medn(metric, nd):
+                    vs = [m[metric] for m in ms if m[metric] is not None]
+                    return fmt(median(vs), nd) if vs else "-"
+                row += [medn("dev_reads_per_op", 4), medn("instr_per_op", 0)]
                 row += [fmt(median([m["read_MiB"] for m in ms]), 1),
                         fmt(median([m["write_MiB"] for m in ms]), 1),
                         fmt(median([m["cpu_s"] for m in ms]), 1),
@@ -405,23 +426,27 @@ def main():
                 continue
             W("")
             W("| config | ops/s %s/%s | p50 %s/%s | p99 %s/%s | "
-              "read bytes/op %s/%s | WAL B/commit %s/%s |"
+              "read bytes/op %s/%s | dev reads/op %s/%s | instr/op %s/%s | "
+              "WAL B/commit %s/%s |"
               % (sut_bf, base, base, sut_bf, base, sut_bf, base, sut_bf,
-                 base, sut_bf))
-            W("|---|---|---|---|---|---|")
+                 base, sut_bf, base, sut_bf, base, sut_bf))
+            W("|---|---|---|---|---|---|---|---|")
             for ax in axes:
                 b = groups.get((exp, ax, sut_bf))
                 st = groups.get((exp, ax, base))
                 if not b or not st:
                     continue
                 def rr(metric):
-                    return ratio(metric,
-                                 median([m[metric] for m in b]),
-                                 median([m[metric] for m in st]))
-                W("| %s | %s | %s | %s | %s | %s |" % (
+                    vb = [m[metric] for m in b if m[metric] is not None]
+                    vs = [m[metric] for m in st if m[metric] is not None]
+                    if not vb or not vs:
+                        return None
+                    return ratio(metric, median(vb), median(vs))
+                W("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
                     ax,
                     fmt(rr("ops_s"), 2), fmt(rr("p50_us"), 2),
                     fmt(rr("p99_us"), 2), fmt(rr("read_bytes_per_op"), 2),
+                    fmt(rr("dev_reads_per_op"), 2), fmt(rr("instr_per_op"), 2),
                     fmt(rr("write_bytes_per_commit"), 2)))
         W("")
 

@@ -74,6 +74,162 @@ static uint64_t nowNs(void){
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/*
+** Hardware counters over the measured phase (2026-10-24).
+**
+** Time on this project's machines varies run to run (btrfs+LUKS laptop, cloud
+** VMs); instruction and branch counts do not -- the same code on the same
+** input retires the same instructions (bbtree's perf review measures +-0.0%).
+** So next to device reads/op, instructions/op is the second machine-
+** independent metric: the CPU cost of a design, separable from I/O luck.
+**
+** One perf_event_open group, user space only (exclude_kernel: works at
+** perf_event_paranoid=2 and keeps syscall/IO-stack noise out), read once with
+** time_enabled/time_running so multiplexing is visible.  The count includes
+** the driver's own per-op work (key sampling, timing), identical for every
+** SUT.  Many cloud VMs expose no PMU: then "available": 0 and the run goes
+** on -- never fail a benchmark for want of a counter.
+*/
+#ifdef __linux__
+# include <linux/perf_event.h>
+# include <sys/syscall.h>
+# include <sys/ioctl.h>
+#endif
+#define PMU_N 4           /* events per group */
+#define PMU_MAXG 2        /* groups: one per core-type PMU on hybrid CPUs */
+static const char *const azPmuName[PMU_N] = {
+  "instructions", "cycles", "branches", "branch_misses"
+};
+/*
+** Hybrid CPUs (Intel P+E cores) have one PMU per core type, and a plain
+** PERF_TYPE_HARDWARE event counts only while the task runs on ONE of them: on
+** the i5-1235U a single group ran for 22-28% of the task's time and two
+** identical stock runs read 999 and 1278 instructions/op.  So open one group
+** per core-type PMU (the PMU's type in config bits 32-63, Linux >= 5.13) and
+** sum: each counts while the task is on its cores, together everything.
+** Non-hybrid machines (cloud servers) get one plain group.  coverage =
+** sum(time_running)/time_enabled is reported; below ~0.99 the counts are
+** multiplexed samples, not totals, and must not be quoted.
+*/
+typedef struct Pmu Pmu;
+struct Pmu {
+  int nGroup;
+  int fd[PMU_MAXG][PMU_N];  /* fd[g][0] leads group g; -1 if absent */
+  int err;                  /* errno of the first leader's failure, else 0 */
+  uint64_t aVal[PMU_N];     /* summed over groups */
+  int aHave[PMU_N];         /* event opened in at least one group */
+  uint64_t tEnabled, tRunning;   /* tEnabled: max over groups; tRunning: sum */
+};
+static int pmuSysType(const char *zPmu){
+  char buf[256];
+  FILE *f;
+  int t = -1;
+  snprintf(buf, sizeof(buf), "/sys/bus/event_source/devices/%s/type", zPmu);
+  f = fopen(buf, "r");
+  if( f ){ if( fscanf(f, "%d", &t)!=1 ) t = -1; fclose(f); }
+  return t;
+}
+static void pmuOpen(Pmu *p){
+  int g, i;
+  memset(p, 0, sizeof(*p));
+  for(g=0; g<PMU_MAXG; g++) for(i=0; i<PMU_N; i++) p->fd[g][i] = -1;
+#ifdef __linux__
+  {
+    static const uint64_t aCfg[PMU_N] = {
+      PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_HW_CPU_CYCLES,
+      PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES
+    };
+    int aType[PMU_MAXG], nType = 0;
+    int tCore = pmuSysType("cpu_core"), tAtom = pmuSysType("cpu_atom");
+    if( tCore>=0 ) aType[nType++] = tCore;
+    if( tAtom>=0 ) aType[nType++] = tAtom;
+    if( nType==0 ) aType[nType++] = -1;          /* plain events */
+    for(g=0; g<nType; g++){
+      for(i=0; i<PMU_N; i++){
+        struct perf_event_attr a;
+        memset(&a, 0, sizeof(a));
+        a.size = sizeof(a);
+        a.type = PERF_TYPE_HARDWARE;
+        a.config = aCfg[i] | (aType[g]>=0 ? ((uint64_t)aType[g]<<32) : 0);
+        a.disabled = (i==0);
+        a.exclude_kernel = 1;
+        a.exclude_hv = 1;
+        a.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED
+                      | PERF_FORMAT_TOTAL_TIME_RUNNING;
+        p->fd[g][i] = (int)syscall(SYS_perf_event_open, &a, 0, -1,
+                                   i==0 ? -1 : p->fd[g][0], 0);
+        if( p->fd[g][i]<0 ){
+          if( i==0 ){ if( !p->err ) p->err = errno; break; }
+          continue;
+        }
+        p->aHave[i] = 1;
+      }
+      if( p->fd[g][0]>=0 ) p->nGroup = g+1;
+    }
+  }
+#endif
+}
+static void pmuStart(Pmu *p){
+#ifdef __linux__
+  int g;
+  for(g=0; g<PMU_MAXG; g++){
+    if( p->fd[g][0]<0 ) continue;
+    ioctl(p->fd[g][0], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
+    ioctl(p->fd[g][0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+  }
+#else
+  (void)p;
+#endif
+}
+static void pmuStop(Pmu *p){
+#ifdef __linux__
+  int g, i, k;
+  for(g=0; g<PMU_MAXG; g++){
+    if( p->fd[g][0]>=0 ) ioctl(p->fd[g][0], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+  }
+  for(g=0; g<PMU_MAXG; g++){
+    /* {nr, time_enabled, time_running, value[nr]} in open order; members
+    ** that failed to open are absent from the group. */
+    uint64_t buf[3+PMU_N];
+    if( p->fd[g][0]<0 ) continue;
+    if( read(p->fd[g][0], buf, sizeof(buf)) >= (ssize_t)(3*sizeof(uint64_t)) ){
+      if( buf[1]>p->tEnabled ) p->tEnabled = buf[1];
+      p->tRunning += buf[2];
+      for(i=0, k=0; i<PMU_N && k<(int)buf[0]; i++){
+        if( p->fd[g][i]>=0 ) p->aVal[i] += buf[3+k++];
+      }
+    }
+    for(i=0; i<PMU_N; i++) if( p->fd[g][i]>=0 ) close(p->fd[g][i]);
+  }
+#else
+  (void)p;
+#endif
+}
+static void pmuJson(FILE *out, const Pmu *p, long long nOps){
+  int i;
+  if( p->nGroup==0 ){
+    fprintf(out, "    \"pmu\": {\"available\": 0, \"error\": \"%s\"},\n",
+            strerror(p->err ? p->err : ENOSYS));
+    return;
+  }
+  fprintf(out, "    \"pmu\": {\"available\": 1, \"groups\": %d, "
+               "\"time_enabled_ns\": %llu, \"time_running_ns\": %llu, "
+               "\"coverage\": %.4f",
+          p->nGroup, (unsigned long long)p->tEnabled,
+          (unsigned long long)p->tRunning,
+          p->tEnabled ? (double)p->tRunning/(double)p->tEnabled : 0.0);
+  for(i=0; i<PMU_N; i++){
+    if( !p->aHave[i] ){
+      fprintf(out, ", \"%s\": null", azPmuName[i]);
+    }else{
+      fprintf(out, ", \"%s\": %llu, \"%s_per_op\": %.2f", azPmuName[i],
+              (unsigned long long)p->aVal[i], azPmuName[i],
+              nOps>0 ? (double)p->aVal[i]/(double)nOps : 0.0);
+    }
+  }
+  fprintf(out, "},\n");
+}
+
 /* xoshiro256** -- fast, good quality, deterministic from a seed. */
 typedef struct Rng { uint64_t s[4]; } Rng;
 
@@ -1280,6 +1436,7 @@ static int cmdRun(Config *p){
   RunState s;
   ProcIo io0, io1;
   struct rusage ru0, ru1;
+  Pmu pmu;
   BfStats bf0, bf1;
   long long dbSize0, walSize0, dbSize1, walSize1, walMax = 0;
   int dbCacheHit0=0, dbCacheMiss0=0, dbCacheWrite0=0, dbCacheSpill0=0, dummy;
@@ -1424,12 +1581,14 @@ static int cmdRun(Config *p){
   memset(&gDio, 0, sizeof(gDio));     /* direct-I/O counters: measured phase only */
   procIoRead(&io0);
   getrusage(RUSAGE_SELF, &ru0);
+  pmuOpen(&pmu);
 
   /* ---- measured phase --------------------------------------------------- */
   if( p->bReadTxn && !mixHasWrites(p) ){
     execOrDie(db, "BEGIN");                /* one long read transaction */
     inTxn = 1;
   }
+  pmuStart(&pmu);
   tStart = nowSec();
   for(;;){
     int op;
@@ -1478,6 +1637,7 @@ static int cmdRun(Config *p){
     inTxn = 0;
   }
   tEnd = nowSec();
+  pmuStop(&pmu);
   elapsed = tEnd - tStart;
 
   /* ---- snapshot counters at the end ------------------------------------ */
@@ -1577,6 +1737,8 @@ static int cmdRun(Config *p){
           ru1.ru_maxrss,
           ru1.ru_minflt - ru0.ru_minflt,
           ru1.ru_majflt - ru0.ru_majflt);
+
+  pmuJson(out, &pmu, nDone);
 
   fprintf(out, "    \"io\": {\"read_bytes\": %llu, \"write_bytes\": %llu, "
                "\"rchar\": %llu, \"wchar\": %llu, \"syscr\": %llu, "
