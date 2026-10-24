@@ -3566,3 +3566,25 @@ Verified:
 - The 2/72 "scr range wrong" failures seen mid-work came from a sweep WITHOUT `MT_SMALL=1`.
   Pristine HEAD fails that mode too (1/144, "malformed"): the known upstream free-list bug,
   not a regression.
+
+### 2026-10-24 — Claude Opus 5.5 — `thesis` branch opened; scope narrowed (owner)
+
+- Starting revision/state: `405008e2f`, the last gate-green commit (`gate --full` 60/60).
+- **Owner decision:** the thesis is due in about a month, around 2026-11-24.  Its scope is
+  single-thread operation, read paths and correctness.  BEGIN CONCURRENT is deferred to a
+  possible later paper.  Its unfinished work is parked as `c730ee662` on `begin-concurrent-exp`;
+  see that branch's log entry for the open lost-DELETE bug.
+- Why this base: it keeps every single-thread gain, namely C3 logical log, C4a variable frames
+  (~100 B per record frame) and C4b region, plus the single-thread fixes found on the BC line
+  (C2a seek shortcut, recovery scratch heap).  BC stays compiled in but is not claimed.
+- Rules for this branch:
+  - commit only here;
+  - gate before every commit;
+  - no new mechanisms unless they serve reads or correctness;
+  - measure at letter boundaries.
+- Known risk to keep in view: the stranded-record mechanism (`balance_quick` leaves another
+  connection's buffered records under the old leaf) needs more than one connection.  It is out
+  of single-thread scope, but it should be listed as a limitation of the 1-writer + N-reader
+  model.
+- Exact next action: settle the 4-week schedule with the owner, then re-establish the
+  correctness baseline on this branch.
