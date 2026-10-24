@@ -110,6 +110,16 @@ def main():
     add("difftest", f"python3 {BENCH}/difftest.py {'' if full else '--quick'} --jobs {dj} "
                     f"--buf {B} --stock {ST} --bf-shell {bins['sqlite3']} "
                     f"--work {work}/diff")
+    # The BENCHMARKED configuration (bench/harness/build_suts.sh): BEGIN
+    # CONCURRENT compiled out.  Every other task tests the default build, and
+    # 2026-10-24 found this one no longer compiled (pPager->pAllRead).
+    noconc = (f"cc -O2 -DSQLITE_OMIT_CONCURRENT -DSQLITE_BF_INSERT_BUFFERING "
+              f"-DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_DQS=0 -DSQLITE_ENABLE_FTS4 "
+              f"-DSQLITE_ENABLE_RTREE -I{BUILD} -I{ROOT}/src -o {work}/sqlite3_noconc "
+              f"{BUILD}/shell.c {amal_snap} -lm -lz")
+    add("difftest:noconc", f"{noconc} && python3 {BENCH}/difftest.py --quick --suite buf "
+                           f"--jobs 2 --buf {work}/sqlite3_noconc --stock {ST} "
+                           f"--work {work}/diff_noconc")
     add("repro:torn_tail", f"sh {BENCH}/torn_tail_repro.sh {B} && "
                            f"sh {BENCH}/torn_tail_repro.sh {DBG}")
     add("repro:recover", f"sh {BENCH}/recover_repro.sh {B} {2000 if full else 250} && "

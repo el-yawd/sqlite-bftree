@@ -3654,3 +3654,43 @@ Verified:
 - Machine note: two OOM kills, both a single difftest.py driver at 4.5 GB.  It keeps every
   case's output in memory; 160 seeds is too many.  Soaks now run 20 seeds per invocation,
   at `--jobs 4`.
+
+### 2026-10-24 (cont.) — Claude Opus 5.5 — benchmarked build fixed; read regression smoke; cloud campaign packaged
+
+- **The benchmarked build did not compile.**
+  - `bench/harness/build_suts.sh` builds every SUT with `-DSQLITE_OMIT_CONCURRENT`.
+  - The C4c group-commit arm in `sqlite3PagerCommitPhaseOne` used `pPager->pAllRead`, which
+    exists only with BEGIN CONCURRENT.
+  - Fix: guard it, and pass 0 when OMIT_CONCURRENT.
+  - No gate task tested that configuration.  New gate task `difftest:noconc` compiles it and
+    runs difftest `--quick --suite buf` on it (324 cases, ~35 s).
+  - Full difftest on it: 2013/2013 clean.
+  - `gate --full --jobs 4`: 62/62.
+- **Read regression smoke**, `configs/thesis_regress.json`, `results/thesis_regress`.
+  NOT QUOTABLE: 1 repeat, 500k warmup, 30 s.
+  - Setup: v100, 32 MiB, direct I/O.
+  - SUTs: stock vs `bf_pre` = `6a46013` (the binaries of `results/b3b`) vs bf = HEAD.
+  - Device reads/op:
+
+    | arm | stock | bf_pre | bf HEAD |
+    |---|---|---|---|
+    | point, scrambled zipf | 0.657 | 0.463 | 0.464 |
+    | point, raw zipf | 0.389 | 0.455 | 0.453 |
+    | 32-row scans | 1.289 | 1.289 | 1.290 |
+    | read 90 / scan 10 | 0.730 | 0.655 | 0.655 |
+
+  - **No read regression** from C3/C4 and today's fixes: bf vs bf_pre is within 0.5% on every
+    arm.  Throughput is within noise (-4.7% to +6.6%, one repeat on a laptop).
+  - Raw zipf at this short warmup is 16% behind stock.  `results/b3b` measured parity
+    (0.383 vs 0.389) at 2M warmup, so it is the warmup, not a change.
+- **Full campaign packaged for a dedicated (cloud) machine**, owner's choice:
+  - `configs/thesis_reads.json`: 27 cells x 3 repeats = 81 runs, about 7 h.
+    - Point reads: v100/v16 x scrambled/raw.  SUTs: stock, bf, bf_nofull, bf in page mode
+      (`read_record_cache=0`), bf X1 (`adaptive_full=8`).
+    - 32-row scans: stock, bf, bf_noscan, bf_nofull.
+    - read90/scan10 mix: stock, bf, bf `scan_promotion=0`.
+  - `bench/harness/run_thesis_cloud.sh`: preflight (systemd-run, cgroup v2, 30 GiB free),
+    build, campaign with `--continue-on-error`, report.  `check` mode runs nothing.
+- Exact next action: the owner runs `sh bench/harness/run_thesis_cloud.sh` on the cloud
+  machine.  Locally, continue the read-path review: profile point reads at HEAD for CPU
+  accidents, using the P1 method.

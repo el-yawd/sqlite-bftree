@@ -7245,8 +7245,12 @@ int sqlite3PagerCommitPhaseOne(
 #ifndef SQLITE_OMIT_BF_CACHE
         /* C4c: a BEGIN CONCURRENT commit may share its fsync with others
         ** (it waits for it in sqlite3WalEndWriteTransaction). */
+#ifndef SQLITE_OMIT_CONCURRENT
         sqlite3WalBfArmGroupSync(pPager->pWal,
                                  pPager->pAllRead!=0 && sqlite3BfGroupSync());
+#else
+        sqlite3WalBfArmGroupSync(pPager->pWal, 0);
+#endif
 #endif
         rc = pagerWalFrames(pPager, pList, pPager->dbSize, 1);
       }

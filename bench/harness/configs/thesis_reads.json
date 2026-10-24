@@ -1,0 +1,249 @@
+{
+ "name": "thesis_reads",
+ "_comment": [
+  "THE thesis read campaign (2026-10-24), meant for a dedicated cloud machine.",
+  "Point reads: v100 (4M x 100 B) and v16 (20M x 16 B), scrambled zipf (hot records scattered) and raw",
+  "zipf (hot keys contiguous, the paper's), 0.9.  SUTs: stock; bf (reference defaults: record mode);",
+  "bf_nofull (M2 ablation: no full-page copies); bf read_record_cache=0 (reference page mode);",
+  "bf adaptive_full=8 (X1, our experiment, default off).  Scans: 32-row, stock / bf / bf_noscan (M3",
+  "ablation) / bf_nofull.  Mix: read 90 / scan 10, stock / bf / bf scan_promotion=0.",
+  "32 MiB budget, direct I/O (the reference's I/O model).  QUOTE device reads/op (dio.reads/op) first;",
+  "throughput second, and only from a quiet machine.  Report cached_records and evictions beside hit rates."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  },
+  "v16": {
+   "records": 20000000,
+   "value_len": 16,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 3,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true,
+  "workload": "read=100"
+ },
+ "experiments": [
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nofull"
+   ]
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8
+    ]
+   }
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nofull"
+   ]
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8
+    ]
+   }
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nofull"
+   ]
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8
+    ]
+   }
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_nofull"
+   ]
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "read_record_cache": [
+     0
+    ]
+   }
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     8
+    ]
+   }
+  },
+  {
+   "name": "scan",
+   "dist": "zipf",
+   "workload": "scan=100",
+   "warmup_ops": 300000,
+   "suts": [
+    "stock",
+    "bf",
+    "bf_noscan",
+    "bf_nofull"
+   ]
+  },
+  {
+   "name": "mix_read_scan",
+   "dist": "zipf",
+   "workload": "read=90,scan=10",
+   "warmup_ops": 1000000,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "mix_read_scan",
+   "dist": "zipf",
+   "workload": "read=90,scan=10",
+   "warmup_ops": 1000000,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "scan_promotion": [
+     0
+    ]
+   }
+  }
+ ]
+}

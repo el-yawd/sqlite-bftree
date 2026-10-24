@@ -1,0 +1,23 @@
+{
+ "name": "thesis_regress",
+ "_comment": [
+  "2026-10-24 thesis week 1, NOT QUOTABLE (1 repeat, short warmup): did the read path regress",
+  "between the last measured read binaries (bf_pre = 6a46013, results/b3b) and thesis HEAD",
+  "(C3 logical log, C4 region/frames, the 2026-10-24 fixes)?  Compare bf vs bf_pre device",
+  "reads/op and served%; stock is the anchor.  v100, 32 MiB, direct I/O."
+ ],
+ "datasets": {"v100": {"records": 4000000, "value_len": 100, "key_spacing": 16}},
+ "defaults": {
+  "dataset": "v100", "repeats": 1, "seconds": 30, "warmup_ops": 500000,
+  "theta": 0.9, "scan_len": 32, "synchronous": "normal", "journal": "wal",
+  "ops_per_txn": 1, "read_txn": true, "drop_cache": true, "budget_bytes": "32M",
+  "memmax": "auto", "promotion": 30, "copy_on_access": 10, "direct_io": true,
+  "suts": ["stock", "bf_pre", "bf"]
+ },
+ "experiments": [
+  {"name": "read_scrambled", "dist": "zipf", "workload": "read=100"},
+  {"name": "read_raw", "dist": "zipf-raw", "workload": "read=100"},
+  {"name": "scan", "dist": "zipf", "workload": "scan=100"},
+  {"name": "mix_read_scan", "dist": "zipf", "workload": "read=90,scan=10"}
+ ]
+}
