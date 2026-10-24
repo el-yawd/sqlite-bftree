@@ -3694,3 +3694,40 @@ Verified:
 - Exact next action: the owner runs `sh bench/harness/run_thesis_cloud.sh` on the cloud
   machine.  Locally, continue the read-path review: profile point reads at HEAD for CPU
   accidents, using the P1 method.
+
+### 2026-10-24 (cont.) — Claude Opus 5.5 — preview-prefix port: NOT a parity gap, and not worth building (CORRECTS P1)
+
+- **Correction to P1's open box (`leaf_node.rs:96`).**  The reference's prefix comes from FENCES,
+  and only base pages have fences.  Every mini-page path initialises without them, so
+  `prefix_len = 0`:
+  - `initialize_mini_page` passes `has_fence=false`;
+  - `copy_initialize_to` says "Mini-page only, thus no fence" (`leaf_node.rs:1512`);
+  - the split and consolidate paths pass `has_fence` through from a mini-page.
+
+  A reference mini-page's 2-byte preview is the first two key bytes: exactly ours.  **Our
+  mini-page search is already at parity.**
+- Why the preview works for them and not for us is the KEY ENCODING, not the mechanism:
+  - `../bf-tree/benchmark/src/bench_e2e.rs:74`, `install_value_to_buffer`: their keys are
+    murmur64 hashes in native (little-endian) byte order, so the first two bytes are
+    effectively random.
+  - Our keys are sign-flipped big-endian rowids, `80 00 ..` for every rowid below 2^48.
+  - Making our preview discriminate would need a per-mini-page prefix: an extension, not a port.
+- **Upper bound, measured.**  perf, frame-pointer build of HEAD, v100, 32 MiB, direct I/O,
+  500k warmup + 30 s.  Shares of on-CPU samples:
+
+  | | scrambled | raw |
+  |---|---|---|
+  | `btreeBfServeFromCache`, inclusive | 4.9-6.6% | 3.3-3.9% |
+  | `sqlite3BfMiniPageSearch` | 1.3% | 1.0% |
+  | `bfBinarySearch` | <1% | 0.5% |
+
+  Wall time is device-bound: p50 9 us, p99 290 us.  So the port's ceiling is well under 1% of
+  throughput.  P1's 2026-10-01 profile (buffered, CPU-bound) had the shortcut at 19-23%, and
+  that shape does not hold under the thesis's I/O model.
+- Top self frames now:
+  - `sqlite3BtreeTableMoveto` 11-15% and `sqlite3GetVarint` 5-7%: SQLite's own interior
+    descent, shared with stock;
+  - `sqlite3VdbeExec` 8%;
+  - `pow` 3.3-3.5%: the harness's zipf sampler, i.e. benchmark overhead in both SUTs.
+- Decision: P1's preview box is CLOSED as "parity confirmed; extension not worth building".
+  Nothing changed in src/.
