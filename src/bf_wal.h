@@ -240,6 +240,8 @@ int  sqlite3BfRegionDecode(const u8 *a, int nAvail, BfRegionEntry *pE);
 /* Drop every op and marker carried by a frame after mxFrame (a rollback or
 ** savepoint undo discarded them, or they are a crashed commit's torn tail). */
 void        sqlite3BfWalIndexPrune(BfWalIndex *p, u32 mxFrame);
+int         sqlite3BfWalIndexForEachBeyond(BfWalIndex *p, u32 mxFrame,
+                int (*xRec)(void*, const BfWalRec*), void *pCtx);
 
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */
 #endif /* SQLITE_BF_WAL_H */

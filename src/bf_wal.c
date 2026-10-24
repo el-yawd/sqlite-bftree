@@ -771,4 +771,36 @@ void sqlite3BfWalIndexPrune(BfWalIndex *p, u32 mxFrame){
   while( p->nMark>0 && p->aMark[p->nMark-1].iFrame>mxFrame ) p->nMark--;
 }
 
+/* Every INSERT/DELETE op past mxFrame -- frames a rollback discarded, which
+** sqlite3BfWalIndexPrune is about to drop -- as records, each key's in log
+** order (the order across keys is irrelevant: replay is per key).  Markers
+** past mxFrame are not reported: replay never honours them. */
+int sqlite3BfWalIndexForEachBeyond(BfWalIndex *p, u32 mxFrame,
+    int (*xRec)(void*, const BfWalRec*), void *pCtx){
+  int i, j;
+  if( p==0 ) return BFWAL_OK;
+  for(i=0; i<p->nBucket; i++){
+    BfKeyNode *pN;
+    for(pN = p->apBucket[i]; pN; pN = pN->pNext){
+      for(j=0; j<pN->nOp; j++){
+        const BfKeyOp *o = &pN->aOp[j];
+        BfWalRec r;
+        int rc;
+        if( o->iFrame<=mxFrame ) continue;
+        memset(&r, 0, sizeof(r));
+        r.pgno = o->hint;
+        r.rootPgno = pN->root;
+        r.op = o->op;
+        r.nKey = 8;
+        r.pKey = pN->aKey;
+        r.nVal = o->nVal;
+        r.pVal = o->pVal;
+        rc = xRec(pCtx, &r);
+        if( rc!=BFWAL_OK ) return rc;
+      }
+    }
+  }
+  return BFWAL_OK;
+}
+
 #endif /* !defined(SQLITE_OMIT_BF_CACHE) */

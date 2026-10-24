@@ -1130,6 +1130,7 @@ void sqlite3BfBtreeReplayStat(Btree *p, u64 *aOut){
   aOut[22] = pBf ? pBf->nRegionPages : 0;
   aOut[23] = pBf ? pBf->nRegionSeed : 0;
   aOut[24] = pBf ? pBf->nRegionCross : 0;
+  aOut[25] = pBf ? pBf->nDiscardCarry : 0;
 }
 
 void sqlite3BfBtreeUpgradeShedStat(Btree *p, u64 *pnShed){
@@ -1608,6 +1609,114 @@ void sqlite3BfTxnEnd(BtShared *pBt){
   pBf->nTxnPg = 0;
 }
 
+/*
+** Rollback with discarded frames (2026-10-24).  A mid-transaction spill writes
+** the deferred-commit batches staged so far -- COMMITTED records -- into WAL
+** frames of the transaction, and its ROLLBACK discards those frames.  The
+** index still holds their ops (sqlite3WalUndo defers the prune), and the
+** rebuild below replays them, but into the cache only: dirty and unlogged,
+** for the next commit to log.  Any full rebuild before that commit -- the
+** snapshot rebuild of the next read transaction, which re-adds only the
+** carry -- lost them (bench/difftest.py, group8, gen_fullpage_stress seed
+** 312: two acknowledged autocommit writes gone after
+**   BEGIN; INSERT ...; SAVEPOINT s; UPDATE <spills>; ROLLBACK;).
+** So they join the carry, ahead of it: they were staged before anything now
+** carried, stage, or open batch.  Ablation: SQLITE_BF_NO_DISCARD_CARRY.
+*/
+#ifndef SQLITE_BF_NO_DISCARD_CARRY
+typedef struct BfDiscardCtx BfDiscardCtx;
+struct BfDiscardCtx {
+  BfGroup    *g;
+  u8        **ap;       /* finished batches, in order */
+  int         n, nAlloc;
+  u8         *aCur;     /* batch being filled (szPage bytes) */
+  BfWalBatch  b;
+  int         rc;
+  u64         nOp;
+};
+static int bfDiscardFlush(BfDiscardCtx *c){
+  if( c->aCur==0 || c->b.nRec==0 ) return SQLITE_OK;
+  sqlite3BfWalBatchFinish(&c->b);
+  if( c->n>=c->nAlloc ){
+    int nNew = c->nAlloc ? c->nAlloc*2 : 4;
+    u8 **ap = (u8**)sqlite3_realloc64(c->ap, (u64)nNew*sizeof(u8*));
+    if( ap==0 ) return SQLITE_NOMEM_BKPT;
+    c->ap = ap;
+    c->nAlloc = nNew;
+  }
+  c->ap[c->n++] = c->aCur;
+  c->aCur = 0;
+  return SQLITE_OK;
+}
+static int bfDiscardRec(void *pCtx, const BfWalRec *pRec){
+  BfDiscardCtx *c = (BfDiscardCtx*)pCtx;
+  int k;
+  for(k=0; k<2; k++){
+    if( c->aCur==0 ){
+      c->aCur = (u8*)sqlite3_malloc(c->g->szPage);
+      if( c->aCur==0 ){ c->rc = SQLITE_NOMEM_BKPT; return BFWAL_NOMEM; }
+      sqlite3BfWalBatchInit(&c->b, c->aCur, c->g->szPage);
+    }
+    if( sqlite3BfWalBatchAppend(&c->b, pRec)==BFWAL_OK ){
+      c->nOp++;
+      return BFWAL_OK;
+    }
+    if( c->b.nRec==0 ) break;           /* does not fit an empty batch */
+    c->rc = bfDiscardFlush(c);
+    if( c->rc ) return BFWAL_NOMEM;
+  }
+  c->rc = SQLITE_CORRUPT_BKPT;
+  return BFWAL_CORRUPT;
+}
+#endif /* SQLITE_BF_NO_DISCARD_CARRY */
+/* Returns 1 if the rollback discarded frames and every op they carried is now
+** in the carry. */
+static int bfCarryDiscarded(BfCache *pBf, Btree *p, int *pRc){
+#ifndef SQLITE_BF_NO_DISCARD_CARRY
+  BfDiscardCtx c;
+  int rc, i, bAny;
+  memset(&c, 0, sizeof(c));
+  c.g = (BfGroup*)pBf->pGroupCommit;
+  if( c.g==0 ){
+    c.g = bfGroupGet(pBf, pBf->szPage);
+    if( c.g==0 ){ *pRc = SQLITE_NOMEM_BKPT; return 0; }
+  }
+  bAny = sqlite3PagerBfForEachDiscarded(p->pBt->pPager, bfDiscardRec, &c, &rc);
+  if( rc==SQLITE_OK && c.rc ) rc = c.rc;
+  if( rc==SQLITE_OK ) rc = bfDiscardFlush(&c);
+  if( rc==SQLITE_OK && c.n>0 ){
+    /* Prepend: older than everything carried now. */
+    BfGroup *g = c.g;
+    if( g->nCarry+c.n>g->nCarryAlloc ){
+      int nNew = g->nCarry+c.n+4;
+      u8 **ap = (u8**)sqlite3_realloc64(g->apCarry, (u64)nNew*sizeof(u8*));
+      if( ap==0 ){
+        rc = SQLITE_NOMEM_BKPT;
+      }else{
+        g->apCarry = ap;
+        g->nCarryAlloc = nNew;
+      }
+    }
+    if( rc==SQLITE_OK ){
+      memmove(&g->apCarry[c.n], g->apCarry, sizeof(u8*)*(size_t)g->nCarry);
+      memcpy(g->apCarry, c.ap, sizeof(u8*)*(size_t)c.n);
+      g->nCarry += c.n;
+      c.n = 0;
+      pBf->nDiscardCarry += c.nOp;
+    }
+  }
+  for(i=0; i<c.n; i++) sqlite3_free(c.ap[i]);
+  sqlite3_free(c.ap);
+  sqlite3_free(c.aCur);
+  *pRc = rc;
+  return bAny && rc==SQLITE_OK;
+#else
+  UNUSED_PARAMETER(pBf); UNUSED_PARAMETER(p);
+  *pRc = SQLITE_OK;
+  return 0;
+#endif
+}
+
 static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
   BfCache *pBf = 0;
   BfGroup *g;
@@ -1618,6 +1727,7 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
   if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
   if( pBf ){
     int bAllDurable = 0;
+    int bCarried;
     u64 nDropBefore;
     sqlite3BfBtreeClearCache(p);
     pBf->nFlushed = 0;       /* every flush of this txn was rolled back too */
@@ -1649,8 +1759,12 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
       if( cap>pBf->nRingPeak ) pBf->nRingPeak = cap;
     }
     nDropBefore = pBf->nReplayDropped;
-    rc = sqlite3PagerBfReplayLog(p->pBt->pPager, pBf, &bAllDurable,
-                                 bfLeafForKeyCb, p->pBt);
+    bCarried = bfCarryDiscarded(pBf, p, &rc);
+    if( rc==SQLITE_OK ){
+      rc = sqlite3PagerBfReplayLog(p->pBt->pPager, pBf, &bAllDurable,
+                                   bfLeafForKeyCb, p->pBt);
+    }
+    if( bCarried ) bAllDurable = 1;    /* the discarded ops are carried now */
     g = (BfGroup*)pBf->pGroupCommit;
     if( rc==SQLITE_OK && g==0 && nStage>0 ){
       g = bfGroupGet(pBf, pBf->szPage);

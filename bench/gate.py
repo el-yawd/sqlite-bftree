@@ -117,6 +117,8 @@ def main():
     add("repro:ckpt", f"sh {BENCH}/ckpt_repro.sh {B}")
     add("repro:region", f"sh {BENCH}/region_repro.sh {B} {ST} && "
                         f"sh {BENCH}/region_repro.sh {DBG} {ST}")
+    add("repro:discard_carry", f"sh {BENCH}/discard_carry_repro.sh {B} {ST} && "
+                               f"sh {BENCH}/discard_carry_repro.sh {DBG} {ST}")
     add("repro:fullpage_reset", f"sh {BENCH}/fullpage_reset_repro.sh {B} {ST} && "
                                 f"sh {BENCH}/fullpage_reset_repro.sh {DBG} {ST}")
 

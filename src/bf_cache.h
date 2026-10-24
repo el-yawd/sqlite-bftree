@@ -688,6 +688,8 @@ struct BfCache {
   u64 nReplayDropped;       /* replayed ops the cache REFUSED (full mini-page):
                             ** nonzero means a committed record was lost */
   u64 nRollbackRehydrate;
+  u64 nDiscardCarry;        /* committed ops a rollback's discarded frames
+                            ** carried, moved into the group carry */
   u64 nClearLogged;
   u64 nSnapshotRehydrate;   /* rebuilds because another connection wrote */
   u64 nRegionCkpt;          /* C4b: checkpoints that wrote a region segment */

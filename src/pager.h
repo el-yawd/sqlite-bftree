@@ -340,6 +340,9 @@ int sqlite3PagerBfPageWasRead(Pager*, Pgno);
 int sqlite3PagerBfConcurrentScan(Pager*, int(*)(void*,u32,u32,const u8*,int,int,int), void*, int*);
 #endif
 void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage);
+struct BfWalRec;
+int sqlite3PagerBfForEachDiscarded(Pager*, int(*)(void*, const struct BfWalRec*),
+                                   void*, int*);
 int sqlite3PagerBfHasDirty(Pager *pPager);
 
 #endif /* SQLITE_PAGER_H */

@@ -3588,3 +3588,69 @@ Verified:
   model.
 - Exact next action: settle the 4-week schedule with the owner, then re-establish the
   correctness baseline on this branch.
+
+### 2026-10-24 (cont.) — Claude Opus 5.5 — thesis week 1: correctness baseline; a deferred-commit data-loss bug fixed
+
+- Starting revision/state: `thesis` @ `1fa276232` (= `405008e2f` + plan).
+- **Baseline, before any change.**
+  - `gate --full`: 60/60.
+  - ASan+UBSan build (gcc; clang's resource dir is broken on this box): difftest
+    2985/2985 clean, over all six buf variants including the opt-in `readfull` and
+    `adaptive`, plus stress and xtable.
+  - **D2 durability matrix re-measured on the C3/C4 log format** (1,008 runs, 0 FAIL, every
+    recovery an exact committed prefix with `integrity_check` ok).  "Lost" is acknowledged
+    commits missing after recovery.
+
+    | cell | runs | runs that lost acknowledged commits | max lost |
+    |---|---|---|---|
+    | process crash, synchronous OFF/NORMAL/FULL, `bf_deferred_commit=1` | 48 each | 0 | 0 |
+    | process crash, OFF/NORMAL/FULL, `bf_deferred_commit=8` | 48 each | 10 / 8 / 9 | 2 (window 7) |
+    | power loss, FULL, durable | 180 | 0 | 0 |
+    | power loss, FULL, cycling ring (`bf_cache_size=262144`) | 180 | 0 | 0 |
+    | power loss, FULL, `bf_deferred_commit=8` | 180 | 30 | 2 (window 7) |
+    | power loss, NORMAL, durable | 180 | 176 | 30 (NORMAL promises atomicity only) |
+
+    These match the 2026-09-24 D2 tables, so C3/C4 did not change the durability contract.
+    The thesis can quote them, with this entry as the provenance.
+  - Ring crash oracle, seeds 201-224: 24/24 clean.
+  - libfuzzer-tester agent: smoke only.  It was not coverage-guided (no working clang) and
+    ran about 90 s: decoder 10k random buffers, 150 SQL runs, 50 reopen runs, 0 crashes.
+    Do NOT cite it as a fuzz campaign.
+- **Bug found by a fresh-seed soak** (difftest seeds 300-339, 6480 cases): `group8
+  gen_fullpage_stress seed=312 wal`.  Committed-data loss on ordinary single-connection SQL
+  under `bf_deferred_commit=8`.  Delta-reduced to 9 statements (`bench/discard_carry_repro.sh`):
+  - Autocommit writes wait in the open group batch.
+  - Then `BEGIN; INSERT; SAVEPOINT s1; UPDATE <long value>; ROLLBACK;` runs.  The UPDATE's
+    page spill (cache_size=20) writes the staged batch, i.e. COMMITTED records, into the
+    transaction's WAL frames, and the ROLLBACK discards those frames (`sqlite3WalUndo`).
+  - `bfRehydrateFromLog` replayed the discarded ops (`bKeepBeyond`), but only into the cache,
+    as dirty-unlogged records left for the next commit.
+  - The next read transaction's full snapshot rebuild (`sqlite3BfBtreeSnapshotRehydrate`,
+    2026-10-12) re-adds only the carry, so the two acknowledged writes vanished: rows 413 and 131.
+  - Class: the 2026-10-12 snapshot rebuild broke the D1 assumption that unlogged committed
+    records survive in the cache until the next commit.
+- **Fix:**
+  - `bfCarryDiscarded` (bf_btree.c) re-encodes the ops past mxFrame into WAL batches
+    (`sqlite3BfWalIndexForEachBeyond`, `sqlite3PagerBfForEachDiscarded`).
+  - It prepends them to the group carry, since they were staged before anything carried now.
+  - The rebuilt records are then marked logged.
+  - Switch `SQLITE_BF_NO_DISCARD_CARRY` (verified: brings the bug back); counter
+    `rollback_discard_carried`.
+  - Gate task `repro:discard_carry` (release + debug, with a vacuity guard).
+- **Second bug, debug builds only:** `sqlite3WalUndo` passed a record frame's index slot
+  (pgno 0) to `pagerUndoCallback`, tripping `sqlite3PagerLookup`'s `pgno!=0` assert.  The
+  loop now skips pgno 0 (BF-guarded).  The gate's 8 debug seeds never reached that path.
+- Validation:
+  - repro release/debug OK; ablated build BUG.
+  - `gate --full --jobs 4` 61/61 GREEN.
+  - Per-case peak RSS of all 9 buf generators x {base, group8} x 2 seeds, old vs new:
+    identical, 13-15 MB.
+  - One earlier `gate --full` (12 jobs) failed `mt:crash` ("scr range wrong").  That is the
+    known BEGIN CONCURRENT flake, out of thesis scope.  An instrumented build showed
+    `bfCarryDiscarded` never fires in mt runs, because BEGIN CONCURRENT never defers commits.
+    The A/B (36 runs per build) saw 0 failures on both builds.
+  - Fresh-seed soak, seeds 300-339 (the range that found the bug) x 6 buf variants:
+    6480/6480 clean.  Seeds 340-459 were not run (stopped for time).
+- Machine note: two OOM kills, both a single difftest.py driver at 4.5 GB.  It keeps every
+  case's output in memory; 160 seeds is too many.  Soaks now run 20 seeds per invocation,
+  at `--jobs 4`.

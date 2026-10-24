@@ -4690,6 +4690,24 @@ int sqlite3PagerBfReplayLog(Pager *pPager, BfCache *pBf, int *pbAllDurable,
 #endif
   return SQLITE_OK;
 }
+/* Committed record ops that only frames a rollback just discarded carried
+** (sqlite3WalUndo keeps them in the index until the prune): report each to
+** xRec.  Returns 0 if there are none (no prune pending), else 1. */
+int sqlite3PagerBfForEachDiscarded(Pager *pPager,
+    int (*xRec)(void*, const struct BfWalRec*), void *pCtx, int *pRc){
+  *pRc = SQLITE_OK;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager && pagerUseWal(pPager) && sqlite3WalBfPrunePending(pPager->pWal) ){
+    BfWalIndex *pWalIdx = sqlite3WalBfIndex(pPager->pWal);
+    int rc = sqlite3BfWalIndexForEachBeyond(pWalIdx,
+                 sqlite3WalBfMxFrame(pPager->pWal), xRec, pCtx);
+    if( rc==BFWAL_NOMEM ) *pRc = SQLITE_NOMEM_BKPT;
+    else if( rc!=BFWAL_OK ) *pRc = SQLITE_CORRUPT_BKPT;
+    return 1;
+  }
+#endif
+  return 0;
+}
 void sqlite3PagerBfStageTake(Pager *pPager, u8 ***papStage, int *pnStage){
   *papStage = 0;
   *pnStage = 0;

@@ -5164,6 +5164,11 @@ int sqlite3WalUndo(
         ** committed. As a result, the call to xUndo may not fail.
         */
         assert( walFramePgno(pWal, iFrame)!=1 );
+#ifndef SQLITE_OMIT_BF_CACHE
+        /* A BF record frame has no page (its index slot is 0): nothing to
+        ** expel.  sqlite3PagerLookup asserts pgno!=0. */
+        if( walFramePgno(pWal, iFrame)==0 ) continue;
+#endif
         rc = xUndo(pUndoCtx, walFramePgno(pWal, iFrame));
       }
       if( iMax!=pWal->hdr.mxFrame ) walCleanupHash(pWal);
