@@ -3731,3 +3731,32 @@ Verified:
   - `pow` 3.3-3.5%: the harness's zipf sampler, i.e. benchmark overhead in both SUTs.
 - Decision: P1's preview box is CLOSED as "parity confirmed; extension not worth building".
   Nothing changed in src/.
+
+### 2026-10-24 (cont.) — Claude Opus 5.5 — reference pulled to `f442e61`: no parity claim changes
+
+- The owner pulled `../bf-tree`, fast-forward `d30f9a4` -> `f442e61` (2026-10-14), 12 commits.
+- Substance of the pull:
+  - CPR snapshot work (#19 base, #23, #26, #31, #35, #41).
+  - A scan operator for **cache-only** mode (#22: scans read mini-pages directly instead of
+    merging).
+  - The `rand` 0.9 API (`gen_range` -> `random_range`).
+  - SPDK build docs and CI.
+- **Every file:line citation in this repo refers to `d30f9a4`**, the clone the 2026-09-21
+  reference-claim audit used.
+- Mechanical check: each of the 40 cited locations was mapped through `git diff -U0`.
+  - 33 only moved.
+  - 7 sit in changed hunks.  All were read, and none changes what we cite:
+    - `config.rs:155`/`:55`: defaults identical (`write_load_full_page: true`, WAL `None`).
+    - `mini_page_op.rs:744` (now ~803): the upgrade still copies with
+      `discard_cold_cache = true`.  Only a snapshot-version argument was added.
+    - `mini_page_op.rs:932-956` (gap cache, now ~1001): one comment added.
+    - `tree.rs:466` `should_promote_scan_page` (now 461): only the rand rename.
+    - `tree.rs:1543-1602` `eviction_callback`: only the new `traverse_to_leaf` arguments.
+    - `merge_full_page` also flushes when the snapshot version changed.  That is CPR, a
+      no-op without snapshots.
+    - `consolidate_after_split` now threads a snapshot version.
+- Out of our scope, and unchanged in disk-backed, non-snapshot mode: cache-only scans and CPR.
+- **Conclusion: no reference-parity claim changes.**  The benchmark workload
+  (`bench_e2e.rs`, murmur64 keys) is unchanged; `benchmark/README.md` only gained SPDK docs.
+- Rule from here: cite the reference as `@d30f9a4` (old citations) or `@f442e61` (new ones).
+  Line numbers without a revision are ambiguous now.
