@@ -5,6 +5,7 @@
 #   sh bench/harness/run_thesis_cloud.sh            # build, campaign, report (115 runs, ~10 h)
 #   sh bench/harness/run_thesis_cloud.sh check      # preflight only
 #
+# Setup steps for a fresh machine (Amazon Linux 2023 / dnf, or Ubuntu): CLOUD.md.
 # Needs: cc, make, tcl (for the amalgamation), python3 + numpy (cost model), systemd (the runner
 # isolates every run in a cgroup with systemd-run --user --scope), cgroup v2,
 # ~30 GiB free disk on a filesystem that supports O_DIRECT (ext4/xfs; NOT tmpfs).

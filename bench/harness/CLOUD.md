@@ -27,8 +27,9 @@ What the benchmark needs, in order of importance:
 3. **Small is fine.**
    - The benchmark is single-threaded and every run is capped by cgroups.
    - 2 vCPU, 8 GiB RAM and ~30 GB of disk are enough.
-4. **A standard Linux distribution with systemd and cgroup v2**: Ubuntu
-   24.04 LTS or Debian 12.
+4. **A standard Linux distribution with systemd and cgroup v2**: Amazon Linux
+   2023, which this guide uses (`dnf`, user `ec2-user`).  Ubuntu 24.04 works
+   too; the commands that differ are noted.
 
 Recommended (check current prices; these are rough on-demand figures):
 
@@ -54,23 +55,34 @@ Rules:
 
 ## 2. Launch and log in
 
-- OS image: Ubuntu 24.04 LTS (x86_64).
+- OS image: Amazon Linux 2023 (x86_64).
 - Root disk: 30 GB is plenty.  The data goes on the local NVMe, not the root disk.
 - Security group or firewall: SSH only.
 
 ```bash
-ssh ubuntu@<public-ip>
+chmod 600 ~/bftree.pem          # ssh refuses a key file others can read
+ssh -i ~/bftree.pem ec2-user@<public-ip>
 ```
+
+On Ubuntu the login user is `ubuntu` instead of `ec2-user`.
 
 ## 3. Install packages
 
 ```bash
-sudo apt update
-sudo apt install -y build-essential tcl python3 python3-numpy git zlib1g-dev tmux
+sudo dnf install -y gcc make tcl git zlib-devel tmux python3 python3-pip rsync
+sudo dnf install -y python3-numpy || pip3 install --user numpy   # either way works
+python3 -c "import numpy; print('numpy', numpy.__version__)"
 ```
 
-`tcl` builds the SQLite amalgamation, and `python3-numpy` is for the cost model
-(`costmodel.py`).
+- `tcl` builds the SQLite amalgamation.
+- numpy is for the cost model (`costmodel.py`).
+- `rsync` lets you copy the results off in step 9.
+
+On Ubuntu:
+
+```bash
+sudo apt install -y build-essential tcl python3 python3-numpy git zlib1g-dev tmux rsync
+```
 
 ## 4. Format and mount the local NVMe
 
@@ -82,7 +94,7 @@ assume.**
 ```bash
 lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,MODEL
 # e.g. nvme1n1  110.6G disk            Amazon EC2 NVMe Instance Storage
-sudo mkfs.ext4 -F /dev/nvme1n1            # ext4 or xfs; must support O_DIRECT (tmpfs does not)
+sudo mkfs.xfs -f /dev/nvme1n1             # xfs or ext4; must support O_DIRECT (tmpfs does not)
 sudo mkdir -p /data
 sudo mount -o noatime /dev/nvme1n1 /data
 sudo chown "$USER": /data
@@ -126,7 +138,7 @@ Optional: pin the CPU frequency governor.  The runner warns when it is not
 is fine.
 
 ```bash
-sudo apt install -y linux-tools-common linux-tools-$(uname -r) 2>/dev/null
+sudo dnf install -y kernel-tools 2>/dev/null      # provides cpupower (Ubuntu: linux-tools-$(uname -r))
 sudo cpupower frequency-set -g performance 2>/dev/null || echo "no cpufreq control (normal on VMs)"
 ```
 
@@ -216,7 +228,7 @@ second campaign.
 From your laptop:
 
 ```bash
-rsync -av ubuntu@<public-ip>:/data/sqlite-bftree/bench/harness/results/thesis_reads/ \
+rsync -av -e "ssh -i ~/bftree.pem" ec2-user@<public-ip>:/data/sqlite-bftree/bench/harness/results/thesis_reads/ \
       ~/Projects/tfg-stuff/sqlite-bftree-v2/bench/harness/results/thesis_reads_cloud/
 ```
 
@@ -246,7 +258,8 @@ is erased at that point, which is fine once the results are copied.
 
 | symptom | cause / fix |
 |---|---|
-| `systemd-run not found, but the config asks for memmax caps` | not a systemd distro; use Ubuntu/Debian |
+| `systemd-run not found, but the config asks for memmax caps` | not a systemd distro; use Amazon Linux 2023 or Ubuntu 24.04 |
+| `dnf: No match for argument: python3-numpy` | use the `pip3 install --user numpy` fallback in step 3 |
 | `Failed to connect to bus` | no user session D-Bus: `loginctl enable-linger`, log out/in |
 | runs die with OOM kills inside their scope | `memory` controller not delegated (step 5) |
 | `dev reads/op` empty | direct I/O not active, e.g. the checkout is on tmpfs/overlay; clone onto the NVMe ext4/xfs mount |
