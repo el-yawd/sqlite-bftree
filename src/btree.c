@@ -5114,6 +5114,9 @@ int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
         memcpy(pBfC->aSnapSeen, aSnap, sizeof(aSnap));
         pBfC->bSnapSeen = 1;
         sqlite3PagerBfTouchReset(pBt->pPager);
+#ifdef SQLITE_BF_AUDIT
+        sqlite3BfAudit(p, "post-commit");
+#endif
       }
     }
 #endif

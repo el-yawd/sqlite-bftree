@@ -693,6 +693,7 @@ struct BfCache {
   u64 nReplayDropped;       /* replayed ops the cache REFUSED (full mini-page):
                             ** nonzero means a committed record was lost */
   u64 nRollbackRehydrate;
+  u64 nAuditCleanStranded;  /* SQLITE_BF_AUDIT: clean records found stranded */
   u64 nDiscardCarry;        /* committed ops a rollback's discarded frames
                             ** carried, moved into the group carry */
   u64 nClearLogged;
@@ -1126,6 +1127,10 @@ SQLITE_PRIVATE int sqlite3BfCacheLeafFits(BfCache*, u32 pgno, const BfFitOp *aEx
 #define BFREG_HDRN        4
 
 SQLITE_PRIVATE u32 sqlite3BfLeafForKey(void *pBtShared, u32 root, const u8 *pKey);
+#ifdef SQLITE_BF_AUDIT
+struct Btree;
+void sqlite3BfAudit(struct Btree*, const char *zWhen);   /* bf_btree.c, debug only */
+#endif
 SQLITE_PRIVATE int sqlite3BfBtreeLogCkpt(Btree*, u32 iSegMx);
 SQLITE_PRIVATE int bfDropReplayPublic(BfCache*, Btree*, const u32*, int,
                        const BfKeyRef*, int, const BfKeyRange*, int);

@@ -1487,6 +1487,9 @@ int sqlite3BfBtreeSnapshotAdvance(Btree *p){
   if( rc==SQLITE_OK ){
     pBf->nSnapshotIncr++;
     pBf->nSnapshotIncrPages += (u64)nPg;
+#ifdef SQLITE_BF_AUDIT
+    sqlite3BfAudit(p, "snapshot-incremental");
+#endif
   }
   sqlite3_free(aPg);
   return rc;
@@ -1583,6 +1586,9 @@ int sqlite3BfBtreeRollbackIncremental(Btree *p, const u32 *aDirty, int nDirty,
   pBf->nFlushed = 0;         /* every flush of this txn was rolled back too */
   pBf->bFlushedOom = 0;
   if( rc==SQLITE_OK ) pBf->nRollbackIncr++;
+#ifdef SQLITE_BF_AUDIT
+  if( rc==SQLITE_OK ) sqlite3BfAudit(p, "rollback-incremental");
+#endif
   *pRc = rc;
   return 1;
 #else
@@ -1717,6 +1723,184 @@ static int bfCarryDiscarded(BfCache *pBf, Btree *p, int *pRc){
 #endif
 }
 
+#ifdef SQLITE_BF_AUDIT
+/*
+** Debug-only invariant audit (SQLITE_BF_AUDIT, 2026-10-24).
+**
+** The differential oracles see a cache bug only when a wrong answer reaches a
+** SELECT, often many statements after the state went wrong (2026-10-24: the
+** deferred-commit ROLLBACK bug needed a 2,800-line script delta-reduced to 9
+** statements).  Like bbtree's check_invariants after every fuzzed operation,
+** this checks the record cache against the log at the moment state changes:
+** after every commit, rollback and cache rebuild/catch-up.  It aborts at the
+** first violation, naming the key and the event.
+**
+** The rule: every record the cache holds for a key agrees with the key's
+** committed state.  That state comes from this connection's committed-but-
+** unlogged deferred commits first (group carry + open batch, newest), else
+** from the WAL op index at the snapshot.  Violations:
+**   stranded   a DIRTY record under a leaf that does not own its key now.
+**              Clean stranded copies (BFOP_CACHE/PHANTOM) are counted, not
+**              fatal: balance_quick leaves the records a merge just wrote out
+**              as clean copies under the old leaf (e.g. rows 336..338 under
+**              leaf 7 after leaf 11 was appended for keys > 335).  They are
+**              never served -- lookups descend to the owner leaf, and the old
+**              leaf's range only grows back through balance_nonroot, which
+**              forgets its records -- so single-connection they cost ring
+**              space, not answers.  (Dirty stranded records lost committed
+**              data on the BEGIN CONCURRENT branch: c730ee662.)
+**   stale      a dirty op for a key the log says is merged into pages
+**   no-log     a committed dirty record neither logged nor held in memory
+**   mismatch   live row vs DELETE, tombstone vs INSERT, or a different value
+** Full-page copies are checked for cells of keys whose state is DELETE.
+** Not a release feature: it walks the whole cache at every commit.
+*/
+typedef struct BfAuditCtx BfAuditCtx;
+struct BfAuditCtx {
+  BfWalIndex *pIdx;       /* the WAL op index */
+  BfWalIndex *pMem;       /* carry + open batch, or 0 */
+  u32 mx;                 /* snapshot */
+  void *pBt;
+  const char *zWhen;
+  int nBad;
+  int nCleanStranded;     /* counted, not fatal (see above) */
+};
+static int bfAuditState(BfAuditCtx *c, u32 root, const u8 *k, BfKeyState *st,
+                        int *pbMem){
+  *pbMem = 0;
+  if( c->pMem && sqlite3BfWalIndexKeyState(c->pMem, root, k, 0xffffffffu, 1, st)
+   && st->op>=0 ){
+    *pbMem = 1;
+    return 1;
+  }
+  return sqlite3BfWalIndexKeyState(c->pIdx, root, k, c->mx, 0, st);
+}
+static void bfAuditReport(BfAuditCtx *c, u32 pgno, u32 root, const u8 *k, int op,
+                          const char *zWhy){
+  fprintf(stderr, "BF-AUDIT (%s): leaf %u root %u key %lld op %d: %s (mx %u)\n",
+          c->zWhen, pgno, root, (long long)bfDecodeRowid(k), op, zWhy, c->mx);
+  c->nBad++;
+}
+static int bfAuditCallback(void *pCtx, u32 pgno, BfMapEntry *pEntry){
+  BfAuditCtx *c = (BfAuditCtx*)pCtx;
+  BfMiniPage *pMini;
+  int i, n;
+  if( pgno<=1 || pEntry->pPage==0 ) return 0;
+  if( pEntry->locType==BF_LOC_FULL ){
+    BfMiniPage *pF = (BfMiniPage*)pEntry->pPage;
+    const u8 *a = (const u8*)BF_FULL_PAGE_DATA(pF);
+    if( a[0]==0x0d && pF->rootPgno>1 ){
+      int nCell = (a[3]<<8)|a[4], k, bMem;
+      for(k=0; k<nCell; k++){
+        int off = (a[8+2*k]<<8)|a[9+2*k];
+        u64 nPay, rid;
+        u8 key[8];
+        BfKeyState st;
+        off += sqlite3GetVarint(&a[off], &nPay);
+        sqlite3GetVarint(&a[off], &rid);
+        bfEncodeRowid((i64)rid, key);
+        if( bfAuditState(c, pF->rootPgno, key, &st, &bMem) && st.op==BFWAL_OP_DELETE ){
+          bfAuditReport(c, pgno, pF->rootPgno, key, -1,
+                        "full-page cell present, state says DELETE");
+        }
+      }
+    }
+    return 0;
+  }
+  if( pEntry->locType!=BF_LOC_MINI ) return 0;
+  pMini = (BfMiniPage*)pEntry->pPage;
+  if( pMini->rootPgno<=1 ) return 0;
+  n = sqlite3BfMiniPageCount(pMini);
+  for(i=0; i<n; i++){
+    const u8 *pK, *pV; int nK, nV; u8 op;
+    BfKeyState st;
+    int bMem, bHave, bUnlogged;
+    if( !sqlite3BfMiniPageAt(pMini, i, &pK, &nK, &pV, &nV, &op) || nK!=8 ) continue;
+    bUnlogged = sqlite3BfMiniPageDirtyUnloggedAt(pMini, i, 0, 0, 0, 0, 0);
+    {
+      u32 own = sqlite3BfLeafForKey(c->pBt, pMini->rootPgno, pK);
+      if( own!=0 && own!=pgno ){
+        if( op==BFOP_INSERT || op==BFOP_DELETE ){
+          bfAuditReport(c, pgno, pMini->rootPgno, pK, op, "dirty record stranded "
+                        "under a leaf that does not own the key");
+        }else{
+          c->nCleanStranded++;
+        }
+        continue;
+      }
+    }
+    bHave = bfAuditState(c, pMini->rootPgno, pK, &st, &bMem);
+    if( bUnlogged && !bMem ){
+      bfAuditReport(c, pgno, pMini->rootPgno, pK, op,
+                    "committed dirty record in no log (not logged, not carried)");
+      continue;
+    }
+    if( !bHave ) continue;              /* no op for the key: pages hold it */
+    if( st.op<0 ){
+      if( op==BFOP_INSERT || op==BFOP_DELETE ){
+        bfAuditReport(c, pgno, pMini->rootPgno, pK, op,
+                      "buffered op on a key the log says is merged");
+      }
+      continue;
+    }
+    if( st.op==BFWAL_OP_DELETE && (op==BFOP_INSERT || op==BFOP_CACHE) ){
+      bfAuditReport(c, pgno, pMini->rootPgno, pK, op, "live row, state says DELETE");
+    }else if( st.op==BFWAL_OP_INSERT && op==BFOP_DELETE ){
+      bfAuditReport(c, pgno, pMini->rootPgno, pK, op, "tombstone, state says INSERT");
+    }else if( st.op==BFWAL_OP_INSERT && (op==BFOP_INSERT || op==BFOP_CACHE)
+           && ((u32)nV!=st.nVal || (nV>0 && memcmp(pV, st.pVal, nV)!=0)) ){
+      bfAuditReport(c, pgno, pMini->rootPgno, pK, op, "value differs from the state");
+    }
+  }
+  return 0;
+}
+/* The carry and the open batch as one index (newest per key wins). */
+static BfWalIndex *bfAuditMemIndex(BfCache *pBf){
+  BfGroup *g = (BfGroup*)pBf->pGroupCommit;
+  BfWalIndex *pMem;
+  int i;
+  if( g==0 || (g->nCarry==0 && g->nOpen==0) ) return 0;
+  pMem = sqlite3BfWalIndexNew();
+  if( pMem==0 ) return 0;
+  for(i=0; i<g->nCarry; i++){
+    sqlite3BfWalIndexAddFrame(pMem, g->apCarry[i], g->szPage, 0xfffffffeu);
+  }
+  if( g->nOpen>0 ){
+    u8 *aCopy = (u8*)sqlite3_malloc(g->szPage);
+    if( aCopy ){
+      BfWalBatch b = g->batch;
+      memcpy(aCopy, g->aBuf, g->szPage);
+      b.aBuf = aCopy;
+      sqlite3BfWalBatchFinish(&b);
+      sqlite3BfWalIndexAddFrame(pMem, aCopy, g->szPage, 0xffffffffu);
+      sqlite3_free(aCopy);
+    }
+  }
+  return pMem;
+}
+void sqlite3BfAudit(Btree *p, const char *zWhen){
+  BfCache *pBf = 0;
+  BfAuditCtx c;
+  u32 aSnap[3] = {0,0,0};
+  if( p && p->pBt ) pBf = sqlite3PagerGetBfCache(p->pBt->pPager);
+  if( pBf==0 ) return;
+  memset(&c, 0, sizeof(c));
+  c.pIdx = sqlite3PagerBfWalIndex(p->pBt->pPager);
+  if( c.pIdx==0 || !sqlite3PagerBfSnapshot(p->pBt->pPager, aSnap) ) return;
+  c.mx = aSnap[0];
+  c.zWhen = zWhen;
+  c.pBt = p->pBt;
+  c.pMem = bfAuditMemIndex(pBf);
+  sqlite3BfMapIterate(pBf, bfAuditCallback, &c);
+  sqlite3BfWalIndexFree(c.pMem);
+  pBf->nAuditCleanStranded += (u64)c.nCleanStranded;
+  if( c.nBad ){
+    fprintf(stderr, "BF-AUDIT (%s): %d violation(s)\n", zWhen, c.nBad);
+    abort();
+  }
+}
+#endif /* SQLITE_BF_AUDIT */
+
 static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
   BfCache *pBf = 0;
   BfGroup *g;
@@ -1829,6 +2013,9 @@ static int bfRehydrateFromLog(Btree *p, u8 **apStage, int nStage){
   sqlite3BfWalIndexFree(pTmp);
   for(i=0; i<nStage; i++) sqlite3_free(apStage[i]);
   sqlite3_free(apStage);
+#ifdef SQLITE_BF_AUDIT
+  if( rc==SQLITE_OK ) sqlite3BfAudit(p, "rehydrate");
+#endif
   return rc;
 }
 #endif /* SQLITE_BF_INSERT_BUFFERING */

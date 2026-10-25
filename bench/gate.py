@@ -120,6 +120,18 @@ def main():
     add("difftest:noconc", f"{noconc} && python3 {BENCH}/difftest.py --quick --suite buf "
                            f"--jobs 2 --buf {work}/sqlite3_noconc --stock {ST} "
                            f"--work {work}/diff_noconc")
+    # Invariant audit (SQLITE_BF_AUDIT, 2026-10-24): a debug build that checks the
+    # record cache against the log after every commit, rollback and rebuild,
+    # and aborts AT the event -- the differential oracle only sees a bug once a
+    # wrong answer reaches a SELECT.  Mutation-checked: without the
+    # discard-carry fix it aborts at the ROLLBACK, naming the lost key.
+    audit = (f"cc -O0 -g -DSQLITE_DEBUG -DSQLITE_BF_AUDIT -DSQLITE_BF_INSERT_BUFFERING "
+             f"-DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE -I{BUILD} -I{ROOT}/src "
+             f"-o {work}/sqlite3_audit {BUILD}/shell.c {amal_snap} -lm -lz")
+    add("audit:difftest", f"{audit} && python3 {BENCH}/difftest.py --quick --suite buf "
+                          f"--variant base,group8,ring{',promo100,readfull,adaptive' if full else ''} "
+                          f"--jobs 2 --buf {work}/sqlite3_audit --stock {ST} "
+                          f"--work {work}/diff_audit")
     add("repro:torn_tail", f"sh {BENCH}/torn_tail_repro.sh {B} && "
                            f"sh {BENCH}/torn_tail_repro.sh {DBG}")
     add("repro:recover", f"sh {BENCH}/recover_repro.sh {B} {2000 if full else 250} && "
