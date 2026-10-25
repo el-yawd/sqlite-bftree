@@ -332,12 +332,15 @@ def build_argv(run, dbpath, jsonpath, page_floor):
         argv += ["--direct-io"]
 
     # --- the memory split: identical totals, different spending -------------
+    # stock_interior_credit: stock also gets the bytes of the interior pages,
+    # which BF holds outside its budget (interior_bytes()).
+    credit = int(run.get("interior_credit_bytes") or 0)
     if sut.startswith("stock"):     # stock, stock_bc (BEGIN CONCURRENT)
-        argv += ["--page-cache-bytes", str(budget)]
+        argv += ["--page-cache-bytes", str(budget + credit)]
     elif sut == "bf_off":
         # BF compiled in but switched off: same page-cache budget as stock, so
         # the difference against stock is pure fork overhead.
-        argv += ["--bf-cache", "off", "--page-cache-bytes", str(budget)]
+        argv += ["--bf-cache", "off", "--page-cache-bytes", str(budget + credit)]
     else:
         # The floor is per-run, not global: it is a legitimate axis.  Until the
         # bf_cache.c page-hash fix it could not be swept -- a BF build with a
@@ -383,6 +386,33 @@ def wrap_scope(argv, memmax, name):
 # ---------------------------------------------------------------------------
 # dataset management
 # ---------------------------------------------------------------------------
+def interior_bytes(path):
+    """Bytes of the table's interior (non-leaf) pages in a dataset template.
+
+    The unified pool keeps BF's interior pages resident OUTSIDE its budget, as
+    the reference keeps its inner nodes on the heap -- but stock's page cache
+    must hold them INSIDE its budget.  Measured: 310 pages (1.21 MiB) in v100,
+    365 (1.43 MiB) in v16: 3.8-4.5% more memory for BF at 32 MiB.  With
+    `stock_interior_credit` the stock page cache is given these bytes on top of
+    the budget, so both engines get the same memory for LEAVES.  Cached beside
+    the template (read-only data, computed once).
+    """
+    cache = path + ".interior"
+    if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(path):
+        return int(open(cache).read())
+    import sqlite3
+    c = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    n = c.execute("SELECT count(*), max(pgsize) FROM dbstat "
+                  "WHERE name='usertable' AND pagetype='internal'").fetchone()
+    c.close()
+    b = int(n[0]) * int(n[1] or 4096)
+    try:
+        open(cache, "w").write(str(b))
+    except OSError:
+        pass
+    return b
+
+
 def ensure_dataset(name, spec, datadir, force=False):
     """Load a dataset template once, with the STOCK binary.
 
@@ -557,8 +587,15 @@ def main():
     for dsname in sorted(needed):
         spec = config["datasets"][dsname]
         templates[dsname] = ensure_dataset(dsname, spec, datadir, args.reload)
+        ib = None
         for r in runs:
             if r.get("dataset", "default") == dsname:
+                if r.get("stock_interior_credit"):
+                    if ib is None:
+                        ib = interior_bytes(templates[dsname])
+                        print("  dataset %-10s interior pages %.2f MiB "
+                              "(credited to stock's page cache)" % (dsname, ib / (1 << 20)))
+                    r["interior_credit_bytes"] = ib
                 r.setdefault("records", spec["records"])
                 r.setdefault("value_len", spec.get("value_len", 100))
                 r.setdefault("key_spacing", spec.get("key_spacing", 16))

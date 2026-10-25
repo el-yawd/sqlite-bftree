@@ -347,6 +347,73 @@ Validated on `results/b3b` (32 MiB, direct I/O):
 Full pages, scan promotion and X1 are not modelled.  The gap between the
 record band and a measurement is their contribution.
 
+## Reading the numbers: claims, controls and noise (2026-10-25)
+
+Written after auditing this harness against danluu.com/benchpocalypse
+(benchmarks overfit by the people, or LLMs, who tune against them) and
+sled.rs/perf (bias that repetition cannot remove).  These rules decide what
+a thesis may say about a result.
+
+**What each metric answers**
+
+- **Device reads/op** (direct I/O): how well the cache uses its memory.
+  It is the primary metric because it is almost deterministic, but it is the
+  metric BF was designed to win.  Never report it alone.
+- **Throughput and latency (p50/p99)**: what a user sees.  Always in the same
+  table as reads/op.  A reads/op win with flat or worse throughput is
+  reported as exactly that.
+- **Instructions/op** (when the PMU exists): the CPU cost.  BF retires more
+  instructions per op than stock, +11% on the one cell measured; say so.
+
+**Fairness rules, and the configs that enforce them**
+
+- **Equal memory for leaves.**  `stock_interior_credit`: BF keeps interior
+  pages outside its budget, as the reference does, so stock gets their bytes
+  on top (v100 1.21 MiB, v16 1.43 MiB).  `thesis_reads` (v1) predates this
+  and gave BF 3.8-4.5% more memory; quote stock-vs-BF ratios from `_v2`.
+- **Interleaved runs.**  `run_thesis_cloud.sh` passes `--shuffle 1`.  A
+  cell-ordered campaign runs every stock repeat before every BF repeat, so a
+  slow window of the machine lands on one system.
+- **Reference defaults only** for the `bf` SUT.  Our extensions (X1,
+  `bf_cap1k`) are separate, labelled SUTs.
+- **Correct answers.**  Every read verifies its value (`read_errors` must be 0).
+
+**Holdouts and controls (`thesis_reads_v2`)**
+
+- Every BF setting was chosen on skewed point reads at theta 0.9 with 100 B
+  and 16 B values.
+- The holdout cells change exactly those things: uniform keys, theta
+  0.7/0.99, 200 B values, YCSB B and A.
+- The other I/O regime (buffered) and per-request transactions are run too.
+- **Uniform keys are a negative control.**  The cost model predicts BF loses
+  slightly there (stock/BF 0.96x): its record cache holds fewer rows than a
+  page cache of the same size.  If BF "wins" on uniform, suspect the
+  benchmark before celebrating.
+- **Predictions come first.**  The cost model's predictions for the main,
+  sweep and holdout cells are in BF_TREE_V2_PLAN.md (2026-10-24/25) and were
+  written before the runs.  A result is "as predicted", "better/worse than
+  predicted, because X (with a counter that shows X)", or unexplained.  Never
+  "explained" after the fact without a measured mechanism.
+
+**Noise**
+
+- Throughput ratios are quoted only when the repeat spread of both SUTs is
+  below the effect.  report.py marks spreads above `NOISE_THRESHOLD`.
+- With 2-3 repeats there are no confidence intervals.  Say "n=3, spread X%",
+  not "significant".
+- Cloud VMs offer no control of the CPU governor or turbo: state the
+  instance type and that.
+
+**Scope of every claim**
+
+- One table, one thread, a rowid key-value shape.
+- 32 MiB (8/128 MiB in the sweep) on a 0.4-0.5 GB dataset, so larger than
+  memory.
+- Direct I/O, the paper's model, plus the buffered cells.
+- Not a general SQLite benchmark: no secondary indexes, joins or
+  multi-statement transactions.  Results do not extend beyond this without
+  a measurement that shows it.
+
 ## Known gaps
 
 - **Single threaded.** The fork keeps SQLite's single-writer serialisation, so

@@ -2,8 +2,13 @@
 # The thesis read campaign on a fresh, dedicated machine (2026-10-24).
 #
 #   git clone <repo> && cd sqlite-bftree-v2 && git checkout thesis
-#   sh bench/harness/run_thesis_cloud.sh            # build, campaign, report (115 runs, ~10 h)
-#   sh bench/harness/run_thesis_cloud.sh check      # preflight only
+#   sh bench/harness/run_thesis_cloud.sh                       # thesis_reads (v1, 115 runs, ~10 h)
+#   sh bench/harness/run_thesis_cloud.sh run thesis_reads_v2   # v2: equal leaf memory, holdouts (~8.5 h)
+#   sh bench/harness/run_thesis_cloud.sh check [config]        # preflight only
+# Runs are SHUFFLED (runner --shuffle, grouped by dataset): without it every
+# cell ran all stock repeats, then all bf repeats, so a slow window of the VM
+# landed on one SUT -- a bias that repeats cannot remove (added 2026-10-25;
+# v1 was started without it).
 #
 # Setup steps for a fresh machine (Amazon Linux 2023 / dnf, or Ubuntu): CLOUD.md.
 # Needs: cc, make, tcl (for the amalgamation), python3 + numpy (cost model), systemd (the runner
@@ -17,6 +22,8 @@ set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 MODE=${1:-run}
+CONFIG=${2:-thesis_reads}
+[ -f "bench/harness/configs/$CONFIG.json" ] || { echo "no config $CONFIG" >&2; exit 1; }
 
 command -v systemd-run >/dev/null || { echo "systemd-run missing" >&2; exit 1; }
 [ -f /sys/fs/cgroup/cgroup.controllers ] || { echo "cgroup v2 required" >&2; exit 1; }
@@ -51,16 +58,16 @@ else
   echo "     (perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null))" >&2
 fi
 rm -rf "$PROBE"
-python3 bench/harness/runner.py bench/harness/configs/thesis_reads.json --dry-run | tail -3
+python3 bench/harness/runner.py bench/harness/configs/$CONFIG.json --dry-run | tail -3
 [ "$MODE" = check ] && exit 0
 
 mkdir -p build
 ( cd build && { [ -f Makefile ] || ../configure --quiet; } && make sqlite3 >/dev/null )
 sh bench/harness/build_suts.sh --all
-OUT=bench/harness/results/thesis_reads
+OUT=bench/harness/results/$CONFIG
 mkdir -p "$OUT"
-python3 bench/harness/runner.py bench/harness/configs/thesis_reads.json \
-    --continue-on-error 2>&1 | tee "$OUT/campaign.log"
+python3 bench/harness/runner.py bench/harness/configs/$CONFIG.json \
+    --continue-on-error --shuffle 1 2>&1 | tee "$OUT/campaign.log"
 python3 bench/harness/report.py "$OUT"
 # The cost model next to every point-read cell: predicted vs measured device
 # reads/op (bench/harness/costmodel.py; needs numpy, ~1 min per dataset).

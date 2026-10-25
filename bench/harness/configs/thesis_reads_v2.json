@@ -1,0 +1,332 @@
+{
+ "name": "thesis_reads_v2",
+ "_comment": [
+  "Second thesis read campaign (2026-10-25), after a methodology audit against danluu.com/benchpocalypse",
+  "and sled.rs/perf.  Differences from thesis_reads (v1, ran first, unchanged):",
+  "  * stock_interior_credit: stock's page cache also gets the dataset's interior-page bytes, which BF keeps",
+  "    outside its budget (v100 1.21 MiB, v16 1.43 MiB) -- equal memory for LEAVES.  v1 gave BF 3.8-4.5% more.",
+  "  * run with --shuffle (run_thesis_cloud.sh): repeats and SUTs interleaved, so machine drift spreads out",
+  "    instead of landing on one SUT.",
+  "  * HOLDOUT cells -- shapes no BF setting was tuned on: uniform (negative control: a record cache should",
+  "    NOT win), theta 0.7 / 0.99, 200 B values, YCSB B (95/5) and A (50/50) read/update.",
+  "  * the other I/O regime: buffered I/O (OS page cache in play, inside the same cgroup cap).",
+  "  * one transaction per read (no --read-txn) on the main cell.",
+  "Ablations (bf_nofull, bf_noscan, page mode, X1, cap1k) are within-BF comparisons: v1 answers them.",
+  "BF runs at the reference's defaults everywhere.  Predictions for C are written before the run (plan)."
+ ],
+ "datasets": {
+  "v100": {
+   "records": 4000000,
+   "value_len": 100,
+   "key_spacing": 16
+  },
+  "v16": {
+   "records": 20000000,
+   "value_len": 16,
+   "key_spacing": 16
+  },
+  "v200": {
+   "records": 4000000,
+   "value_len": 200,
+   "key_spacing": 16
+  }
+ },
+ "defaults": {
+  "dataset": "v100",
+  "repeats": 2,
+  "seconds": 60,
+  "theta": 0.9,
+  "scan_len": 32,
+  "synchronous": "normal",
+  "journal": "wal",
+  "ops_per_txn": 1,
+  "read_txn": true,
+  "drop_cache": true,
+  "budget_bytes": "32M",
+  "memmax": "auto",
+  "promotion": 30,
+  "copy_on_access": 10,
+  "direct_io": true,
+  "workload": "read=100",
+  "stock_interior_credit": true
+ },
+ "experiments": [
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 3,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 3,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "repeats": 3,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "repeats": 3,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "scan",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "scan=100",
+   "warmup_ops": 300000,
+   "repeats": 3,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "mix_read_scan",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=90,scan=10",
+   "warmup_ops": 1000000,
+   "repeats": 3,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "axes": {
+    "budget_bytes": [
+     {
+      "label": "8M",
+      "budget_bytes": "8M",
+      "warmup_ops": 1000000
+     },
+     {
+      "label": "128M",
+      "budget_bytes": "128M",
+      "warmup_ops": 8000000
+     }
+    ]
+   }
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "axes": {
+    "budget_bytes": [
+     {
+      "label": "8M",
+      "budget_bytes": "8M",
+      "warmup_ops": 1000000
+     },
+     {
+      "label": "128M",
+      "budget_bytes": "128M",
+      "warmup_ops": 8000000
+     }
+    ]
+   }
+  },
+  {
+   "name": "holdout_uniform",
+   "dataset": "v100",
+   "dist": "uniform",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "holdout_theta07_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "theta": 0.7
+  },
+  {
+   "name": "holdout_theta07_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "theta": 0.7
+  },
+  {
+   "name": "holdout_theta099_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "theta": 0.99
+  },
+  {
+   "name": "holdout_theta099_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "theta": 0.99
+  },
+  {
+   "name": "holdout_v200_scrambled",
+   "dataset": "v200",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "holdout_v200_raw",
+   "dataset": "v200",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ]
+  },
+  {
+   "name": "holdout_ycsb_b",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=95,update=5",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "read_txn": false
+  },
+  {
+   "name": "holdout_ycsb_a",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=50,update=50",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "read_txn": false
+  },
+  {
+   "name": "buffered_v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "direct_io": false
+  },
+  {
+   "name": "buffered_v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "direct_io": false
+  },
+  {
+   "name": "per_request_txn_v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "read_txn": false
+  }
+ ]
+}

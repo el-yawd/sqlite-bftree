@@ -223,6 +223,21 @@ grep -c '"returncode": 0' /data/sqlite-bftree/bench/harness/results/thesis_reads
 Do not run anything else heavy on the machine meanwhile: no builds, no
 second campaign.
 
+### 8b. The second campaign, `thesis_reads_v2` (~8.5 h, 100 runs)
+
+v2 differs from v1 in four ways: equal memory for leaves, interleaved runs,
+holdout and control cells, and the buffered I/O regime.  See "Reading the
+numbers" in README.md.  Run it after v1 on the SAME instance type, and
+ideally the same instance:
+
+```bash
+cd /data/sqlite-bftree && git pull
+tmux new -s camp2 'sh bench/harness/run_thesis_cloud.sh run thesis_reads_v2; exec bash'
+```
+
+Results land in `bench/harness/results/thesis_reads_v2/`.  Quote stock-vs-BF
+ratios from v2.  v1 answers the within-BF ablations.
+
 ## 9. Copy the results off, then stop the machine
 
 From your laptop:

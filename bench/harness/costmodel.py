@@ -94,6 +94,8 @@ def fnv64_np(v):
 @functools.lru_cache(maxsize=None)
 def key_pmf(n, theta, dist):
     """Probability of each key index 0..n-1 under bfbench's pickKey."""
+    if dist == "uniform":
+        return np.full(n, 1.0 / n)
     rp = zipf_rank_pmf(n, theta)
     if dist == "zipf-raw":
         return rp
@@ -307,7 +309,7 @@ def main():
     ap.add_argument("--db", help="dataset .db (leaf boundaries via dbstat)")
     ap.add_argument("--records", type=int)
     ap.add_argument("--theta", type=float, default=0.9)
-    ap.add_argument("--dist", default="zipf", choices=["zipf", "zipf-raw"])
+    ap.add_argument("--dist", default="zipf", choices=["zipf", "zipf-raw", "uniform"])
     ap.add_argument("--budget", default="32M")
     ap.add_argument("--bytes-per-record", type=float, default=None,
                     help="BF ring bytes per cached record (measured gauge)")

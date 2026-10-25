@@ -3887,3 +3887,63 @@ These are bbtree lessons 2 and 3.
   - Codec round-trip (properties 4-5): written, **NOT proven**.  2 records x 4 symbolic ops
     did not finish in 30 min / 5.5 GB.  The per-op split exists but was never run.
     **Parked by the owner.**
+
+### 2026-10-25 — Claude Opus 5.5 — methodology audit (benchpocalypse, sled perf); `thesis_reads_v2` with fixes; holdout predictions PRE-REGISTERED
+
+- The owner worries about producing benchmark slop.  I audited the harness against
+  danluu.com/benchpocalypse (overfitting by whoever, or whatever LLM, tunes against the
+  benchmark; no holdouts) and sled.rs/perf (interleave runs; bias is not removed by repeats).
+- Already sound:
+  - every read is verified (`read_errors`);
+  - one amalgamation for all SUTs;
+  - stock loads the dataset;
+  - BF at the reference's defaults, with extensions as separate SUTs;
+  - ablations;
+  - cost-model predictions written before the campaign;
+  - negative results kept in this plan.
+- **Problems found, verified in code:**
+  1. **Unequal memory.**  BF keeps interior pages outside its budget, and stock's page cache
+     holds them inside: v100 310 pages = 1.21 MiB, v16 365 = 1.43 MiB, i.e. **3.8-4.5% more
+     memory for BF** at 32 MiB, and 15% at 8 MiB.
+  2. **Runs not interleaved.**  Cell-major order, stock repeats then bf repeats.
+     `--shuffle` existed but was unused.
+  3. **No holdout or control workloads.**
+  4. **Only the I/O regime that favours BF** (direct) in the campaign.
+  5. **One long read transaction** for the whole measured phase.
+  6. **Thin statistics.**  2-3 repeats, no CIs.
+- **Fixes** (`thesis_reads` v1 had already started on the cloud machine and is unchanged; it
+  still answers the within-BF ablations):
+  - `runner.py`:
+    - `stock_interior_credit` gives stock `budget + interior bytes`;
+    - `interior_bytes()` reads dbstat, cached beside the template;
+    - verified: stock `--page-cache-bytes` 34889728 = 32 MiB + 64 KiB + 1269760.
+  - `run_thesis_cloud.sh [run|check] [config]` always passes `--shuffle 1`.
+  - `configs/thesis_reads_v2.json`, 100 runs, ~8.5 h:
+    - the main stock/bf cells, credited and shuffled;
+    - the 8M/128M sweep;
+    - HOLDOUTS: uniform (negative control), theta 0.7 / 0.99, v200, YCSB B (95/5) and
+      A (50/50);
+    - buffered I/O on v100 scrambled/raw;
+    - one cell with a transaction per read.
+  - `costmodel.py` handles uniform.
+  - README section "Reading the numbers": metric roles, fairness rules, controls, noise
+    rules, scope of every claim.
+  - CLOUD.md step 8b.
+- **PRE-REGISTERED predictions** (cost model, pure record cache, BF 230 B/record measured at
+  v100, stock credited; written before any v2 run):
+
+  | cell | stock LRU | BF q-LRU .. q-FIFO | stock/BF |
+  |---|---|---|---|
+  | holdout_uniform (negative control) | 0.9261 | 0.9635 | **0.96x: BF loses** |
+  | holdout_theta07_scrambled | 0.8742 | 0.7193 .. 0.7666 | 1.22x .. 1.14x |
+  | holdout_theta07_raw | 0.6843 | 0.7488 .. 0.7959 | 0.91x .. 0.86x |
+  | holdout_theta099_scrambled | 0.4742 | 0.2640 .. 0.3130 | 1.80x .. 1.51x |
+  | holdout_theta099_raw | 0.2351 | 0.2744 .. 0.3241 | 0.86x .. 0.73x |
+  | v100_scrambled (credited) | 0.6485 | 0.4169 .. 0.4764 | 1.56x .. 1.36x |
+  | v100_raw (credited) | 0.3803 | 0.4335 .. 0.4937 | 0.88x .. 0.77x |
+
+  - Raw cells are expected ABOVE the record band (full pages).
+  - v200 BF is NOT pre-registered: its bytes/record is unknown before a run.
+  - YCSB A/B, buffered and per-request-txn cells: no model; report as measured.
+- Still open: SQLite's own test suite with BF forced on, an external correctness holdout
+  nobody tuned against.
