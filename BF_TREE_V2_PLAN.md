@@ -3842,3 +3842,48 @@ Both are lessons from bbtree's method (`../bbtree/.github/perf-review.md`,
        - vacuity: `mini_cap_hits` 14096 vs 8457 at the default, full pages 175 vs 150,
          on gen_fullpage_stress seed 42;
        - quick gate 23/23.
+
+### 2026-10-24 (cont.) — Claude Opus 5.5 — debug cache audit (`SQLITE_BF_AUDIT`, `63ab463d4`); ESBMC proofs, partly done then parked (owner)
+
+These are bbtree lessons 2 and 3.
+- **Audit (`SQLITE_BF_AUDIT`, debug only, compiled out by default).**
+  - What it checks: `sqlite3BfAudit` checks the record cache against the log after every
+    commit (`btree.c` post-commit), every rollback / snapshot rebuild (`bfRehydrateFromLog`),
+    and the incremental snapshot and rollback paths.  It aborts AT the event.
+  - Expected state per key: this connection's unlogged deferred commits (carry + open batch)
+    first, then the WAL op index at the snapshot.
+  - Violations it reports:
+    - a dirty record stranded under a non-owner leaf;
+    - a dirty op on a key the log says is merged;
+    - a committed dirty record in no log;
+    - a live row vs DELETE, a tombstone vs INSERT, or a different value;
+    - a full-page cell of a DELETEd key.
+  - **Mutation-checked.**  With `SQLITE_BF_NO_DISCARD_CARRY` it aborts at the ROLLBACK
+    ("rehydrate"), naming key 413: the row that bug lost.  Before, that bug was visible only
+    as a wrong count statements later.
+  - **Finding: clean stranded records.**  `balance_quick` leaves the records a merge just
+    wrote out as clean copies under the old leaf (e.g. rows 336..338 under leaf 7 once leaf
+    11 is appended for keys > 335).  `balance_nonroot` forgets its leaves' records;
+    `balance_quick` does not.
+    - Single-connection they are never served: lookups descend to the owner, and the old
+      leaf's range only grows back through balance_nonroot.  So they waste ring space, not
+      answers.
+    - Counted (`nAuditCleanStranded`), not fatal.
+    - Same mechanism as the BC branch's stranded DIRTY records (c730ee662).  A fix (drop out-
+      of-range clean records in balance_quick) is a candidate if ring space matters.
+  - Results: 486/486 under the audit (quick seeds, 6 buf variants).  Gate task
+    `audit:difftest` (quick: base/group8/ring; full: +promo100/readfull/adaptive).
+    `gate --full --jobs 4` 63/63 in 324 s; the audit task is now the long pole.
+- **ESBMC (`test/bf/esbmc/`, `run_all.sh`).**
+  - **The esbmc-verifier agent's report was wrong.**  Its "proofs" ran with
+    `--no-unwinding-assertions` at `--unwind 2` over 8-iteration loops and a 1024-byte zero
+    fill.  With assertions on, all three FAILED their unwinding checks.  Its shim also made
+    `assert()` a no-op.  Rule: never accept a bounded proof without unwinding assertions.
+  - Redone:
+    - harness copies equal `src/` (checked);
+    - **rowid encoding preserves order and round-trips, for every i64** (unwind 9);
+    - **WAL decoder memory-safe and terminating on any 48-byte input** (unwind 50).
+  - Both mutation-checked: no sign flip -> FAIL; decoder bound off by one -> FAIL.
+  - Codec round-trip (properties 4-5): written, **NOT proven**.  2 records x 4 symbolic ops
+    did not finish in 30 min / 5.5 GB.  The per-op split exists but was never run.
+    **Parked by the owner.**
