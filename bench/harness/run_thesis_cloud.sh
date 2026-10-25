@@ -5,7 +5,7 @@
 #   sh bench/harness/run_thesis_cloud.sh            # build, campaign, report (~7 h at 3 repeats)
 #   sh bench/harness/run_thesis_cloud.sh check      # preflight only
 #
-# Needs: cc, make, tcl (for the amalgamation), python3, systemd (the runner
+# Needs: cc, make, tcl (for the amalgamation), python3 + numpy (cost model), systemd (the runner
 # isolates every run in a cgroup with systemd-run --user --scope), cgroup v2,
 # ~30 GiB free disk on a filesystem that supports O_DIRECT (ext4/xfs; NOT tmpfs).
 # Datasets (~9 GiB) are generated on first use by the stock binary.
@@ -61,4 +61,12 @@ mkdir -p "$OUT"
 python3 bench/harness/runner.py bench/harness/configs/thesis_reads.json \
     --continue-on-error 2>&1 | tee "$OUT/campaign.log"
 python3 bench/harness/report.py "$OUT"
+# The cost model next to every point-read cell: predicted vs measured device
+# reads/op (bench/harness/costmodel.py; needs numpy, ~1 min per dataset).
+if python3 -c "import numpy" 2>/dev/null; then
+  python3 bench/harness/costmodel.py --results "$OUT" > "$OUT/COSTMODEL.md"
+  echo "cost model: $OUT/COSTMODEL.md"
+else
+  echo "numpy missing: skipped the cost model (run costmodel.py --results $OUT later)" >&2
+fi
 echo "done: $OUT/RESULTS.md"

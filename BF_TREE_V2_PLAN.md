@@ -3760,3 +3760,56 @@ Verified:
   (`bench_e2e.rs`, murmur64 keys) is unchanged; `benchmark/README.md` only gained SPDK docs.
 - Rule from here: cite the reference as `@d30f9a4` (old citations) or `@f442e61` (new ones).
   Line numbers without a revision are ambiguous now.
+
+### 2026-10-24 (cont.) — Claude Opus 5.5 — harness: instructions/op (`02596daac`); a cost model that predicts device reads/op
+
+Both are lessons from bbtree's method (`../bbtree/.github/perf-review.md`,
+`design/06-cost-model.md`), adopted on the owner's call.
+
+- **Instructions/op** (`bfbench.c` pmu*, `report.py`).
+  - Mechanism:
+    - one `perf_event_open` group PER core-type PMU, summed;
+    - user space only;
+    - wrapped around the measured phase;
+    - `coverage` reported, and `report.py` uses counts only at coverage >= 0.99.
+  - The hybrid-CPU trap: one plain group covered 22-28% of the task on the i5-1235U.
+    Identical stock runs read 999 vs 1278 instr/op.
+  - Fixed: coverage 1.0000, and identical runs read 4556.4 / 4556.4 instr/op (stock) and
+    5074.3 / 5074.3 (bf), while cycles/op moved 3%.
+  - First data point (small, 2M x 100 B, 32 MiB, direct I/O, NOT a campaign cell): bf
+    retires +11% instructions/op to do -11% device reads/op.
+  - `report.py` gains `dev reads/op` and `instr/op` columns and their ratios.
+  - `run_thesis_cloud.sh check` probes the PMU: many VMs expose none.
+- **Cost model** (`bench/harness/costmodel.py`, README section).
+  - Premise: reads/op = P(cache miss).
+  - Inputs:
+    - the EXACT key pmf of bfbench's own sampler (matches 5M draws within noise);
+    - the real leaf boundaries (dbstat);
+    - stock = Che-LRU over leaves;
+    - BF = record cache in a band from q-FIFO to q-LRU (Martina et al. 2014), plus the
+      static optimum.
+  - Validated on `results/b3b`:
+    - stock within 0.5-1.1% in all four cells;
+    - BF scrambled inside its band;
+    - BF raw below the band (full pages, unmodelled by design).
+  - Sweep, v100, 230 B per cached record (measured):
+
+    | budget | scrambled stock/BF | raw stock/BF | raw break-even B/rec |
+    |---|---|---|---|
+    | 8 MiB | 1.40x | 0.96x | 173 |
+    | 32 MiB | 1.57x | 0.89x | 145 |
+    | 128 MiB | 1.87x | 0.73x | 129 |
+
+  - **Thesis findings the model gives:**
+    1. With scattered hot keys the record cache wins at any realistic record size, and
+       the win GROWS with the budget.
+    2. With clustered hot keys a pure record cache LOSES, more so as the budget grows.
+       At 128 MiB even the ideal record cache (0.219) is beaten by LRU over pages (0.202).
+       BF's measured raw parity comes from full pages.  This is the theoretical case for
+       X1.
+    3. Per-record overhead is a lever: 230 B per cached 100-B record (size classes,
+       metadata, headers) against a 145 B break-even at 32 MiB.
+- Cost: the `--results` mode takes ~1 min per dataset; `--sweep` with break-even ~10 min.
+- Exact next action: owner runs the cloud campaign.  It now records instr/op (if the VM has
+  a PMU) and writes `COSTMODEL.md`.  Meanwhile: the debug cache audit (bbtree lesson 2), or
+  ESBMC on the rowid encoding (lesson 3).

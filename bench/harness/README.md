@@ -311,6 +311,42 @@ second.
 - `report.py` prints `dev reads/op` and `instr/op` in every experiment table,
   and their stock/bf ratios in the comparison block.
 
+## Cost model (`costmodel.py`; 2026-10-24)
+
+Predicts device reads/op for point reads before measuring, then checks each
+measured cell against the prediction.  Under direct I/O every cache miss
+reads one leaf, so reads/op = P(miss).  The model computes:
+
+- the **exact** per-key probabilities of bfbench's own sampler.  That is YCSB's
+  approximate Zipfian, solved interval by interval, plus the FNV-1a scramble.
+  It matches 5M sampled draws within Monte Carlo noise.
+- the dataset's real leaf boundaries, from `dbstat`.  They are cached in
+  `<db>.leaves.npy`.
+- stock as an **LRU over leaves**, using Che's approximation.
+- BF as a **record cache** of `budget / bytes-per-record` records.  BF is
+  shown as a band:
+  - q-LRU (Martina et al. 2014; admission q = promotion rate), the
+    optimistic edge;
+  - q-FIFO, the pessimistic edge;
+  - static-optimal as the floor.
+
+```bash
+python3 costmodel.py --results results/b3b            # model vs measured, per cell
+python3 costmodel.py --db work/datasets/v100.db --records 4000000 --dist zipf-raw \
+    --bytes-per-record 230 --sweep 8M,16M,32M,64M,128M  # curves + break-even B/record
+```
+
+Validated on `results/b3b` (32 MiB, direct I/O):
+
+- **stock** is predicted within 0.5-1.1% in all four cells.
+- **BF** scrambled cells fall inside the band.
+- **BF** raw cells beat the pure-record band.  Full pages, which the model
+  leaves out on purpose, account for the difference; there the ring holds
+  95k records against a record-only capacity of 145k.
+
+Full pages, scan promotion and X1 are not modelled.  The gap between the
+record band and a measurement is their contribution.
+
 ## Known gaps
 
 - **Single threaded.** The fork keeps SQLite's single-writer serialisation, so
