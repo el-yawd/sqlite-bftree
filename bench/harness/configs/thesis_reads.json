@@ -8,7 +8,14 @@
   "bf adaptive_full=8 (X1, our experiment, default off).  Scans: 32-row, stock / bf / bf_noscan (M3",
   "ablation) / bf_nofull.  Mix: read 90 / scan 10, stock / bf / bf scan_promotion=0.",
   "32 MiB budget, direct I/O (the reference's I/O model).  QUOTE device reads/op (dio.reads/op) first;",
-  "throughput second, and only from a quiet machine.  Report cached_records and evictions beside hit rates."
+  "throughput second, and only from a quiet machine.  Report cached_records and evictions beside hit rates.",
+  "ADDED 2026-10-24, from the cost model (costmodel.py) and the X1 question:",
+  "  * budget sweep (v100, stock vs bf, 8M and 128M beside the main 32M cells): the model predicts the",
+  "    scrambled win GROWS with budget (1.40x / 1.57x / 1.87x) and the raw loss deepens (0.96x / 0.89x / 0.73x)",
+  "    for a pure record cache -- predicted before measured.  Warmup scales with the budget so the ring fills.",
+  "  * X1 adaptive_full N = 4 / 16 beside the main N = 8 (raw cells; N = 4 also on v100 scrambled, the risk side).",
+  "  * bf_cap1k: the mini-page cap at 1024 instead of 2048 (the reference's max_mini_page_size), i.e. leaves go",
+  "    full EARLIER with no adaptivity -- the static baseline X1 must beat on raw without the cost on scrambled."
  ],
  "datasets": {
   "v100": {
@@ -244,6 +251,150 @@
      0
     ]
    }
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "axes": {
+    "budget_bytes": [
+     {
+      "label": "8M",
+      "budget_bytes": "8M",
+      "warmup_ops": 1000000
+     },
+     {
+      "label": "128M",
+      "budget_bytes": "128M",
+      "warmup_ops": 8000000
+     }
+    ]
+   }
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "repeats": 2,
+   "suts": [
+    "stock",
+    "bf"
+   ],
+   "axes": {
+    "budget_bytes": [
+     {
+      "label": "8M",
+      "budget_bytes": "8M",
+      "warmup_ops": 1000000
+     },
+     {
+      "label": "128M",
+      "budget_bytes": "128M",
+      "warmup_ops": 8000000
+     }
+    ]
+   }
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     4,
+     16
+    ]
+   }
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "repeats": 2,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     4,
+     16
+    ]
+   }
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "bf"
+   ],
+   "axes": {
+    "adaptive_full": [
+     4
+    ]
+   }
+  },
+  {
+   "name": "v100_scrambled",
+   "dataset": "v100",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "bf_cap1k"
+   ]
+  },
+  {
+   "name": "v100_raw",
+   "dataset": "v100",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 2000000,
+   "repeats": 2,
+   "suts": [
+    "bf_cap1k"
+   ]
+  },
+  {
+   "name": "v16_scrambled",
+   "dataset": "v16",
+   "dist": "zipf",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "repeats": 2,
+   "suts": [
+    "bf_cap1k"
+   ]
+  },
+  {
+   "name": "v16_raw",
+   "dataset": "v16",
+   "dist": "zipf-raw",
+   "workload": "read=100",
+   "warmup_ops": 4000000,
+   "repeats": 2,
+   "suts": [
+    "bf_cap1k"
+   ]
   }
  ]
 }

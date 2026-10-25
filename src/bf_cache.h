@@ -77,7 +77,12 @@ typedef struct BfFreeList BfFreeList;
 ** the page it partially caches.  4096 stays the ladder's last class (the
 ** free list and the full-page slab size rely on it); it is just never a
 ** mini-page.  -DSQLITE_BF_NO_MINI_CAP restores growth to BF_MAX_MINI_PAGE. */
-#if !defined(SQLITE_BF_NO_MINI_CAP)
+#if defined(BF_MAX_MINI_GROW)
+  /* A benchmark SUT may set the cap lower -- the reference's own knob,
+  ** max_mini_page_size (config.rs) -- to make warm leaves go full EARLIER
+  ** (bench/harness/build_suts.sh bf_cap1k, 2026-10-24).  A multiple of 64,
+  ** below BF_MAX_MINI_PAGE. */
+#elif !defined(SQLITE_BF_NO_MINI_CAP)
 # define BF_MAX_MINI_GROW \
     (((BF_MAX_MINI_PAGE - (1952 + 8) - 32 - 2*8) / 64) * 64)
 #else

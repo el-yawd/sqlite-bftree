@@ -3813,3 +3813,32 @@ Both are lessons from bbtree's method (`../bbtree/.github/perf-review.md`,
 - Exact next action: owner runs the cloud campaign.  It now records instr/op (if the VM has
   a PMU) and writes `COSTMODEL.md`.  Meanwhile: the debug cache audit (bbtree lesson 2), or
   ESBMC on the rowid encoding (lesson 3).
+
+### 2026-10-24 (cont.) — Claude Opus 5.5 — thesis campaign: budget sweep, X1 N-sweep, static cap baseline (owner: "do 3 and 4")
+
+- `configs/thesis_reads.json` grows from 81 to **115 runs** (~10 h on the cloud machine).
+  1. **Budget sweep.**  v100, scrambled and raw, stock vs bf, 8M and 128M beside the main
+     32M cells, 2 repeats.  Warmup scales with the budget (1M / 2M / 8M ops) so the ring
+     fills.  The cost model's predictions, written down BEFORE the campaign (pure record
+     cache, q-LRU edge):
+
+     | | 8M | 32M | 128M |
+     |---|---|---|---|
+     | scrambled stock/bf | 1.40x | 1.57x | 1.87x |
+     | raw stock/bf | 0.96x | 0.89x | 0.73x |
+
+     Measured raw cells will sit ABOVE these because of full pages.
+  2. **X1 sweep.**  `adaptive_full` N = 4 / 16 on the raw cells, beside the main N = 8.
+     N = 4 also on v100 scrambled, the risk side.
+  3. **`bf_cap1k`**, a new SUT: mini-page cap 1024 instead of 2048.
+     - The reference exposes this as `max_mini_page_size` (`config.rs@f442e61`,
+       default 2048).
+     - `BF_MAX_MINI_GROW` is now overridable (`bf_cache.h`); the default is unchanged.
+     - It is the STATIC "go full earlier" baseline: X1 must beat it on raw without its
+       cost on scrambled.
+     - Checks:
+       - difftest buf on that build, base/ring/promo100/readfull/adaptive x 4 seeds:
+         540/540 clean;
+       - vacuity: `mini_cap_hits` 14096 vs 8457 at the default, full pages 175 vs 150,
+         on gen_fullpage_stress seed 42;
+       - quick gate 23/23.

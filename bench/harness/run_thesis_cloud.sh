@@ -2,7 +2,7 @@
 # The thesis read campaign on a fresh, dedicated machine (2026-10-24).
 #
 #   git clone <repo> && cd sqlite-bftree-v2 && git checkout thesis
-#   sh bench/harness/run_thesis_cloud.sh            # build, campaign, report (~7 h at 3 repeats)
+#   sh bench/harness/run_thesis_cloud.sh            # build, campaign, report (115 runs, ~10 h)
 #   sh bench/harness/run_thesis_cloud.sh check      # preflight only
 #
 # Needs: cc, make, tcl (for the amalgamation), python3 + numpy (cost model), systemd (the runner
